@@ -1,6 +1,10 @@
 # usable-git
 A bunch of shell scripts that make using git bearable.
 
+This is for working with forks of projects, not directly commiting to
+the main master. It's expected that your changes will go through the
+GitHub PR process to actually end up commited.
+
 Usage:
 
 `clone flutter engine me`
