@@ -1,11 +1,24 @@
 # usable-git
 A bunch of shell scripts that make using git bearable.
 
-This is for working with forks of projects, not directly commiting to
-the main master. It's expected that your changes will go through the
-GitHub PR process to actually end up commited.
+This is for working with branches on forks of projects, not directly commiting to
+a project's master. It's expected that your changes will go through the
+GitHub PR process to actually end up commited to the project.
 
-Usage:
+## Installation
+
+Run the following commands in a terminal:
+
+```bash
+mkdir -p ~/bin
+cd ~/bin
+git clone git@github.com:Hixie/usable-git
+echo 'export PATH=$PATH:~/bin/usable-git' >> ~/.bash_profile
+```
+
+Then, open a new terminal.
+
+## Usage:
 
 `clone flutter engine me`
 
