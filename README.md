@@ -107,7 +107,7 @@ If you're using emacs, the following is a good start for a `~/.gitconfig` file:
 ```
 [core]
         autocrlf = false
-	filemode = false
+        filemode = false
         editor = emacsclient
 [branch]
         autosetuprebase = always
@@ -117,7 +117,7 @@ If you're using emacs, the following is a good start for a `~/.gitconfig` file:
         log = false
         cl = false
         blame = false
-	merge = false
+        merge = false
         rebase = false
         help = false
         show = false
