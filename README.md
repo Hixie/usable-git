@@ -99,3 +99,32 @@ Then, open a new terminal.
 `nuke`
 
   Delete the current branch.
+
+## Configuration
+
+If you're using emacs, the following is a good start for a `~/.gitconfig` file:
+
+```
+[core]
+        autocrlf = false
+	filemode = false
+        editor = emacsclient
+[branch]
+        autosetuprebase = always
+[pager]
+       	diff = false
+        commit = false
+        log = false
+        cl = false
+        blame = false
+	merge = false
+        rebase = false
+        help = false
+        show = false
+        reflog = false
+        grep = false
+[push]
+        default = simple
+[credential]
+        helper = cache --timeout=315569000
+```
