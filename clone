@@ -1,0 +1,9 @@
+set -e
+if [[ $# -ne 3 ]]; then
+  echo "Usage: clone <github project name> <github repo name> <your github name>"
+  echo "Make sure you have previously forked the project on GitHub."
+  exit 1
+fi
+git clone git@github.com:$1/$2.git
+cd $2
+git remote add upstream git@github.com:$3/$2.git

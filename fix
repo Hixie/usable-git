@@ -1,0 +1,4 @@
+set -e
+emacsclient $1
+git add $1
+git rebase --continue

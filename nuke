@@ -1,0 +1,10 @@
+set -e
+git diff upstream/master --stat $@
+git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 upstream/master $@ > ~/temp/last-nuke
+head -200 ~/temp/last-nuke | tee /tmp/last-nuked-branch | head -100
+git branch -m "branch-to-delete"
+git checkout master || git checkout -B master upstream/master
+git fetch upstream
+git rebase upstream/master
+git branch -D "branch-to-delete"
+git branch

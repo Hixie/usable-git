@@ -1,0 +1,4 @@
+set -e
+git checkout -B $1 upstream/master
+git fetch upstream
+git rebase upstream/master
