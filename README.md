@@ -56,9 +56,20 @@ Then, open a new terminal.
   Update the current commit with new changes.
 
 
+`save`
+
+  Commit your current changes with the message "wip" and upload it to
+  GitHub on your fork, merging any remote changes in as well.
+
+
 `push`
 
   Send the current branch to GitHub.
+
+
+`publish`
+
+  Push your current master branch to your GitHub master branch.
 
 
 `n bar`

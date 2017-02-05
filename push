@@ -8,6 +8,16 @@ if [ "`git rev-parse --abbrev-ref HEAD`" == "master" ]; then
   exit 1
 fi
 
+if [[ `git status --porcelain` ]]; then
+  echo 'Your branch has uncommitted changes. Use "commit" first.'
+  exit 1
+fi
+
+if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  echo 'Push only works when you have an upstream; consider "save" or "publish".'
+  exit 1
+fi
+
 set -e
 git fetch upstream
 git rebase upstream/master

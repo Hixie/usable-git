@@ -1,0 +1,25 @@
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+  echo 'This is not a git repository.'
+  exit 1
+fi
+
+if [ "`git rev-parse --abbrev-ref HEAD`" != "master" ]; then
+  echo 'This is not the master branch. Consider "push" or "save" when working with a branch.'
+  exit 1
+fi
+
+if [[ `git status --porcelain` ]]; then
+  echo 'Your branch has uncommitted changes. Use "commit" first.'
+  exit 1
+fi
+
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  echo 'This repo has an upstream. Use "push" to push a branch then merge it there.'
+  exit 1
+fi
+
+set -ex
+git fetch origin
+git rebase origin
+git diff origin
+git push origin

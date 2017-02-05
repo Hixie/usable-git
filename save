@@ -1,0 +1,17 @@
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+  echo 'This is not a git repository.'
+  exit 1
+fi
+
+if [ "`git rev-parse --abbrev-ref HEAD`" == "master" ]; then
+  echo 'Rename the branch first. You were about to save a "wip" commit on your master branch.'
+  exit 1
+fi
+
+git commit -a -m"wip"
+
+set -ex
+git fetch origin
+git rebase origin/`git rev-parse --abbrev-ref HEAD`
+git diff origin/`git rev-parse --abbrev-ref HEAD`
+git push origin `git rev-parse --abbrev-ref HEAD`

@@ -1,4 +1,16 @@
 set -e
-git checkout -B $1 upstream/master
-git fetch upstream
-git rebase upstream/master
+
+if [[ `git status --porcelain` ]]; then
+  echo 'Your branch has uncommitted changes. Use "commit" first.'
+  exit 1
+fi
+
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  git checkout -B $1 upstream/master
+  git fetch upstream
+  git rebase upstream/master
+else
+  git checkout -B $1 origin/master
+  git fetch origin
+  git rebase origin/master
+fi

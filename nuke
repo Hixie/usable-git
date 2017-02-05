@@ -1,10 +1,22 @@
 set -e
-git diff upstream/master --stat $@
-git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 upstream/master $@ > ~/temp/last-nuke
-head -200 ~/temp/last-nuke | tee /tmp/last-nuked-branch | head -100
-git branch -m "branch-to-delete"
-git checkout master || git checkout -B master upstream/master
-git fetch upstream
-git rebase upstream/master
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  git diff upstream/master --stat $@
+  git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 upstream/master $@ > ~/temp/last-nuke
+  head -200 ~/temp/last-nuke | tee /tmp/last-nuked-branch | head -100
+  echo "Complete diff saved to: ~/temp/last-nuke"
+  git branch -m "branch-to-delete"
+  git checkout master || git checkout -B master upstream/master
+  git fetch upstream
+  git rebase upstream/master
+else
+  git diff origin/master --stat $@
+  git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 origin/master $@ > ~/temp/last-nuke
+  head -200 ~/temp/last-nuke | tee /tmp/last-nuked-branch | head -100
+  echo "Complete diff saved to: ~/temp/last-nuke"
+  git branch -m "branch-to-delete"
+  git checkout master || git checkout -B master origin/master
+  git fetch origin
+  git rebase origin/master
+fi
 git branch -D "branch-to-delete"
 git branch
