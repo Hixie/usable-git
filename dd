@@ -1,0 +1,5 @@
+set -e
+
+git diff --stat $@
+git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 $@
+git diff --check $@

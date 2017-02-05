@@ -46,6 +46,12 @@ Then, open a new terminal.
   Add the local files to the repo (stage for commit).
 
 
+`clean`
+
+  Show you what files would be deleted by running `git clean`, and
+  gives you instructions for doing so.
+
+
 `commit`
 
   Commit the current changes using emacsclient to write the commit message.
