@@ -1,3 +1,4 @@
+#!/bin/bash
 set -e
 
 if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then

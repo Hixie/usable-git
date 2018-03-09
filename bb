@@ -1,3 +1,4 @@
+#!/bin/bash
 set -e
 
 if [[ `git status --porcelain` ]]; then
