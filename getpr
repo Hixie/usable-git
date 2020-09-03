@@ -1,0 +1,19 @@
+set -ex
+
+MASTER="${MASTER:-master}"
+
+if [[ $# -ne 3 ]]; then
+  echo "Usage: getpr <git://.../.git> <branch-name>"
+  echo "You can get the <git://.../.git> part and the <branch-name> from the bottom of the PR."
+  exit 1
+fi
+
+git fetch $1 $2
+git branch $2 FETCH_HEAD
+git checkout $2 &&
+
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  get branch --set-upstream-to=upstream $MASTER
+else
+  get branch --set-upstream-to=origin $MASTER
+fi

@@ -1,16 +1,19 @@
+set -e
+
+MASTER="${MASTER:-master}"
+
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
   echo 'This is not a git repository.'
   exit 1
 fi
 
-if [ "`git rev-parse --abbrev-ref HEAD`" == "master" ]; then
-  echo 'Rename the branch first. You were about to push your master branch.'
+if [ "`git rev-parse --abbrev-ref HEAD`" == "$MASTER" ]; then
+  echo 'Rename the branch first. You were about to push your $MASTER branch.'
   exit 1
 fi
 
 if [[ `git status --porcelain` ]]; then
-  echo 'Your branch has uncommitted changes. Use "commit" or "clean" first.'
-  exit 1
+  echo 'WARNING! Your branch has uncommitted changes, consider "commit" or "clean".'
 fi
 
 if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
@@ -18,8 +21,7 @@ if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
   exit 1
 fi
 
-set -e
 git fetch upstream
-git rebase upstream/master
-git diff upstream/master
+git rebase upstream/$MASTER
+#git diff upstream/$MASTER
 git push -f origin `git rev-parse --abbrev-ref HEAD`

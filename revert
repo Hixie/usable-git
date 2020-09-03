@@ -1,2 +1,3 @@
 set -e
-git checkout upstream/master -- $@
+MASTER="${MASTER:-master}"
+git checkout upstream/$MASTER -- $@

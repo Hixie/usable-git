@@ -4,11 +4,10 @@ use strict;
 my $commits = `git rev-list \@{u}..`;
 my $result = $?;
 if ($result != 0) {
-  print "Error.";
+  print "\nError.";
 } elsif ($commits eq '') {
   print "You have not yet made a commit.\n";
 } else {
   print "Amending last commit.\n";
-  print "\$ git commit -a --amend --no-edit\n";
   print `git commit -a --amend --no-edit`;
 }
