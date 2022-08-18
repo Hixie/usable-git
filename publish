@@ -8,10 +8,10 @@ if [ "`git rev-parse --abbrev-ref HEAD`" != "master" ]; then
   exit 1
 fi
 
-if [[ `git status --porcelain` ]]; then
-  echo 'Your branch has uncommitted changes. Use "commit" or "clean" first.'
-  exit 1
-fi
+# if [[ `git status --porcelain` ]]; then
+#   echo 'Your branch has uncommitted changes. Use "commit" or "clean" first.'
+#   exit 1
+# fi
 
 if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
   echo 'This repo has an upstream. Use "push" to push a branch then merge it there.'
