@@ -1,0 +1,4 @@
+#!/bin/bash
+set -e
+MASTER="${MASTER:-master}"
+git branch --set-upstream-to upstream/$MASTER
