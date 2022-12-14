@@ -1,2 +1,4 @@
+#!/bin/bash
+
 set -e
 git branch -m $1

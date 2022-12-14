@@ -1,3 +1,5 @@
+#!/bin/bash
+
 set -e
 MAIN="${MAIN:-main}"
 git checkout upstream/$MAIN -- $@
