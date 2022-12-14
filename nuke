@@ -1,25 +1,25 @@
 set -e
 
-MASTER="${MASTER:-master}"
+MAIN="${MAIN:-main}"
 
 if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
-  git diff upstream/$MASTER --stat $@
-  git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 upstream/$MASTER $@ > ~/temp/last-nuke
+  git diff upstream/$MAIN --stat $@
+  git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 upstream/$MAIN $@ > ~/temp/last-nuke
   head -200 ~/temp/last-nuke | tee /tmp/last-nuked-branch | head -100
   echo "Complete diff saved to: ~/temp/last-nuke"
   git branch -m "branch-to-delete"
-  git checkout $MASTER || git checkout -B $MASTER upstream/$MASTER
+  git checkout $MAIN || git checkout -B $MAIN upstream/$MAIN
   git fetch upstream
-  git rebase upstream/$MASTER
+  git rebase upstream/$MAIN
 else
-  git diff origin/$MASTER --stat $@
-  git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 origin/$MASTER $@ > ~/temp/last-nuke
+  git diff origin/$MAIN --stat $@
+  git diff --find-copies-harder --ignore-space-change --inter-hunk-context=10 --color --unified=10 origin/$MAIN $@ > ~/temp/last-nuke
   head -200 ~/temp/last-nuke | tee /tmp/last-nuked-branch | head -100
   echo "Complete diff saved to: ~/temp/last-nuke"
   git branch -m "branch-to-delete"
-  git checkout $MASTER || git checkout -B $MASTER origin/$MASTER
+  git checkout $MAIN || git checkout -B $MAIN origin/$MAIN
   git fetch origin
-  git rebase origin/$MASTER
+  git rebase origin/$MAIN
 fi
 git branch -D "branch-to-delete"
 git branch

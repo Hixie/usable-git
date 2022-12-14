@@ -1,6 +1,6 @@
 set -ex
 
-MASTER="${MASTER:-master}"
+MAIN="${MAIN:-main}"
 
 if [[ $# -ne 2 ]]; then
   echo "Usage: getpr <git://.../.git> <branch-name>"
@@ -11,4 +11,4 @@ fi
 git fetch $1 $2
 git branch $2 FETCH_HEAD
 git checkout $2 &&
-git branch --set-upstream-to=$MASTER
+git branch --set-upstream-to=$MAIN

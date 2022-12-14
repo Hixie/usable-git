@@ -1,9 +1,10 @@
 # usable-git
 A bunch of shell scripts that make using git bearable.
 
-This is for working with branches on forks of projects, not directly commiting to
-a project's master. It's expected that your changes will go through the
-GitHub PR process to actually end up commited to the project.
+This is for working with branches on forks of projects, not directly
+commiting to a project's main branch. It's expected that your changes
+will go through the GitHub PR process to actually end up commited to
+the project.
 
 ## Installation
 
@@ -75,7 +76,7 @@ Then, open a new terminal.
 
 `publish`
 
-  Push your current master branch to your GitHub master branch.
+  Push your current main branch to your GitHub main branch.
 
 
 `n bar`
@@ -83,9 +84,9 @@ Then, open a new terminal.
   Rename the current branch to `bar`.
 
 
-`bb master`
+`bb main`
 
-  Switch to the `master` branch and pull changes.
+  Switch to the `main` branch and pull changes.
 
 
 `b bar`

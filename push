@@ -1,14 +1,14 @@
 set -e
 
-MASTER="${MASTER:-master}"
+MAIN="${MAIN:-main}"
 
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
   echo 'This is not a git repository.'
   exit 1
 fi
 
-if [ "`git rev-parse --abbrev-ref HEAD`" == "$MASTER" ]; then
-  echo 'Rename the branch first. You were about to push your $MASTER branch.'
+if [ "`git rev-parse --abbrev-ref HEAD`" == "$MAIN" ]; then
+  echo 'Rename the branch first. You were about to push your $MAIN branch.'
   exit 1
 fi
 
@@ -22,6 +22,6 @@ if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
 fi
 
 git fetch upstream
-git rebase upstream/$MASTER
-#git diff upstream/$MASTER
+git rebase upstream/$MAIN
+#git diff upstream/$MAIN
 git push -f origin `git rev-parse --abbrev-ref HEAD`

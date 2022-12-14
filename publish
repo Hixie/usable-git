@@ -3,8 +3,8 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   exit 1
 fi
 
-if [ "`git rev-parse --abbrev-ref HEAD`" != "master" ]; then
-  echo 'This is not the master branch. Consider "push" or "save" when working with a branch.'
+if [ "`git rev-parse --abbrev-ref HEAD`" != "main" ]; then
+  echo 'This is not the main branch. Consider "push" or "save" when working with a branch.'
   exit 1
 fi
 

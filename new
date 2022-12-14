@@ -1,17 +1,17 @@
 set -e
 
-MASTER="${MASTER:-master}"
+MAIN="${MAIN:-main}"
 
 if [[ `git status --porcelain` ]]; then
   echo 'Your branch had uncommitted changes!'
 fi
 
 if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
-  git checkout -B $1 upstream/$MASTER
+  git checkout -B $1 upstream/$MAIN
   git fetch upstream
-  git rebase upstream/$MASTER
+  git rebase upstream/$MAIN
 else
-  git checkout -B $1 origin/$MASTER
+  git checkout -B $1 origin/$MAIN
   git fetch origin
-  git rebase origin/$MASTER
+  git rebase origin/$MAIN
 fi

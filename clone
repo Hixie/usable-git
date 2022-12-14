@@ -5,10 +5,10 @@ if [[ $# -ne 3 ]]; then
   exit 1
 fi
 
-MASTER="${MASTER:-master}"
+MAIN="${MAIN:-main}"
 
 git clone git@github.com:$3/$2.git
 cd $2
 git remote add upstream git@github.com:$1/$2.git
 git fetch upstream
-git rebase upstream/$MASTER
+git rebase upstream/$MAIN

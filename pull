@@ -1,11 +1,11 @@
 set -e
 
-MASTER="${MASTER:-master}"
+MAIN="${MAIN:-main}"
 
 if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
   git fetch upstream
-  git rebase upstream/$MASTER
+  git rebase upstream/$MAIN
 else
   git fetch origin
-  git rebase origin/$MASTER
+  git rebase origin/$MAIN
 fi
