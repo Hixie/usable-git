@@ -2,4 +2,4 @@
 
 set -e
 git diff
-git commit -a
+git commit -S -a

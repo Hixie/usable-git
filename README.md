@@ -15,9 +15,18 @@ mkdir -p ~/bin
 cd ~/bin
 git clone git@github.com:Hixie/usable-git
 echo 'export PATH=$PATH:~/bin/usable-git' >> ~/.bash_profile
+git config --global gpg.format ssh
+git config --global user.signingkey ~/.ssh/id_rsa.pub ; use the same key you use to push to GitHub
 ```
 
 Then, open a new terminal.
+
+## Other git config options you might want
+
+```bash
+# remember merge conflict fixes
+git config --global rerere.enabled true
+```
 
 ## Usage:
 

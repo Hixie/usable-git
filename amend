@@ -10,5 +10,5 @@ if ($result != 0) {
 } else {
   print "Amending last commit.\n";
   print `git diff`;
-  print `git commit -a --amend --no-edit`;
+  print `git commit -S -a --amend --no-edit`;
 }
