@@ -41,6 +41,11 @@ git config --global rerere.enabled true
   List current branches.
 
 
+`logs`
+
+  Show recent commits in one line each, with relative time and author.
+
+
 `new foo`
 
   Create a branch `foo`.

@@ -1,0 +1,254 @@
+#!/bin/sh
+
+set -e
+
+program=${0##*/}
+default_count=10
+count=
+count_was_set=0
+min_authors=2
+color=auto
+date_style=relative
+show_hash=1
+
+usage() {
+  cat <<EOF
+Usage: $program [options] [git-log-arguments]
+
+Show recent commits in one aligned line per commit.
+
+Options:
+  -n, --count N       Show N commits. The default is at least 10, expanded
+                      when needed to include at least two authors.
+  --min-authors N     In the default count, include enough commits to show N
+                      authors when the history contains that many. Default: 2.
+  --date STYLE        Use a git log date style. Default: relative.
+  --color WHEN        Color output: auto, always, or never. Default: auto.
+  --no-color          Same as --color=never.
+  --hash              Show abbreviated commit hashes. Default.
+  --no-hash           Hide abbreviated commit hashes.
+  -h, --help          Show this help.
+
+Arguments not handled by $program are passed to git log. Put $program options
+before git log revisions, options, and pathspecs.
+EOF
+}
+
+die() {
+  echo "$program: $1" >&2
+  exit 2
+}
+
+is_positive_integer() {
+  case $1 in
+    ''|*[!0123456789]*)
+      return 1
+      ;;
+  esac
+  [ "$1" -gt 0 ] 2>/dev/null
+}
+
+set_count() {
+  is_positive_integer "$1" || die "count must be a positive integer"
+  count=$1
+  count_was_set=1
+}
+
+set_min_authors() {
+  is_positive_integer "$1" || die "minimum author count must be a positive integer"
+  min_authors=$1
+}
+
+while [ "$#" -gt 0 ]; do
+  case $1 in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    -n|--count)
+      [ "$#" -gt 1 ] || die "$1 needs a value"
+      set_count "$2"
+      shift 2
+      ;;
+    --count=*)
+      set_count "${1#*=}"
+      shift
+      ;;
+    -n[0123456789]*)
+      set_count "${1#-n}"
+      shift
+      ;;
+    -[0123456789]*)
+      set_count "${1#-}"
+      shift
+      ;;
+    --min-authors)
+      [ "$#" -gt 1 ] || die "$1 needs a value"
+      set_min_authors "$2"
+      shift 2
+      ;;
+    --min-authors=*)
+      set_min_authors "${1#*=}"
+      shift
+      ;;
+    --date)
+      [ "$#" -gt 1 ] || die "$1 needs a value"
+      date_style=$2
+      shift 2
+      ;;
+    --date=*)
+      date_style=${1#*=}
+      shift
+      ;;
+    --color)
+      [ "$#" -gt 1 ] || die "$1 needs a value"
+      color=$2
+      shift 2
+      ;;
+    --color=*)
+      color=${1#*=}
+      shift
+      ;;
+    --no-color)
+      color=never
+      shift
+      ;;
+    --hash)
+      show_hash=1
+      shift
+      ;;
+    --no-hash)
+      show_hash=0
+      shift
+      ;;
+    --)
+      break
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+case $color in
+  auto|always|never)
+    ;;
+  *)
+    die "color must be auto, always, or never"
+    ;;
+esac
+
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+  echo "$program: not in a git repository" >&2
+  exit 128
+fi
+
+if ! git rev-parse --verify HEAD >/dev/null 2>&1; then
+  exit 0
+fi
+
+if [ "$count_was_set" -eq 0 ]; then
+  count=$(
+    git --no-pager log --format='%an' "$@" |
+      awk -v minimum="$default_count" -v minimum_authors="$min_authors" '
+        BEGIN {
+          count = 0
+          author_count = 0
+          printed = 0
+        }
+        {
+          count++
+          if (!seen[$0]++) {
+            author_count++
+          }
+          if (count >= minimum && author_count >= minimum_authors) {
+            print count
+            printed = 1
+            exit
+          }
+        }
+        END {
+          if (!printed) {
+            if (count < minimum) {
+              print count
+            } else {
+              print minimum
+            }
+          }
+        }
+      '
+  )
+fi
+
+use_color=0
+case $color in
+  always)
+    use_color=1
+    ;;
+  auto)
+    if [ -t 1 ] && [ -z "${NO_COLOR+x}" ] && [ "${TERM:-}" != dumb ]; then
+      use_color=1
+    fi
+    ;;
+esac
+
+if [ "$date_style" = relative ]; then
+  date_format='%cr'
+else
+  date_format='%cd'
+fi
+
+field_separator=$(printf '\037')
+format="%h%x1f${date_format}%x1f%an%x1f%s"
+
+if [ "$date_style" = relative ]; then
+  git --no-pager log --max-count="$count" --format="$format" "$@"
+else
+  git --no-pager log --max-count="$count" --date="$date_style" --format="$format" "$@"
+fi |
+  awk -F "$field_separator" \
+    -v use_color="$use_color" \
+    -v show_hash="$show_hash" '
+    BEGIN {
+      split("32 36 35 33 31 34", palette, " ")
+      palette_size = 6
+      escape = sprintf("%c", 27)
+      reset = escape "[0m"
+    }
+    {
+      row_count++
+      hashes[row_count] = $1
+      dates[row_count] = $2
+      authors[row_count] = $3
+      subjects[row_count] = $4
+      if (length($2) > date_width) {
+        date_width = length($2)
+      }
+      if (length($3) > author_width) {
+        author_width = length($3)
+      }
+      if (!($3 in author_color)) {
+        author_count++
+        author_color[$3] = palette[((author_count - 1) % palette_size) + 1]
+      }
+    }
+    END {
+      for (i = 1; i <= row_count; i++) {
+        prefix = ""
+        suffix = ""
+        if (use_color) {
+          prefix = escape "[" author_color[authors[i]] "m"
+          suffix = reset
+        }
+        if (show_hash) {
+          printf "%s%-7s  %-*s  %-*s%s  %s\n",
+            prefix, hashes[i], date_width, dates[i],
+            author_width, authors[i], suffix, subjects[i]
+        } else {
+          printf "%s%-*s  %-*s%s  %s\n",
+            prefix, date_width, dates[i],
+            author_width, authors[i], suffix, subjects[i]
+        }
+      }
+    }
+  '
