@@ -17,6 +17,14 @@ Usage: $program [options] [git-log-arguments]
 
 Show recent commits in one aligned line per commit.
 
+The output starts with a summary line that counts the local branches and names
+the current one. When the working tree has uncommitted changes, a line with the
+commit ID "[workspace]" appears above the commits, giving the age of the most
+recently changed file and a count of the changes.
+
+Commits that are not yet on upstream/main are flagged with a leading "+" in the
+left margin. Long commit messages are shortened to fit the terminal width.
+
 Options:
   -n, --count N       Show N commits. The default is at least 10, expanded
                       when needed to include at least two authors.
@@ -57,6 +65,66 @@ set_count() {
 set_min_authors() {
   is_positive_integer "$1" || die "minimum author count must be a positive integer"
   min_authors=$1
+}
+
+plural() {
+  if [ "$1" -eq 1 ]; then
+    printf '%s %s ago\n' "$1" "$2"
+  else
+    printf '%s %ss ago\n' "$1" "$2"
+  fi
+}
+
+plural_unit() {
+  if [ "$1" -eq 1 ]; then
+    printf '%s %s' "$1" "$2"
+  else
+    printf '%s %ss' "$1" "$2"
+  fi
+}
+
+relative_age() {
+  diff=$1
+  [ "$diff" -ge 0 ] 2>/dev/null || diff=0
+  if [ "$diff" -lt 90 ]; then
+    plural "$diff" second
+    return
+  fi
+  diff=$(( (diff + 30) / 60 ))
+  if [ "$diff" -lt 90 ]; then
+    plural "$diff" minute
+    return
+  fi
+  diff=$(( (diff + 30) / 60 ))
+  if [ "$diff" -lt 36 ]; then
+    plural "$diff" hour
+    return
+  fi
+  diff=$(( (diff + 12) / 24 ))
+  if [ "$diff" -lt 14 ]; then
+    plural "$diff" day
+    return
+  fi
+  if [ "$diff" -lt 70 ]; then
+    plural "$(( (diff + 3) / 7 ))" week
+    return
+  fi
+  if [ "$diff" -lt 365 ]; then
+    plural "$(( (diff + 15) / 30 ))" month
+    return
+  fi
+  if [ "$diff" -lt 1825 ]; then
+    total_months=$(( (diff * 12 * 2 + 365) / (365 * 2) ))
+    years=$(( total_months / 12 ))
+    months=$(( total_months % 12 ))
+    if [ "$months" -gt 0 ]; then
+      printf '%s, %s ago\n' "$(plural_unit "$years" year)" "$(plural_unit "$months" month)"
+    else
+      plural "$years" year
+    fi
+    return
+  fi
+  plural "$(( (diff + 183) / 365 ))" year
 }
 
 while [ "$#" -gt 0 ]; do
@@ -192,6 +260,24 @@ case $color in
     ;;
 esac
 
+if [ -t 1 ]; then
+  exec 9<&1
+  term_width=$(stty size <&9 2>/dev/null | cut -d' ' -f2)
+  exec 9<&-
+  case $term_width in
+    ''|*[!0123456789]*)
+      term_width=$(tput cols 2>/dev/null || echo 80)
+      ;;
+  esac
+  case $term_width in
+    ''|*[!0123456789]*)
+      term_width=80
+      ;;
+  esac
+else
+  term_width=0
+fi
+
 if [ "$date_style" = relative ]; then
   date_format='%cr'
 else
@@ -199,55 +285,242 @@ else
 fi
 
 field_separator=$(printf '\037')
-format="%h%x1f${date_format}%x1f%an%x1f%s"
+format="%H%x1f%h%x1f${date_format}%x1f%an%x1f%s"
 
-if [ "$date_style" = relative ]; then
-  git --no-pager log --max-count="$count" --format="$format" "$@"
+branch_count=$(git branch | grep -cv '^\* (' || true)
+current_branch=$(git branch --show-current)
+if [ "$branch_count" -eq 1 ]; then
+  branch_label="1 branch"
 else
-  git --no-pager log --max-count="$count" --date="$date_style" --format="$format" "$@"
-fi |
+  branch_label="$branch_count branches"
+fi
+if [ -n "$current_branch" ]; then
+  branch_line="$branch_label; current branch: $current_branch"
+else
+  branch_line="$branch_label; detached HEAD"
+fi
+if [ "$use_color" -eq 1 ]; then
+  printf '\033[1;37m%s\033[0m\n' "$branch_line"
+else
+  printf '%s\n' "$branch_line"
+fi
+
+workspace_row=
+status=$(git status --porcelain --untracked-files=normal)
+if [ -n "$status" ]; then
+  if [ "$(stat -f %m . 2>/dev/null)" -ge 0 ] 2>/dev/null; then
+    stat_mtime() { stat -f %m "$1" 2>/dev/null || true; }
+  else
+    stat_mtime() { stat -c %Y "$1" 2>/dev/null || true; }
+  fi
+  file_count=$(printf '%s\n' "$status" | wc -l | tr -d ' ')
+  if [ "$file_count" -eq 1 ]; then
+    description="1 file modified"
+  else
+    description="$file_count files modified"
+  fi
+  paths=$(printf '%s\n' "$status" | sed -e 's/^...//' -e 's/.* -> //')
+  newest=
+  name_list=
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    if [ -z "$name_list" ]; then
+      name_list=$path
+    else
+      name_list="$name_list$field_separator$path"
+    fi
+    [ -e "$path" ] || continue
+    mtime=$(stat_mtime "$path")
+    [ -n "$mtime" ] || continue
+    if [ -z "$newest" ] || [ "$mtime" -gt "$newest" ] 2>/dev/null; then
+      newest=$mtime
+    fi
+  done <<EOF
+$paths
+EOF
+  now=$(date +%s)
+  if [ -n "$newest" ]; then
+    age=$(relative_age "$(( now - newest ))")
+  else
+    age=$(relative_age 0)
+  fi
+  workspace_row="${field_separator}[workspace]${field_separator}${age}${field_separator}(Uncommitted)${field_separator}"
+fi
+
+upstream_ref=upstream/main
+local_only_hashes=
+if git rev-parse --verify --quiet "$upstream_ref" >/dev/null 2>&1; then
+  if [ "$#" -gt 0 ]; then
+    local_only_hashes=$(git rev-list "$@" --not "$upstream_ref" 2>/dev/null || true)
+  else
+    local_only_hashes=$(git rev-list HEAD --not "$upstream_ref" 2>/dev/null || true)
+  fi
+fi
+LOGS_LOCAL_ONLY=$local_only_hashes
+export LOGS_LOCAL_ONLY
+
+{
+  if [ -n "$workspace_row" ]; then
+    printf '%s\n' "$workspace_row"
+  fi
+  if [ "$date_style" = relative ]; then
+    git --no-pager log --max-count="$count" --format="$format" "$@"
+  else
+    git --no-pager log --max-count="$count" --date="$date_style" --format="$format" "$@"
+  fi
+} |
   awk -F "$field_separator" \
     -v use_color="$use_color" \
-    -v show_hash="$show_hash" '
+    -v show_hash="$show_hash" \
+    -v workspace_summary="$description" \
+    -v workspace_files="$name_list" \
+    -v term_width="$term_width" '
+    function clip(text, width) {
+      if (term_width <= 0) {
+        return text
+      }
+      if (width <= 0) {
+        return ""
+      }
+      if (length(text) <= width) {
+        return text
+      }
+      if (width == 1) {
+        return substr(text, 1, 1)
+      }
+      return substr(text, 1, width - 1) "…"
+    }
     BEGIN {
       split("32 36 35 33 31 34", palette, " ")
       palette_size = 6
       escape = sprintf("%c", 27)
       reset = escape "[0m"
+      marker_char = "+"
+      n_local = split(ENVIRON["LOGS_LOCAL_ONLY"], local_list, "\n")
+      for (j = 1; j <= n_local; j++) {
+        if (local_list[j] != "") {
+          is_local[local_list[j]] = 1
+        }
+      }
     }
     {
       row_count++
-      hashes[row_count] = $1
-      dates[row_count] = $2
-      authors[row_count] = $3
-      subjects[row_count] = $4
-      if (length($2) > date_width) {
-        date_width = length($2)
+      fullhashes[row_count] = $1
+      hashes[row_count] = $2
+      dates[row_count] = $3
+      authors[row_count] = $4
+      subjects[row_count] = $5
+      if (length($2) > hash_width) {
+        hash_width = length($2)
       }
-      if (length($3) > author_width) {
-        author_width = length($3)
+      if (length($3) > date_width) {
+        date_width = length($3)
       }
-      if (!($3 in author_color)) {
+      if (length($4) > author_width) {
+        author_width = length($4)
+      }
+      if (!($4 in author_color)) {
         author_count++
-        author_color[$3] = palette[((author_count - 1) % palette_size) + 1]
+        author_color[$4] = palette[((author_count - 1) % palette_size) + 1]
       }
     }
     END {
+      if (hash_width < 7) {
+        hash_width = 7
+      }
+      first_commit_row = 0
       for (i = 1; i <= row_count; i++) {
+        if (hashes[i] != "[workspace]") {
+          first_commit_row = i
+          break
+        }
+      }
+      any_marked = 0
+      for (i = 1; i <= row_count; i++) {
+        if (is_local[fullhashes[i]] || hashes[i] == "[workspace]") {
+          any_marked = 1
+          break
+        }
+      }
+      gutter_width = any_marked ? 2 : 0
+      workspace_color = ""
+      if (row_count >= 1 && hashes[1] == "[workspace]" && first_commit_row > 0) {
+        if (is_local[fullhashes[first_commit_row]]) {
+          workspace_color = author_color[authors[first_commit_row]]
+        }
+      }
+      for (i = 1; i <= row_count; i++) {
+        is_workspace = (hashes[i] == "[workspace]")
+        if (any_marked) {
+          if (is_local[fullhashes[i]] || is_workspace) {
+            gutter = marker_char " "
+          } else {
+            gutter = "  "
+          }
+        } else {
+          gutter = ""
+        }
         prefix = ""
         suffix = ""
         if (use_color) {
-          prefix = escape "[" author_color[authors[i]] "m"
+          color_code = author_color[authors[i]]
+          if (is_workspace && workspace_color != "") {
+            color_code = workspace_color
+          }
+          prefix = escape "[" color_code "m"
           suffix = reset
         }
         if (show_hash) {
-          printf "%s%-7s  %-*s  %-*s%s  %s\n",
-            prefix, hashes[i], date_width, dates[i],
-            author_width, authors[i], suffix, subjects[i]
+          used = gutter_width + hash_width + 2 + date_width + 2 + author_width + 2
         } else {
-          printf "%s%-*s  %-*s%s  %s\n",
-            prefix, date_width, dates[i],
-            author_width, authors[i], suffix, subjects[i]
+          used = gutter_width + date_width + 2 + author_width + 2
+        }
+        subject_avail = term_width - used
+        out_subject = subjects[i]
+        if (is_workspace) {
+          out_subject = workspace_summary
+          file_separator = sprintf("%c", 31)
+          nfiles = split(workspace_files, files, file_separator)
+          if (nfiles >= 1) {
+            avail = subject_avail
+            ellipsis_overhead = length("…") - 1
+            full = workspace_summary ": "
+            for (k = 1; k <= nfiles; k++) {
+              if (k > 1) {
+                full = full ", "
+              }
+              full = full files[k]
+            }
+            if (term_width <= 0 || length(full) <= avail) {
+              out_subject = full
+            } else {
+              listed = ""
+              for (m = 1; m < nfiles; m++) {
+                if (m > 1) {
+                  listed = listed ", "
+                }
+                listed = listed files[m]
+                candidate = workspace_summary ": " listed " …and " (nfiles - m) " more"
+                if (length(candidate) - ellipsis_overhead <= avail) {
+                  out_subject = candidate
+                }
+              }
+            }
+          }
+          if (out_subject == workspace_summary) {
+            out_subject = clip(out_subject, subject_avail)
+          }
+        } else {
+          out_subject = clip(out_subject, subject_avail)
+        }
+        if (show_hash) {
+          printf "%s%s%-*s  %-*s  %-*s%s  %s\n",
+            prefix, gutter, hash_width, hashes[i], date_width, dates[i],
+            author_width, authors[i], suffix, out_subject
+        } else {
+          printf "%s%s%-*s  %-*s%s  %s\n",
+            prefix, gutter, date_width, dates[i],
+            author_width, authors[i], suffix, out_subject
         }
       }
     }
