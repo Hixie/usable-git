@@ -1,0 +1,457 @@
+#!/bin/bash
+
+# Resets this checkout and your fork back to a pristine copy of upstream's
+# main branch, destroying everything else along the way:
+#
+#   * removes worktree debris (modifications, deletions, type changes,
+#     untracked files, ignored files)
+#   * deletes every local branch, including main
+#   * fetches from upstream and origin
+#   * recreates main tracking upstream/main
+#   * empties the stash
+#   * force-pushes the fresh main to origin so your fork's main matches
+#     upstream's main
+#
+# While this runs, a cluster-bomb barrage plays over the work's output: a
+# particle system detonates small explosions at random spots, each throwing out a
+# short-lived burst of fire that flies out, cools from white to orange to red,
+# and rises into smoke. The output occupies as many rows as it has, up to the
+# screen height, and the blast plays over those rows. When the animation ends the
+# work's output is left on screen, the same as a normal run.
+#
+# The barrage lasts two seconds longer than the work itself, then stops so the
+# last bombs can burn out and reveal the output. Pass --fast to end it the moment
+# the work does, or --no-color to skip the animation entirely.
+
+MAIN="${MAIN:-main}"
+
+# ---------------------------------------------------------------------------
+# Validation
+# ---------------------------------------------------------------------------
+
+if ! git rev-parse --git-dir > /dev/null 2>&1; then
+  echo 'This is not a git repository.'
+  exit 1
+fi
+
+if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream'); then
+  echo 'armageddon needs an upstream remote to reset back to. Consider "nuke" for a single branch.'
+  exit 1
+fi
+
+if (! git remote | grep --fixed-strings --line-regexp --quiet 'origin'); then
+  echo 'armageddon needs an origin remote (your fork) to push the reset main to.'
+  exit 1
+fi
+
+TOPLEVEL="$(git rev-parse --show-toplevel)"
+cd "$TOPLEVEL" || exit 1
+
+# ---------------------------------------------------------------------------
+# Confirmation
+# ---------------------------------------------------------------------------
+
+ASSUME_YES=0
+FAST=0
+NOCOLOR=0
+for arg in "$@"; do
+  case "$arg" in
+    -y|--yes) ASSUME_YES=1 ;;
+    --fast) FAST=1 ;;
+    --no-color) NOCOLOR=1 ;;
+    -h|--help)
+      echo 'Usage: armageddon [-y] [--fast] [--no-color]'
+      echo
+      echo 'Obliterate every local branch and reset this checkout and your fork'"'"'s'
+      echo "$MAIN back to a pristine copy of upstream/$MAIN."
+      echo
+      echo '  -y, --yes    skip the confirmation prompt'
+      echo '  --fast       end the explosion as soon as the work finishes'
+      echo '  --no-color   run without the explosion animation'
+      exit 0
+      ;;
+    *)
+      echo "armageddon: unknown option '$arg' (try --help)"
+      exit 1
+      ;;
+  esac
+done
+
+if [ "$ASSUME_YES" -ne 1 ]; then
+  echo "This will DESTROY everything in $TOPLEVEL that isn't upstream/$MAIN:"
+  echo "  * discard all uncommitted changes and delete untracked + ignored files"
+  echo "  * delete every local branch, including $MAIN, and empty the stash"
+  echo "  * force-push origin/$MAIN to match upstream/$MAIN (rewriting your fork)"
+  echo
+  if [ ! -t 0 ]; then
+    echo 'Refusing to run unattended without -y.'
+    exit 1
+  fi
+  printf 'Type "armageddon" to proceed: '
+  read -r reply
+  if [ "$reply" != "armageddon" ]; then
+    echo 'Aborted.'
+    exit 1
+  fi
+fi
+
+# ---------------------------------------------------------------------------
+# The actual demolition, run in the background while the animation plays
+# ---------------------------------------------------------------------------
+
+LOG="$(mktemp -t armageddon)"
+DONE="${LOG}.done"
+FADE="${LOG}.fade"
+STOP="${LOG}.stop"
+
+work() {
+  set -e
+  cd "$TOPLEVEL"
+
+  # Step off whatever branch we're on so every branch becomes deletable, then
+  # wipe the worktree clean: tracked changes, deletions, type changes, and
+  # finally untracked and ignored files.
+  git checkout --detach
+  git reset --hard
+  git clean -xffd
+
+  # Delete every local branch, including main.
+  git for-each-ref --format='%(refname:short)' refs/heads/ |
+    while read -r branch; do git branch -D "$branch"; done
+
+  # Refresh both remotes and drop stale remote-tracking refs.
+  git fetch --prune upstream
+  git fetch --prune origin
+
+  # Recreate main pointing at, and tracking, upstream/main.
+  git checkout -B "$MAIN" "upstream/$MAIN"
+  git branch --set-upstream-to="upstream/$MAIN" "$MAIN" > /dev/null
+
+  # Empty the stash.
+  git stash clear
+
+  # Sync your fork's main with upstream's main.
+  git push --force origin "$MAIN:$MAIN"
+
+  echo
+  git branch -vv
+  git status -sb
+}
+
+# Run it detached, writing all output to the log, and record the exit status
+# when finished. The inner subshell isolates work's "set -e" so a failing step
+# still gets its status recorded.
+( ( work ) > "$LOG" 2>&1 < /dev/null; echo $? > "$DONE" ) &
+WORKPID=$!
+
+# ---------------------------------------------------------------------------
+# Animation
+# ---------------------------------------------------------------------------
+
+# Defaults, used only if the terminal cannot be measured at all.
+W=80
+H=24
+
+ANIMATING=0
+TIMERPID=""
+cleanup() {
+  tput cnorm 2>/dev/null    # terminfo "cursor normal": make the cursor visible again
+  printf '\033[0m'          # ESC[0m -- SGR 0: reset all colours and text attributes
+  if [ "$ANIMATING" -eq 1 ]; then printf '\n'; fi   # \n line feed: move below the block
+  kill "$WORKPID" 2>/dev/null
+  [ -n "$TIMERPID" ] && kill "$TIMERPID" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+# Measure the terminal size without touching the cursor, so the animation just
+# starts wherever the prompt left it and appends downward like any command.
+#
+# "stty size" reads the window size with an ioctl on its standard input, so
+# feeding it the real terminal on /dev/tty reports the true rows and columns
+# even inside a command substitution -- unlike "tput cols/lines", which probe
+# stdout (a pipe here) and fall back to a stale 80x24. Falls back to tput, then
+# the defaults, if that fails.
+measure_terminal() {
+  local sz rows cols
+  sz="$(stty size </dev/tty 2>/dev/null)"
+  read -r rows cols <<< "$sz"
+  [[ "$rows" =~ ^[0-9]+$ ]] && H="$rows"
+  [[ "$cols" =~ ^[0-9]+$ ]] && W="$cols"
+  [[ "$H" =~ ^[0-9]+$ ]] || H="$(tput lines 2>/dev/null)"; [[ "$H" =~ ^[0-9]+$ ]] || H=24
+  [[ "$W" =~ ^[0-9]+$ ]] || W="$(tput cols 2>/dev/null)";  [[ "$W" =~ ^[0-9]+$ ]] || W=80
+}
+
+# The animation is one awk process that owns the block of lines the work prints
+# and nothing else. It renders that block in place each frame -- moving the
+# cursor only up and down within the block, never above it -- so the console
+# text above stays exactly as it was. The block grows as the work emits output,
+# the cluster-bomb barrage detonates over it, and when it is done the block is
+# rewritten as the plain output, leaving the console as if no animation played.
+animate() {
+  awk -v W="$W" -v H="$H" -v logf="$LOG" -v pid="$WORKPID" -v fast="$FAST" \
+      -v stopf="$STOP" -v fadef="$FADE" -v delay="0.05" -v maxframes=4000 '
+  function clamp(c){ c=int(c+0.5); if(c<0)c=0; if(c>255)c=255; return c }
+  function ss(a,b,x,  tt){ if(b==a) return (x<a)?0:1; tt=(x-a)/(b-a); if(tt<0)tt=0; if(tt>1)tt=1; return tt*tt*(3.0-2.0*tt) }
+  # Fire ramp: t=0 white-hot, t=1 dark ember. Maps particle age to its colour.
+  function setgrad(t,  a){
+    if(t<0)t=0; if(t>1)t=1;
+    if(t<0.18){ a=t/0.18;            G_r=255;          G_g=255+a*(244-255); G_b=238+a*(150-238) }
+    else if(t<0.38){ a=(t-0.18)/0.20; G_r=255;          G_g=244+a*(194-244); G_b=150+a*(55-150) }
+    else if(t<0.58){ a=(t-0.38)/0.20; G_r=255;          G_g=194+a*(120-194); G_b=55+a*(18-55) }
+    else if(t<0.76){ a=(t-0.58)/0.18; G_r=255+a*(216-255); G_g=120+a*(58-120); G_b=18+a*(12-18) }
+    else if(t<0.90){ a=(t-0.76)/0.14; G_r=216+a*(120-216); G_g=58+a*(28-58);  G_b=12+a*(10-12) }
+    else { a=(t-0.90)/0.10;           G_r=120+a*(38-120);  G_g=28+a*(12-28);  G_b=10+a*(8-10) }
+  }
+  # Re-read the work log. ND is the line count. The block is the smaller of the
+  # output height and the screen height: it grows with the output, and once the
+  # output is taller than the screen it scrolls within, showing the last rows.
+  function readlog(  ln,k,parts,r,idx,base){
+    ND=0;
+    while((getline ln < logf) > 0){
+      k=split(ln,parts,"\r"); ln=parts[k];       # \r carriage return: keep only text after the last one (progress redraws)
+      gsub(/\033\[[0-9;]*[A-Za-z]/,"",ln);        # strip CSI escapes (ESC[ ... final letter): stray colour/cursor codes from git
+      gsub(/\t/,"  ",ln);                         # \t tab: expand to two spaces
+      gsub(/[[:cntrl:]]/," ",ln);                 # blank any other control characters (ESC, BEL, etc.)
+      ND++; raw[ND]=ln;
+    }
+    close(logf);
+    VN=(ND<MAXBH)? ND : MAXBH;
+    base=(ND>MAXBH)? ND-MAXBH : 0;
+    for(r=0;r<VN;r++){ idx=base+r+1; vis[r]=raw[idx] }
+  }
+  function alive(){ return (system("kill -0 " pid " 2>/dev/null")==0) }
+  function fexists(f,  r){ r=(getline _ < f); close(f); return (r>=0) }
+  # Grow the block downward to match the output, capped at the screen height,
+  # printing the line feeds that make room (and scroll the terminal once it is
+  # full) as the output gets taller.
+  function grow(  delta,i){
+    if(VN>BH){
+      delta=VN-BH;
+      # \n line feed (cooked mode -> CR+LF): moves down a row, scrolling the
+      # terminal up by one when at the bottom -- which is how the block grows.
+      if(BH==0){ for(i=0;i<delta-1;i++) printf "\n" }
+      else { for(i=0;i<delta;i++) printf "\n" }
+      BH=VN;
+    }
+  }
+  # --- particle system -----------------------------------------------------
+  # A cluster-bomb barrage: small explosions detonate at random spots over the
+  # block, each throwing out a short-lived burst of fire particles that fly out,
+  # slow, cool from white to orange to red, and rise into grey smoke. Particles
+  # are splatted additively onto a per-frame RGB grid so overlapping fire piles
+  # up into bright white-hot cores, just like real flame.
+  #
+  # Particle state lives in parallel arrays 1..NP:
+  #   PX,PY position (col,row, floats)   PVX,PVY velocity (cells/frame)
+  #   PAGE,PLIFE age and lifetime         PSZ base radius   PKIND 0 fire 1 spark 2 flash
+  function addParticle(x,y,vx,vy,life,sz,kind){
+    NP++;
+    PX[NP]=x; PY[NP]=y; PVX[NP]=vx; PVY[NP]=vy; PAGE[NP]=0; PLIFE[NP]=life; PSZ[NP]=sz; PKIND[NP]=kind;
+  }
+  # Detonate one bomb at (cx,cy) with the given size: a bright flash, a ring of
+  # fire particles thrown outward, and a few fast sparks.
+  function spawnExplosion(cx,cy,scale,  n,i,ang,sp){
+    addParticle(cx,cy, 0,0, 3+int(rand()*3), scale*2.0, 2);
+    n=9+int(rand()*9);
+    for(i=0;i<n;i++){
+      ang=rand()*PI2; sp=(0.5+rand()*1.6)*scale;
+      addParticle(cx,cy, cos(ang)*sp, sin(ang)*sp*0.5 - 0.10*scale, 10+int(rand()*8), (0.7+rand()*1.0)*scale, 0);
+    }
+    n=2+int(rand()*4);
+    for(i=0;i<n;i++){
+      ang=rand()*PI2; sp=(1.6+rand()*1.8)*scale;
+      addParticle(cx,cy, cos(ang)*sp, sin(ang)*sp*0.5, 5+int(rand()*5), 0.5+rand()*0.4, 1);
+    }
+  }
+  # Advance every particle one frame and drop the dead ones (compacting the
+  # arrays). Fire drags hard and floats up, sparks fall under gravity, the flash
+  # stays put.
+  function updateParticles(  i,j,k){
+    j=0;
+    for(i=1;i<=NP;i++){
+      PAGE[i]++;
+      if(PAGE[i]<PLIFE[i]){
+        k=PKIND[i];
+        if(k==1){ PVX[i]*=0.90; PVY[i]=PVY[i]*0.90+0.07 }
+        else if(k==0){ PVX[i]*=0.80; PVY[i]=PVY[i]*0.80-0.05 }
+        PX[i]+=PVX[i]; PY[i]+=PVY[i];
+        j++;
+        PX[j]=PX[i];PY[j]=PY[i];PVX[j]=PVX[i];PVY[j]=PVY[i];PAGE[j]=PAGE[i];PLIFE[j]=PLIFE[i];PSZ[j]=PSZ[i];PKIND[j]=PKIND[i];
+      }
+    }
+    NP=j;
+  }
+  # Splat every particle onto the additive colour grid (aR/aG/aB), tagged with
+  # the frame number so stale cells read as empty without clearing the arrays.
+  function splatParticles(  i,a,k,inten,pr,pg,pb,sa,sz,prx,pry,c0,c1,r0,r1,r,c,dx,dy,d2,fo,idx){
+    fnum++;
+    for(i=1;i<=NP;i++){
+      a=PAGE[i]/PLIFE[i]; if(a>1)a=1;
+      k=PKIND[i];
+      if(k==2){ inten=(1.0-a)*1.1; pr=255; pg=246; pb=214 }
+      else if(k==1){ inten=(1.0-a)*0.9; setgrad(a*0.55); pr=G_r; pg=G_g; pb=G_b }
+      else {
+        setgrad(a*0.95); pr=G_r; pg=G_g; pb=G_b;
+        sa=ss(0.55,1.0,a); pr=pr*(1-sa)+80*sa; pg=pg*(1-sa)+76*sa; pb=pb*(1-sa)+72*sa;
+        inten=(a<0.7)? 1.0 : (1.0-(a-0.7)/0.3);
+      }
+      if(inten<=0.02) continue;
+      sz=PSZ[i]*(1.0+1.3*a);
+      prx=sz; pry=sz*0.5;
+      if(prx<0.7)prx=0.7; if(pry<0.55)pry=0.55; if(prx>8)prx=8; if(pry>4.5)pry=4.5;
+      pr*=inten; pg*=inten; pb*=inten;
+      c0=int(PX[i]-prx); c1=int(PX[i]+prx)+1; r0=int(PY[i]-pry); r1=int(PY[i]+pry)+1;
+      if(c0<0)c0=0; if(c1>W-1)c1=W-1; if(r0<0)r0=0; if(r1>BH-1)r1=BH-1;
+      for(r=r0;r<=r1;r++){
+        dy=(r-PY[i])/pry;
+        for(c=c0;c<=c1;c++){
+          dx=(c-PX[i])/prx; d2=dx*dx+dy*dy;
+          if(d2<1.0){
+            fo=1.0-d2; fo=fo*fo;
+            idx=r*W+c;
+            if(aStamp[idx]!=fnum){ aR[idx]=0; aG[idx]=0; aB[idx]=0; aStamp[idx]=fnum }
+            aR[idx]+=pr*fo; aG[idx]+=pg*fo; aB[idx]+=pb*fo;
+          }
+        }
+      }
+    }
+  }
+  # Draw the block in place from the colour grid, compositing the fire over the
+  # work output (text under bright fire becomes a dark silhouette).
+  function renderParticles(  r,c,idx,L,uch,haslog,R,Gc,B,br,sgr,ch,prev,line,dr,dg,db){
+    if(BH<=0) return;
+    # Move to the top of the block to repaint it. \r is carriage return (go to
+    # column 1); \033[<n>A is CUU (cursor up n rows). \033 is the ESC byte and
+    # \033[ is the CSI that introduces every sequence below.
+    if(BH>1) O=sprintf("\r\033[%dA",BH-1); else O="\r";
+    for(r=0;r<BH;r++){
+      L=length(vis[r]); prev=""; line="";
+      for(c=0;c<W;c++){
+        uch=(c<L)? substr(vis[r],c+1,1) : " "; haslog=(c<L && uch!=" ");
+        idx=r*W+c;
+        if(aStamp[idx]==fnum){ R=aR[idx]; Gc=aG[idx]; B=aB[idx]; br=R+Gc+B } else br=0;
+        if(br>16){
+          if(R>255)R=255; if(Gc>255)Gc=255; if(B>255)B=255;
+          R=int(R); Gc=int(Gc); B=int(B);
+          if(haslog){
+            dr=int(R*0.25); dg=int(Gc*0.25); db=int(B*0.25); ch=uch;
+            # ESC[...m is SGR (select graphic rendition): 0 reset, 38;2;r;g;b sets a
+            # 24-bit foreground, 48;2;r;g;b a 24-bit background -- dark text on bright fire
+            sgr=sprintf("\033[0;38;2;%d;%d;%d;48;2;%d;%d;%dm",dr,dg,db,R,Gc,B);
+          } else {
+            # SGR: 0 reset, 48;2;r;g;b = 24-bit background only (a solid fire cell)
+            ch=" "; sgr=sprintf("\033[0;48;2;%d;%d;%dm",R,Gc,B);
+          }
+        } else {
+          ch=haslog?uch:" "; sgr="\033[0m";   # ESC[0m -- SGR 0: back to default colours
+        }
+        if(sgr!=prev){ line=line sgr; prev=sgr }
+        line=line ch;
+      }
+      # ESC[0m resets colour at the row end; ESC[K is EL (erase in line), clearing
+      # from the cursor to the end of the row so stale fire to the right is wiped.
+      O=O line "\033[0m\033[K";
+      if(r<BH-1) O=O "\n";   # \n line feed: advance to the next block row
+    }
+    O=O "\r";   # \r carriage return: leave the cursor at column 1 of the block bottom
+    printf "%s",O; fflush();
+  }
+  # One frame of the barrage: detonate new bombs at a rate scaled to the area of
+  # the block (so a big terminal gets a proportionally busier barrage, not a few
+  # lonely blasts), advance the particles, and draw. Spawning is off in the tail
+  # so the last bursts can die out.
+  function stepBarrage(spawning,  rate,cx,cy,scale){
+    if(spawning && BH>0){
+      rate=(W*BH)/2400.0; if(rate<0.5)rate=0.5;
+      spawnBudget+=rate;
+      while(spawnBudget>=1.0 && NP<MAXP){
+        cx=2+rand()*(W-4); cy=1+rand()*(BH-1); scale=0.8+rand()*1.9;
+        spawnExplosion(cx,cy,scale);
+        spawnBudget-=1.0;
+      }
+      if(NP>=MAXP || spawnBudget>4) spawnBudget=0;
+    }
+    updateParticles();
+    splatParticles();
+    renderParticles();
+  }
+  # Settle the screen to the plain output: jump to the top of the block, print
+  # every captured line, then erase the rest of the block below so the leftover
+  # blast is cleared and the cursor lands right after the output.
+  function cleanout(  r){
+    # \r to column 1, then \033[<n>A (CUU) up to the top of the block
+    if(BH>1) printf "\r\033[%dA",BH-1; else printf "\r";
+    # each line: the text, then \033[K (EL) to wipe trailing fire, then \n to advance
+    for(r=1;r<=ND;r++) printf "%s\033[K\n", raw[r];
+    printf "\033[J";   # \033[J is ED (erase in display): clear from the cursor to the end of the screen
+    fflush();
+  }
+  BEGIN{
+    # The block caps at the full screen height. Growing this last row forces the
+    # one scroll that carries the command line above the output off into
+    # scrollback, so the whole screen ends up in the blast (not a window below
+    # row one).
+    MAXBH=H; if(MAXBH<1)MAXBH=1;
+    SLEEPCMD="sleep " delay;
+    PI2=6.28318;
+    srand(); for(sk=0; sk<(pid%131); sk++) rand();
+    BH=0; total=0; NP=0; fnum=0; spawnBudget=0; MAXP=900;
+    # The barrage rages while the work runs.
+    while(alive()){
+      if(total>maxframes) break;
+      readlog(); grow();
+      stepBarrage(1);
+      system(SLEEPCMD); total++;
+    }
+    # Two-second tail: keep detonating until the one-second fade mark, then stop
+    # so the last bombs burn out (~1s) and the smoke clears to reveal the output,
+    # until the two-second stop mark. Both marks are dropped by a timer in the
+    # shell, so the tail is two seconds of real wall-clock no matter how fast the
+    # frames render. --fast skips it.
+    while(!fast && !fexists(stopf)){
+      if(total>maxframes) break;
+      readlog(); grow();
+      stepBarrage(fexists(fadef)? 0 : 1);
+      system(SLEEPCMD); total++;
+    }
+    readlog(); grow();
+    cleanout();
+  }'
+}
+
+printf '\a'   # BEL (0x07): ring the terminal bell -- the detonation alert
+if [ -t 1 ] && [ "$NOCOLOR" -ne 1 ]; then
+  tput civis 2>/dev/null    # terminfo "cursor invisible": hide the cursor while animating
+  measure_terminal
+  # Timer: once the work has finished, mark one second later (start dissipating)
+  # and two seconds later (stop), giving the barrage a real two-second tail.
+  if [ "$FAST" -ne 1 ]; then
+    ( while [ ! -f "$DONE" ]; do sleep 0.05; done
+      sleep 1; : > "$FADE"
+      sleep 1; : > "$STOP" ) &
+    TIMERPID=$!
+  fi
+  ANIMATING=1
+  animate
+  ANIMATING=0
+  tput cnorm 2>/dev/null    # terminfo "cursor normal": show the cursor again
+  printf '\033[0m'          # ESC[0m -- SGR 0: reset all colours and text attributes
+  [ -n "$TIMERPID" ] && kill "$TIMERPID" 2>/dev/null
+else
+  wait "$WORKPID" 2>/dev/null
+  cat "$LOG"
+fi
+
+# ---------------------------------------------------------------------------
+# Report
+# ---------------------------------------------------------------------------
+
+wait "$WORKPID" 2>/dev/null
+STATUS="$(cat "$DONE" 2>/dev/null)"
+rm -f "$LOG" "$DONE" "$FADE" "$STOP"
+
+if [ "$STATUS" != "0" ]; then
+  echo
+  echo "armageddon failed (exit $STATUS); the fallout above may be incomplete."
+  exit "${STATUS:-1}"
+fi
