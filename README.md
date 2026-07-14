@@ -137,10 +137,13 @@ git config --global rerere.enabled true
 
   Blow everything away and reset back to a pristine copy of upstream.
   Removes all worktree debris, deletes every local branch (including
-  main), empties the stash, recreates main tracking upstream/main, and
-  force-pushes your fork's main to match upstream's main. Asks for
-  confirmation first (type "armageddon"), or pass `-y` to skip the
-  prompt. Plays a particle-based cluster-bomb barrage across the whole
+  main, but keeping branches checked out in linked worktrees), empties
+  the stash, recreates main tracking upstream/main, and force-pushes
+  your fork's main to match upstream's main. Inside a linked worktree,
+  destroys only that worktree: wipes it clean, deletes the branch it had
+  checked out, and leaves it detached at upstream/main, keeping other
+  branches, the stash, and your fork untouched. Asks for confirmation
+  first (type "armageddon"), or pass `-y` to skip the prompt. Plays a particle-based cluster-bomb barrage across the whole
   terminal while the work's output scrolls up through it; your earlier
   console contents scroll up into scrollback, and the work's output is
   left on screen when it finishes. The barrage runs for two seconds past

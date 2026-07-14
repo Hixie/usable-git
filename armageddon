@@ -5,12 +5,18 @@
 #
 #   * removes worktree debris (modifications, deletions, type changes,
 #     untracked files, ignored files)
-#   * deletes every local branch, including main
+#   * deletes every local branch, including main (branches checked out in
+#     linked worktrees are kept: git refuses to delete those)
 #   * fetches from upstream and origin
 #   * recreates main tracking upstream/main
 #   * empties the stash
 #   * force-pushes the fresh main to origin so your fork's main matches
 #     upstream's main
+#
+# Inside a linked worktree (one made with "git worktree add"), the destruction
+# is scoped to that worktree instead: it is wiped clean, the branch it had
+# checked out is deleted, and it is left detached at upstream/main. Branches
+# used elsewhere, the shared stash, and your fork are untouched.
 #
 # While this runs, a cluster-bomb barrage plays over the work's output: a
 # particle system detonates small explosions at random spots, each throwing out a
@@ -34,12 +40,25 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   exit 1
 fi
 
+# A linked worktree has its own git dir under the shared repository's
+# .git/worktrees/; in the primary checkout the two directories are the same.
+# The cd/pwd round trip normalizes the paths, which git may report relative
+# to the current directory.
+GITDIR="$(cd "$(git rev-parse --git-dir)" && pwd)"
+COMMONDIR="$(cd "$(git rev-parse --git-common-dir)" && pwd)"
+IS_WORKTREE=0
+if [ "$GITDIR" != "$COMMONDIR" ]; then
+  IS_WORKTREE=1
+fi
+
 if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream'); then
   echo 'armageddon needs an upstream remote to reset back to. Consider "nuke" for a single branch.'
   exit 1
 fi
 
-if (! git remote | grep --fixed-strings --line-regexp --quiet 'origin'); then
+# Only the full demolition pushes to the fork; the worktree-scoped one never
+# touches origin.
+if [ "$IS_WORKTREE" -ne 1 ] && (! git remote | grep --fixed-strings --line-regexp --quiet 'origin'); then
   echo 'armageddon needs an origin remote (your fork) to push the reset main to.'
   exit 1
 fi
@@ -65,6 +84,11 @@ for arg in "$@"; do
       echo 'Obliterate every local branch and reset this checkout and your fork'"'"'s'
       echo "$MAIN back to a pristine copy of upstream/$MAIN."
       echo
+      echo 'Inside a linked worktree, only that worktree is destroyed: it is wiped'
+      echo 'clean, the branch it has checked out is deleted, and it is left detached'
+      echo "at upstream/$MAIN. Branches used elsewhere, the stash, and your fork are"
+      echo 'untouched.'
+      echo
       echo '  -y, --yes    skip the confirmation prompt'
       echo '  --fast       end the explosion as soon as the work finishes'
       echo '  --no-color   run without the explosion animation'
@@ -78,10 +102,18 @@ for arg in "$@"; do
 done
 
 if [ "$ASSUME_YES" -ne 1 ]; then
-  echo "This will DESTROY everything in $TOPLEVEL that isn't upstream/$MAIN:"
-  echo "  * discard all uncommitted changes and delete untracked + ignored files"
-  echo "  * delete every local branch, including $MAIN, and empty the stash"
-  echo "  * force-push origin/$MAIN to match upstream/$MAIN (rewriting your fork)"
+  if [ "$IS_WORKTREE" -eq 1 ]; then
+    echo "This is a linked worktree. This will DESTROY everything in $TOPLEVEL:"
+    echo "  * discard all uncommitted changes and delete untracked + ignored files"
+    echo "  * delete the branch this worktree has checked out"
+    echo "  * leave the worktree detached at upstream/$MAIN"
+    echo "Branches used elsewhere, the stash, and your fork are untouched."
+  else
+    echo "This will DESTROY everything in $TOPLEVEL that isn't upstream/$MAIN:"
+    echo "  * discard all uncommitted changes and delete untracked + ignored files"
+    echo "  * delete every local branch, including $MAIN, and empty the stash"
+    echo "  * force-push origin/$MAIN to match upstream/$MAIN (rewriting your fork)"
+  fi
   echo
   if [ ! -t 0 ]; then
     echo 'Refusing to run unattended without -y.'
@@ -108,6 +140,34 @@ work() {
   set -e
   cd "$TOPLEVEL"
 
+  if [ "$IS_WORKTREE" -eq 1 ]; then
+    # This is a linked worktree: destroy only what belongs to it. A branch can
+    # be checked out in at most one worktree, so deleting this worktree's
+    # branch takes nothing from the others.
+    BRANCH="$(git symbolic-ref --quiet --short HEAD || true)"
+
+    # Step off the branch so it becomes deletable, then wipe the worktree
+    # clean: tracked changes, deletions, type changes, and finally untracked
+    # and ignored files.
+    git checkout --detach
+    git reset --hard
+    git clean -xffd
+
+    if [ -n "$BRANCH" ]; then
+      git branch -D "$BRANCH"
+    fi
+
+    # Refresh upstream and end detached at its main. Detached, because main
+    # may be checked out in the primary checkout, and git allows a branch to
+    # be checked out in only one worktree at a time.
+    git fetch --prune upstream
+    git checkout --detach "upstream/$MAIN"
+
+    echo
+    git status -sb
+    return
+  fi
+
   # Step off whatever branch we're on so every branch becomes deletable, then
   # wipe the worktree clean: tracked changes, deletions, type changes, and
   # finally untracked and ignored files.
@@ -115,9 +175,16 @@ work() {
   git reset --hard
   git clean -xffd
 
-  # Delete every local branch, including main.
-  git for-each-ref --format='%(refname:short)' refs/heads/ |
-    while read -r branch; do git branch -D "$branch"; done
+  # Delete every local branch, including main. Branches checked out in linked
+  # worktrees are kept: git refuses to delete a branch that is checked out.
+  git for-each-ref --format='%(refname:short) %(worktreepath)' refs/heads/ |
+    while read -r branch wtpath; do
+      if [ -n "$wtpath" ]; then
+        echo "keeping $branch: checked out in $wtpath"
+      else
+        git branch -D "$branch"
+      fi
+    done
 
   # Refresh both remotes and drop stale remote-tracking refs.
   git fetch --prune upstream
