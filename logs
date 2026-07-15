@@ -361,6 +361,20 @@ else
   log_output=$(git --no-pager log --max-count="$count" --date="$date_style" --format="$format" "$@")
 fi
 
+# Every log line must carry the fields requested above, with the full commit
+# hash in field 1. git log options passed through on the command line can
+# replace the format or add lines of their own; when that happens, the lines
+# cannot be displayed, so the run stops here.
+if [ -n "$log_output" ]; then
+  format_violation=$(
+    printf '%s\n' "$log_output" |
+      awk -F "$field_separator" '$1 !~ /^[0-9a-f]+$/ || NF < 5 { print NR; exit }'
+  )
+  if [ -n "$format_violation" ]; then
+    die "git log arguments changed the log output format; options like --graph, --oneline, --pretty, and -p are not supported"
+  fi
+fi
+
 # Mark the displayed commits that are not reachable from the comparison ref.
 # Each log line carries the commit's full hash in field 1. git rev-list
 # walks ancestry, so its output also includes commits that are not
