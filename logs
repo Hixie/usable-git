@@ -23,7 +23,9 @@ commit ID "[workspace]" appears above the commits, giving the age of the most
 recently changed file and a count of the changes.
 
 Commits that are not yet on upstream/main are flagged with a leading "+" in the
-left margin. Long commit messages are shortened to fit the terminal width.
+left margin. When there is no remote named "upstream", origin/main is used
+instead. The branch name comes from \$MAIN when that is set. Long commit
+messages are shortened to fit the terminal width.
 
 Options:
   -n, --count N       Show N commits. The default is at least 10, expanded
@@ -347,7 +349,12 @@ EOF
   workspace_row="${field_separator}[workspace]${field_separator}${age}${field_separator}(Uncommitted)${field_separator}"
 fi
 
-upstream_ref=upstream/main
+main_branch=${MAIN:-main}
+if git remote | grep --fixed-strings --line-regexp --quiet 'upstream'; then
+  upstream_ref=refs/remotes/upstream/$main_branch
+else
+  upstream_ref=refs/remotes/origin/$main_branch
+fi
 local_only_hashes=
 if git rev-parse --verify --quiet "$upstream_ref" >/dev/null 2>&1; then
   if [ "$#" -gt 0 ]; then
