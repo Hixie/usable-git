@@ -362,13 +362,23 @@ else
 fi
 
 # Mark the displayed commits that are not reachable from the comparison ref.
-# Each log line carries the commit's full hash in field 1.
+# Each log line carries the commit's full hash in field 1. git rev-list
+# walks ancestry, so its output also includes commits that are not
+# displayed; only the displayed hashes are kept in the exported set.
 local_only_hashes=
 if [ -n "$log_output" ] && git rev-parse --verify --quiet "$upstream_ref" >/dev/null 2>&1; then
+  displayed_hashes=$(printf '%s\n' "$log_output" | cut -d "$field_separator" -f 1)
+  unreachable_hashes=$(printf '%s\n' "$displayed_hashes" | git rev-list --stdin --not "$upstream_ref")
   local_only_hashes=$(
-    printf '%s\n' "$log_output" |
-      cut -d "$field_separator" -f 1 |
-      git rev-list --stdin --not "$upstream_ref"
+    {
+      printf '%s\n\n' "$displayed_hashes"
+      printf '%s\n' "$unreachable_hashes"
+    } |
+      awk '
+        $0 == "" { separator_seen = 1; next }
+        !separator_seen { is_displayed[$0] = 1; next }
+        $0 in is_displayed
+      '
   )
 fi
 LOGS_LOCAL_ONLY=$local_only_hashes
