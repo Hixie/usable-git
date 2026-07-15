@@ -355,13 +355,21 @@ if git remote | grep --fixed-strings --line-regexp --quiet 'upstream'; then
 else
   upstream_ref=refs/remotes/origin/$main_branch
 fi
+if [ "$date_style" = relative ]; then
+  log_output=$(git --no-pager log --max-count="$count" --format="$format" "$@")
+else
+  log_output=$(git --no-pager log --max-count="$count" --date="$date_style" --format="$format" "$@")
+fi
+
+# Mark the displayed commits that are not reachable from the comparison ref.
+# Each log line carries the commit's full hash in field 1.
 local_only_hashes=
-if git rev-parse --verify --quiet "$upstream_ref" >/dev/null 2>&1; then
-  if [ "$#" -gt 0 ]; then
-    local_only_hashes=$(git rev-list "$@" --not "$upstream_ref" 2>/dev/null || true)
-  else
-    local_only_hashes=$(git rev-list HEAD --not "$upstream_ref" 2>/dev/null || true)
-  fi
+if [ -n "$log_output" ] && git rev-parse --verify --quiet "$upstream_ref" >/dev/null 2>&1; then
+  local_only_hashes=$(
+    printf '%s\n' "$log_output" |
+      cut -d "$field_separator" -f 1 |
+      git rev-list --stdin --not "$upstream_ref"
+  )
 fi
 LOGS_LOCAL_ONLY=$local_only_hashes
 export LOGS_LOCAL_ONLY
@@ -370,10 +378,8 @@ export LOGS_LOCAL_ONLY
   if [ -n "$workspace_row" ]; then
     printf '%s\n' "$workspace_row"
   fi
-  if [ "$date_style" = relative ]; then
-    git --no-pager log --max-count="$count" --format="$format" "$@"
-  else
-    git --no-pager log --max-count="$count" --date="$date_style" --format="$format" "$@"
+  if [ -n "$log_output" ]; then
+    printf '%s\n' "$log_output"
   fi
 } |
   awk -F "$field_separator" \
