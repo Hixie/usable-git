@@ -53,7 +53,10 @@ git config --global rerere.enabled true
 
 `d`
 
-  Show a diff of your changes on the current branch.
+  Show the combined diff of the commits on the current branch that are not on
+  upstream/main. When there is no remote named upstream, compare with
+  origin/main instead. The main branch name comes from `$MAIN` when that is
+  set.
 
 
 `add quux.dart baz.dart`
