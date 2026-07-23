@@ -9,21 +9,25 @@ if ! git rev-parse --git-dir > /dev/null 2>&1; then
   exit 1
 fi
 
-if [ "`git rev-parse --abbrev-ref HEAD`" == "$MAIN" ]; then
-  echo 'Rename the branch first. You were about to push your $MAIN branch.'
+if ! current_branch=$(git symbolic-ref --quiet --short HEAD); then
+  echo 'This checkout is not on a branch. Check out or create a branch first.'
   exit 1
 fi
 
-if [[ `git status --porcelain` ]]; then
+if [ "$current_branch" == "$MAIN" ]; then
+  echo "Rename the branch first. You were about to push your $MAIN branch."
+  exit 1
+fi
+
+if [[ $(git status --porcelain) ]]; then
   echo 'WARNING! Your branch has uncommitted changes, consider "commit" or "clean".'
 fi
 
-if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
-  echo 'Push only works when you have an upstream; consider "save" or "publish".'
-  exit 1
+base_remote=origin
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  base_remote=upstream
 fi
 
-git fetch upstream
-git rebase upstream/$MAIN
-#git diff upstream/$MAIN
-git push -f origin `git rev-parse --abbrev-ref HEAD`
+git fetch "$base_remote"
+git rebase "$base_remote/$MAIN"
+git push -f origin "HEAD:refs/heads/$current_branch"
