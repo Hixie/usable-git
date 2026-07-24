@@ -93,7 +93,9 @@ git config --global rerere.enabled true
 
 `publish`
 
-  Push your current main branch to your GitHub main branch.
+  Rebase the current branch onto `origin/main`, then push it to
+  `origin/main`. The main branch name comes from `$MAIN` when that is set.
+  Repositories with an `upstream` remote are rejected.
 
 
 `n bar`

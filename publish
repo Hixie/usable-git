@@ -1,27 +1,31 @@
 #!/bin/bash
 
+set -e
+
+MAIN="${MAIN:-main}"
+
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
   echo 'This is not a git repository.'
   exit 1
 fi
 
-if [ "`git rev-parse --abbrev-ref HEAD`" != "main" ]; then
-  echo 'This is not the main branch. Consider "push" or "save" when working with a branch.'
+if ! git symbolic-ref --quiet --short HEAD > /dev/null; then
+  echo 'This checkout is not on a branch. Check out or create a branch first.'
   exit 1
 fi
 
-# if [[ `git status --porcelain` ]]; then
-#   echo 'Your branch has uncommitted changes. Use "commit" or "clean" first.'
-#   exit 1
-# fi
+if [[ $(git status --porcelain) ]]; then
+  echo 'The working tree has uncommitted changes. Use "commit" or "clean" first.'
+  exit 1
+fi
 
 if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
   echo 'This repo has an upstream. Use "push" to push a branch then merge it there.'
   exit 1
 fi
 
-set -ex
+set -x
 git fetch origin
-git rebase origin
-git diff origin
-git push origin
+git rebase "origin/$MAIN"
+git diff "origin/$MAIN"
+git push origin "HEAD:refs/heads/$MAIN"
