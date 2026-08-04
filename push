@@ -32,4 +32,26 @@ fi
 
 git fetch "$base_remote"
 rebase_or_abort "$base_remote/$MAIN"
-git push -f origin "HEAD:refs/heads/$current_branch"
+
+push_log=$(mktemp)
+trap 'rm -f "$push_log"' EXIT
+
+set -o pipefail
+git push -f --progress origin "HEAD:refs/heads/$current_branch" 2>&1 | tee "$push_log"
+
+# When the server offers a page for opening a pull request, it says so in the
+# messages it sends back, each prefixed with "remote:". Take the first URL from
+# the offer onwards and hand it to the browser.
+pr_url=$(
+  sed -n 's/^remote: *//p' "$push_log" |
+  awk 'tolower($0) ~ /create (a )?(pull|merge) request/ { offered = 1 }
+       offered && match($0, /https?:\/\/[^ \t\r]+/) { print substr($0, RSTART, RLENGTH); exit }'
+)
+
+if [ -n "$pr_url" ]; then
+  if command -v open > /dev/null; then
+    open "$pr_url"
+  elif command -v xdg-open > /dev/null; then
+    xdg-open "$pr_url"
+  fi
+fi

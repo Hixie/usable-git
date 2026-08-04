@@ -90,6 +90,8 @@ git config --global rerere.enabled true
 
   Rebase the current branch onto the latest main branch, then send it to
   GitHub. If the rebase has merge conflicts, abort it and do not push.
+  When the server replies with a page for opening a pull request, that
+  page is opened in your browser.
 
 
 `publish`
