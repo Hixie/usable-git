@@ -1,0 +1,158 @@
+#!/bin/bash
+
+set -e
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+TEST_DIR=$(mktemp -d)
+
+source "$SCRIPT_DIR/rebase-or-abort"
+
+cleanup() {
+  rm -rf "$TEST_DIR"
+}
+trap cleanup EXIT
+
+git_config() {
+  git -C "$1" config user.name 'Usable Git Test'
+  git -C "$1" config user.email 'usable-git@example.com'
+}
+
+assert_conflict_was_aborted() {
+  local repo=$1
+  local original_head=$2
+  local output=$3
+
+  [ "$(git -C "$repo" rev-parse HEAD)" = "$original_head" ]
+  [ -z "$(git -C "$repo" ls-files --unmerged)" ]
+  [ -z "$(git -C "$repo" status --porcelain)" ]
+  (
+    cd "$repo"
+    [ ! -d "$(git rev-parse --git-path rebase-merge)" ]
+    [ ! -d "$(git rev-parse --git-path rebase-apply)" ]
+  )
+  [ "$(printf '%s\n' "$output" | tail -n 1)" = \
+    $'\033[33;41mREBASE ABORTED: MERGE CONFLICTS DETECTED\033[0m' ]
+}
+
+assert_preexisting_rebase_was_preserved() {
+  local repo=$1
+  local output=$2
+
+  [ "$(git -C "$repo" show :2:conflict.txt)" = topic ]
+  [ "$(git -C "$repo" show :3:conflict.txt)" = main ]
+  [ "$(cat "$repo/conflict.txt")" = 'resolution in progress' ]
+  (
+    cd "$repo"
+    [ -d "$(git rev-parse --git-path rebase-merge)" ] ||
+      [ -d "$(git rev-parse --git-path rebase-apply)" ]
+  )
+  if printf '%s\n' "$output" | grep --fixed-strings --quiet \
+    'REBASE ABORTED: MERGE CONFLICTS DETECTED'; then
+    exit 1
+  fi
+}
+
+test_other_rebase_failure() (
+  git() {
+    case "$1 $2" in
+      'rebase target') return 23 ;;
+      'ls-files --unmerged') return 0 ;;
+      *) return 99 ;;
+    esac
+  }
+
+  set +e
+  output=$(rebase_or_abort target 2>&1)
+  status=$?
+  set -e
+
+  [ "$status" -eq 23 ]
+  [ -z "$output" ]
+)
+
+test_preexisting_conflict() (
+  git() {
+    case "$1 $2" in
+      'rebase target') return 23 ;;
+      'ls-files --unmerged') printf 'conflict.txt\n' ;;
+      'rev-parse --git-path') printf '%s\n' "$TEST_DIR/not-a-rebase" ;;
+      *) return 99 ;;
+    esac
+  }
+
+  set +e
+  output=$(rebase_or_abort target 2>&1)
+  status=$?
+  set -e
+
+  [ "$status" -eq 23 ]
+  [ -z "$output" ]
+)
+
+run_conflict_test() {
+  local command=$1
+  local remote="$TEST_DIR/$command-origin.git"
+  local seed="$TEST_DIR/$command-seed"
+  local repo="$TEST_DIR/$command-repo"
+  local updater="$TEST_DIR/$command-updater"
+  local original_head
+  local output
+  local status
+
+  git init --bare --quiet "$remote"
+  git clone --quiet "$remote" "$seed" 2>/dev/null
+  git_config "$seed"
+  printf 'base\n' > "$seed/conflict.txt"
+  git -C "$seed" add conflict.txt
+  git -C "$seed" commit --quiet -m base
+  git -C "$seed" branch -M main
+  git -C "$seed" push --quiet -u origin main
+  git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
+
+  git clone --quiet "$remote" "$repo"
+  git_config "$repo"
+  git -C "$repo" switch --quiet -c topic
+  printf 'topic\n' > "$repo/conflict.txt"
+  git -C "$repo" commit --quiet -am topic
+  original_head=$(git -C "$repo" rev-parse HEAD)
+
+  git clone --quiet "$remote" "$updater"
+  git_config "$updater"
+  printf 'main\n' > "$updater/conflict.txt"
+  git -C "$updater" commit --quiet -am main
+  git -C "$updater" push --quiet
+
+  set +e
+  output=$(cd "$repo" && PATH="$SCRIPT_DIR:$PATH" "$command" 2>&1)
+  status=$?
+  set -e
+
+  [ "$status" -eq 1 ]
+  assert_conflict_was_aborted "$repo" "$original_head" "$output"
+
+  if [ "$command" = push ]; then
+    if git --git-dir="$remote" show-ref --verify --quiet refs/heads/topic; then
+      exit 1
+    fi
+  else
+    set +e
+    git -C "$repo" rebase origin/main >/dev/null 2>&1
+    status=$?
+    set -e
+    [ "$status" -ne 0 ]
+    printf 'resolution in progress\n' > "$repo/conflict.txt"
+
+    set +e
+    output=$(cd "$repo" && PATH="$SCRIPT_DIR:$PATH" "$command" 2>&1)
+    status=$?
+    set -e
+
+    [ "$status" -ne 0 ]
+    assert_preexisting_rebase_was_preserved "$repo" "$output"
+  fi
+}
+
+test_other_rebase_failure
+test_preexisting_conflict
+run_conflict_test pull
+run_conflict_test push
