@@ -4,10 +4,12 @@ set -e
 
 MAIN="${MAIN:-main}"
 
+source "$(dirname "$0")/rebase-or-abort"
+
 if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
   git fetch upstream
-  git rebase upstream/$MAIN
+  rebase_or_abort "upstream/$MAIN"
 else
   git fetch origin
-  git rebase origin/$MAIN
+  rebase_or_abort "origin/$MAIN"
 fi

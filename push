@@ -4,6 +4,8 @@ set -e
 
 MAIN="${MAIN:-main}"
 
+source "$(dirname "$0")/rebase-or-abort"
+
 if ! git rev-parse --git-dir > /dev/null 2>&1; then
   echo 'This is not a git repository.'
   exit 1
@@ -29,5 +31,5 @@ if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
 fi
 
 git fetch "$base_remote"
-git rebase "$base_remote/$MAIN"
+rebase_or_abort "$base_remote/$MAIN"
 git push -f origin "HEAD:refs/heads/$current_branch"

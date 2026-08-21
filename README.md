@@ -88,7 +88,8 @@ git config --global rerere.enabled true
 
 `push`
 
-  Send the current branch to GitHub.
+  Rebase the current branch onto the latest main branch, then send it to
+  GitHub. If the rebase has merge conflicts, abort it and do not push.
 
 
 `publish`
@@ -115,7 +116,8 @@ git config --global rerere.enabled true
 
 `pull`
 
-  Pull the changes from upstream.
+  Rebase the current branch onto the latest main branch. If the rebase has
+  merge conflicts, abort it.
 
 
 `fix quux.dart`
