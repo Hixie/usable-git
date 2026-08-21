@@ -20,6 +20,4 @@ else
   START=$(git hash-object -t tree /dev/null)
 fi
 
-git diff --stat "$START" HEAD "$@"
 git diff --minimal --find-copies-harder --ignore-space-change --inter-hunk-context=25 --color=auto --unified=50 "$START" HEAD "$@"
-git diff --check "$START" HEAD "$@"
