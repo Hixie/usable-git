@@ -1,0 +1,537 @@
+#!/usr/bin/env python3
+"""Drive prwatch's change detection with made-up data and check what it says.
+
+The events worth having are the rare ones, and the rare ones are the ones a
+live pull request will not produce on demand: a cancelled run, a check that
+goes back to pending, a branch that starts conflicting, a commit with no CI
+at all. This feeds those situations to the same methods the watcher uses and
+compares the lines that come out.
+
+Run it with no arguments. It touches no network and no repository.
+"""
+
+import importlib.machinery
+import importlib.util
+import io
+import sys
+from contextlib import redirect_stdout
+from pathlib import Path
+
+spec = importlib.util.spec_from_loader(
+    "prwatch",
+    importlib.machinery.SourceFileLoader("prwatch",
+                                         str(Path(__file__).with_name("prwatch"))))
+prwatch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(prwatch)
+
+
+class Options:
+    """The defaults, so each case names only what it cares about."""
+
+    def __init__(self, **overrides):
+        defaults = dict(expect=None, once=False, follow=False, interval=60,
+                        heartbeat=900, stall=1800, stability=3, min_checks=0,
+                        no_ci_grace=900, warn_after=3, max_lines=12,
+                        detail=True, fresh=True, state=None, exit_code=False,
+                        require_review=None, excerpt=300)
+        defaults.update(overrides)
+        self.__dict__.update(defaults)
+
+
+def check(name, snapshot_fields, known, options=None, head="a" * 40):
+    """Absorb one snapshot on top of `known` and return the lines emitted."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              options or Options())
+    watcher.known.update(known)
+    watcher.head = known.get("_head", head)
+    snap = prwatch.Snapshot()
+    for field, value in snapshot_fields.items():
+        setattr(snap, field, value)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.absorb(snap, announce=True)
+    return name, watcher, out.getvalue()
+
+
+def run_check(fn, expected, forbidden=()):
+    name, watcher, output = fn()
+    problems = [f"missing {want!r}" for want in expected if want not in output]
+    problems += [f"unwanted {no!r}" for no in forbidden if no in output]
+    if problems:
+        print(f"FAIL {name}")
+        for problem in problems:
+            print(f"       {problem}")
+        print("     got:")
+        for line in output.splitlines():
+            print(f"       {line}")
+        return False
+    print(f"ok   {name}")
+    return True
+
+
+def pull(head="a" * 40, state="open", merged=False, mergeable="clean"):
+    return {"head": {"sha": head}, "state": state, "merged": merged,
+            "mergeable_state": mergeable, "title": "t", "draft": False,
+            "html_url": "https://example.invalid/pull/1"}
+
+
+def check_run(name, status="completed", conclusion="success", cid=None):
+    return {cid or name: {"name": name, "status": status,
+                          "conclusion": conclusion, "url": "u", "app": "a"}}
+
+
+def workflow(name="CI", status="completed", conclusion="success", rid="1"):
+    return {rid: {"name": name, "status": status, "conclusion": conclusion,
+                  "url": "u", "attempt": 1, "event": "pull_request"}}
+
+
+def review(user="cubic-dev-ai[bot]", commit="a" * 40, rid="1", state="COMMENTED"):
+    return {rid: {"user": user, "state": state, "commit": commit, "url": "u",
+                  "body": "looks fine"}}
+
+
+def thread(resolved=False, tid="t1"):
+    return {tid: {"resolved": resolved, "outdated": False, "path": "f.py",
+                  "line": 1, "author": "someone", "url": "u", "body": "why?"}}
+
+
+CASES = []
+
+
+def case(fn):
+    CASES.append(fn)
+    return fn
+
+
+# -- the events a green watch never reaches ---------------------------------
+
+@case
+def cancelled_is_not_a_failure():
+    return run_check(
+        lambda: check(
+            "a cancelled check is announced as a cancellation",
+            {"pull": pull(), "checks": check_run("Test", conclusion="cancelled")},
+            {"pull": pull(), "checks": check_run("Test", status="in_progress",
+                                                 conclusion=None),
+             "_head": "a" * 40}),
+        expected=["CANCEL", "Test", "not a test result"],
+        forbidden=["FAIL"])
+
+
+@case
+def rerun_goes_back_to_pending():
+    return run_check(
+        lambda: check(
+            "a check that returns to pending is announced as a rerun",
+            {"pull": pull(), "checks": check_run("Test", status="queued",
+                                                 conclusion="")},
+            {"pull": pull(), "checks": check_run("Test"), "_head": "a" * 40}),
+        expected=["RERUN", "Test"])
+
+
+@case
+def empty_conclusion_is_not_a_verdict():
+    _, watcher, _ = check(
+        "an empty conclusion counts as pending, not as a failure",
+        {"pull": pull(), "checks": check_run("Test", status="queued",
+                                             conclusion=""),
+         "runs": workflow(status="in_progress", conclusion=None)},
+        {"pull": pull()})
+    counts = prwatch.tally_checks(watcher.known["checks"])
+    settled, reason = watcher.is_settled()
+    good = (counts["pending"], counts["bad"], settled) == (1, 0, False)
+    print("ok   an empty conclusion counts as pending, not as a failure"
+          if good else f"FAIL empty conclusion: {counts} {settled} {reason}")
+    return good
+
+
+@case
+def conflict_is_announced():
+    return run_check(
+        lambda: check(
+            "a branch that starts conflicting is announced",
+            {"pull": pull(mergeable="dirty")},
+            {"pull": pull(mergeable="clean")}),
+        expected=["CONFLICT", "no longer merges cleanly"])
+
+
+@case
+def expectation_met_is_announced():
+    options = Options(expect=None)
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1, options)
+    watcher.expect = "b" * 40
+    watcher.expect_met = False
+    watcher.head = "a" * 40
+    snap = prwatch.Snapshot()
+    snap.pull = pull(head="b" * 40)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.absorb(snap, announce=True)
+    output = out.getvalue()
+    good = "MATCH" in output and "RETARGET" in output
+    print("ok   the head becoming the awaited commit is announced" if good
+          else f"FAIL awaited commit: {output}")
+    return good
+
+
+@case
+def closed_without_merging():
+    _, watcher, output = check(
+        "a pull request closed without merging",
+        {"pull": pull(state="closed")},
+        {"pull": pull(state="open")})
+    settled, reason = watcher.is_settled()
+    good = "CLOSED" in output and settled and "without merging" in reason
+    print("ok   a pull request closed without merging settles as closed"
+          if good else f"FAIL closed: {output} / {reason}")
+    return good
+
+
+# -- settling ---------------------------------------------------------------
+
+@case
+def an_empty_board_is_not_green():
+    _, watcher, _ = check(
+        "an empty board",
+        {"pull": pull(), "checks": {}, "runs": {}, "statuses": {}},
+        {"pull": pull()})
+    settled, reason = watcher.is_settled()
+    good = not settled and "appeared" in reason
+    print("ok   a commit with no checks yet is not called settled" if good
+          else f"FAIL empty board: {settled} / {reason}")
+    return good
+
+
+@case
+def only_the_review_bot_is_not_green():
+    """The exact shape that produced a false green: one instant check, no run."""
+    _, watcher, _ = check(
+        "one bot check and no workflow run",
+        {"pull": pull(), "checks": check_run("cubic"), "runs": {},
+         "statuses": {}},
+        {"pull": pull()})
+    settled, reason = watcher.is_settled()
+    good = not settled
+    print("ok   a lone review-bot check does not settle the watch" if good
+          else f"FAIL lone bot check: {settled} / {reason}")
+    return good
+
+
+@case
+def an_unfinished_run_holds_the_watch_open():
+    _, watcher, _ = check(
+        "a run still going",
+        {"pull": pull(), "checks": check_run("Test"),
+         "runs": workflow(status="in_progress", conclusion=None),
+         "statuses": {}},
+        {"pull": pull()})
+    settled, reason = watcher.is_settled()
+    good = not settled and "still going" in reason
+    print("ok   an unfinished workflow run holds the watch open" if good
+          else f"FAIL unfinished run: {settled} / {reason}")
+    return good
+
+
+@case
+def no_ci_settles_only_after_the_grace_period():
+    _, watcher, _ = check(
+        "no CI",
+        {"pull": pull(), "checks": {}, "runs": {}, "statuses": {},
+         "issue_comments": {}, "review_comments": {}, "reviews": {},
+         "threads": {}},
+        {"pull": pull()}, Options(no_ci_grace=0))
+    settled, reason = watcher.is_settled()
+    watcher.options.detail = False
+    out = io.StringIO()
+    with redirect_stdout(out):
+        verdict = watcher.final_report(reason, settled)
+    good = settled and verdict == "NO-CI"
+    print("ok   a commit that never gets a check settles as NO-CI" if good
+          else f"FAIL no ci: {settled} / {verdict} / {reason}")
+    return good
+
+
+@case
+def a_bad_run_without_a_bad_job_is_red():
+    _, watcher, _ = check(
+        "a run that failed with no jobs",
+        {"pull": pull(), "checks": {},
+         "runs": workflow(conclusion="action_required"), "statuses": {},
+         "issue_comments": {}, "review_comments": {}, "reviews": {},
+         "threads": {}},
+        {"pull": pull()})
+    settled, reason = watcher.is_settled()
+    watcher.options.detail = False
+    out = io.StringIO()
+    with redirect_stdout(out):
+        verdict = watcher.final_report(reason, settled)
+    good = verdict == "RED" and "action_required" in out.getvalue()
+    print("ok   a workflow run that failed with no jobs is red" if good
+          else f"FAIL bad run: {verdict} / {out.getvalue()}")
+    return good
+
+
+# -- reading failures -------------------------------------------------------
+
+@case
+def an_unread_facet_is_not_a_zero():
+    _, watcher, _ = check(
+        "an unread facet",
+        {"pull": pull(), "checks": check_run("Test"), "runs": workflow(),
+         "statuses": {}},
+        {"pull": pull()})
+    line = watcher.status_line()
+    settled, reason = watcher.is_settled()
+    out = io.StringIO()
+    watcher.options.detail = False
+    with redirect_stdout(out):
+        verdict = watcher.final_report(reason, settled)
+    good = "comments ? issue / ? inline" in line and verdict == "UNKNOWN"
+    print("ok   a facet never read prints ? and blocks a green verdict"
+          if good else f"FAIL unread facet: {line} / {verdict}")
+    return good
+
+
+@case
+def a_failed_read_keeps_what_it_had():
+    """The bug this replaced: an empty result taken as a deletion."""
+    known = {"pull": pull(), "issue_comments": {"1": {
+        "user": "someone", "updated": "t", "url": "u", "body": "hello"}}}
+    snap = prwatch.Snapshot()
+    snap.pull = pull()
+    snap.errors["issue_comments"] = "simulated outage"
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(warn_after=1))
+    watcher.known.update(known)
+    watcher.head = "a" * 40
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.report_errors(snap)
+        watcher.absorb(snap, announce=True)
+        # the next poll succeeds and returns exactly what was there before
+        recovered = prwatch.Snapshot()
+        recovered.pull = pull()
+        recovered.issue_comments = known["issue_comments"]
+        watcher.report_errors(recovered)
+        watcher.absorb(recovered, announce=True)
+    output = out.getvalue()
+    good = ("WARN" in output and "reading again" in output
+            and "COMMENT" not in output
+            and watcher.known["issue_comments"] == known["issue_comments"])
+    print("ok   a failed read changes nothing and re-announces nothing"
+          if good else f"FAIL failed read: {output}")
+    return good
+
+
+# -- reviews ----------------------------------------------------------------
+
+@case
+def a_review_of_an_older_commit_does_not_count():
+    _, watcher, _ = check(
+        "a review of an older commit",
+        {"pull": pull(), "checks": check_run("Test"), "runs": workflow(),
+         "statuses": {}, "issue_comments": {}, "review_comments": {},
+         "reviews": review(commit="b" * 40), "threads": {}},
+        {"pull": pull()}, Options(require_review="*"))
+    line = watcher.status_line()
+    outstanding = watcher.outstanding_lines()
+    good = ("reviews 1 (none on this head)" in line
+            and any("no review of" in item for item in outstanding))
+    print("ok   a review of an older commit is not a review of this one"
+          if good else f"FAIL stale review: {line} / {outstanding}")
+    return good
+
+
+@case
+def a_review_of_this_commit_counts():
+    _, watcher, _ = check(
+        "a review of this commit",
+        {"pull": pull(), "reviews": review(), "threads": {}},
+        {"pull": pull()}, Options(require_review="cubic"))
+    good = ("reviews 1 (1 on this head)" in watcher.status_line()
+            and not watcher.outstanding_lines())
+    print("ok   a review of the watched commit satisfies --require-review"
+          if good else f"FAIL fresh review: {watcher.status_line()}")
+    return good
+
+
+@case
+def a_required_reviewer_who_has_not_come():
+    _, watcher, _ = check(
+        "a different reviewer",
+        {"pull": pull(), "reviews": review(user="a-human"), "threads": {}},
+        {"pull": pull()}, Options(require_review="cubic"))
+    outstanding = watcher.outstanding_lines()
+    good = any("no review from cubic" in item for item in outstanding)
+    print("ok   --require-review LOGIN names the reviewer it is waiting for"
+          if good else f"FAIL required reviewer: {outstanding}")
+    return good
+
+
+# -- threads and quoting ----------------------------------------------------
+
+@case
+def thread_resolution_is_tracked():
+    return run_check(
+        lambda: check(
+            "a thread being resolved",
+            {"pull": pull(), "threads": thread(resolved=True)},
+            {"pull": pull(), "threads": thread(resolved=False)}),
+        expected=["THREAD", "resolved"])
+
+
+@case
+def an_unresolved_thread_is_outstanding():
+    _, watcher, _ = check(
+        "an unresolved thread",
+        {"pull": pull(), "checks": check_run("Test"), "runs": workflow(),
+         "statuses": {}, "issue_comments": {}, "review_comments": {},
+         "reviews": review(), "threads": thread(resolved=False)},
+        {"pull": pull()})
+    settled, reason = watcher.is_settled()
+    out = io.StringIO()
+    watcher.options.detail = False
+    with redirect_stdout(out):
+        verdict = watcher.final_report(reason, settled)
+    good = verdict == "FEEDBACK"
+    print("ok   an unresolved thread makes the verdict FEEDBACK, not GREEN"
+          if good else f"FAIL unresolved thread: {verdict}")
+    return good
+
+
+@case
+def quoting_drops_the_furniture():
+    body = ("<!-- bot:v=1 -->\n**One real sentence.** "
+            "<sub>[Fix all](https://example.invalid/a/very/long/link/indeed) | "
+            "[Re-run](https://example.invalid/another/very/long/link)</sub>")
+    got = prwatch.excerpt(body, 300)
+    good = (got.startswith("**One real sentence.**") and "http" not in got
+            and "<sub>" not in got and "Fix all" in got)
+    print("ok   a quote drops link targets and HTML, keeping the words"
+          if good else f"FAIL quoting: {got!r}")
+    return good
+
+
+@case
+def quoting_cuts_at_a_word():
+    got = prwatch.excerpt("alpha bravo charlie delta echo foxtrot", 20)
+    good = got.endswith("…") and not got.rstrip("…").endswith(("chari", "charl"))
+    print("ok   a quote is cut at a word boundary" if good
+          else f"FAIL word boundary: {got!r}")
+    return good
+
+
+# -- the things two agents reported ----------------------------------------
+
+@case
+def skipped_is_counted_apart_from_passing():
+    _, watcher, _ = check(
+        "a skipped check",
+        {"pull": pull(),
+         "checks": {**check_run("Test"), **check_run("Deploy",
+                                                     conclusion="skipped")}},
+        {"pull": pull()})
+    counts = prwatch.tally_checks(watcher.known["checks"])
+    line = watcher.status_line()
+    good = counts == {"ok": 1, "bad": 0, "skipped": 1, "cancelled": 0,
+                      "pending": 0} and "1 skipped" in line
+    print("ok   a skipped check is counted apart from the passes" if good
+          else f"FAIL skipped: {counts} / {line}")
+    return good
+
+
+@case
+def a_thread_without_a_line_says_so():
+    return run_check(
+        lambda: check(
+            "a thread with no line number",
+            {"pull": pull(), "threads": {"t1": {
+                "resolved": True, "outdated": True, "path": "f.py",
+                "line": None, "author": "cubic", "url": "u", "body": "b"}}},
+            {"pull": pull(), "threads": {"t1": {
+                "resolved": False, "outdated": True, "path": "f.py",
+                "line": None, "author": "cubic", "url": "u", "body": "b"}}}),
+        expected=["THREAD", "resolved · f.py ·"],
+        forbidden=["None"])
+
+
+@case
+def an_edit_that_reads_the_same_is_not_announced():
+    body = "**1 issue found** across 21 files"
+    return run_check(
+        lambda: check(
+            "an edit that changes nothing readable",
+            {"pull": pull(), "issue_comments": {"1": {
+                "user": "bot", "updated": "later", "url": "u",
+                "body": body + "\n<!-- stamp:2 -->"}}},
+            {"pull": pull(), "issue_comments": {"1": {
+                "user": "bot", "updated": "earlier", "url": "u",
+                "body": body + "\n<!-- stamp:1 -->"}}}),
+        expected=[], forbidden=["COMMENT"])
+
+
+@case
+def an_edit_is_quoted_from_where_it_changed():
+    return run_check(
+        lambda: check(
+            "an edit quoted from the change",
+            {"pull": pull(), "issue_comments": {"1": {
+                "user": "bot", "updated": "later", "url": "u",
+                "body": "One issue found. It is now fixed."}}},
+            {"pull": pull(), "issue_comments": {"1": {
+                "user": "bot", "updated": "earlier", "url": "u",
+                "body": "One issue found. It is not fixed."}}}),
+        expected=["edited ·", "now fixed"])
+
+
+@case
+def expect_follows_the_working_tree():
+    """The reported bug: --expect HEAD froze at launch and then cried wolf."""
+    options = Options(expect="HEAD")
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1, options)
+    watcher.expect_revision = True
+    watcher.expect = "5" * 40          # what HEAD pointed at when it started
+    watcher.expect_met = False
+    watcher.head = "5" * 40
+    watcher.local_commit = lambda: "8" * 40   # a fix has been committed since
+    snap = prwatch.Snapshot()
+    snap.pull = pull(head="8" * 40)           # and pushed
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.absorb(snap, announce=True)
+    output = out.getvalue()
+    good = "MATCH" in output and "MISMATCH" not in output
+    print("ok   --expect HEAD follows the working tree across a push" if good
+          else f"FAIL expect tracking: {output}")
+    return good
+
+
+@case
+def expect_a_commit_id_stays_put():
+    options = Options(expect="a" * 40)
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1, options)
+    watcher.expect_revision = False
+    watcher.expect = "a" * 40
+    watcher.expect_met = True
+    watcher.head = "a" * 40
+    watcher.local_commit = lambda: "8" * 40
+    snap = prwatch.Snapshot()
+    snap.pull = pull(head="b" * 40)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.absorb(snap, announce=True)
+    good = "MISMATCH" in out.getvalue()
+    print("ok   --expect with a commit id names that one commit" if good
+          else f"FAIL expect fixed: {out.getvalue()}")
+    return good
+
+
+def main():
+    results = [fn() for fn in CASES]
+    failed = results.count(False)
+    print(f"\n{len(results) - failed}/{len(results)} passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
