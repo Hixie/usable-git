@@ -137,6 +137,40 @@ git config --global rerere.enabled true
   Throw away local changes vs upstream.
 
 
+`prwatch`
+
+  Watch the pull request for the current branch and print one line per
+  thing that happens to it, until it settles. Reports failing checks as
+  they land, workflow runs as they finish, every comment (issue-level,
+  inline, and review summaries), and every review thread as it opens or
+  is resolved. Takes a pull request number, a URL, or `owner/repo#N`
+  instead, if you do not want the one for this branch.
+
+  A few things it is careful about, because watchers usually are not. A
+  pull request whose checks have not registered yet is not called green.
+  A commit that a newer push has replaced is announced as a retarget
+  rather than reported as thirty failures. A failed request to GitHub
+  updates nothing, so a network blip cannot look like every comment
+  being deleted, and the poll after a blip has nothing to re-announce. A
+  reading it could not take is printed as `?`, never as `0`. A head that
+  no reviewer has reached is counted and said out loud, since a review
+  that found nothing leaves no comment and no thread behind it, and
+  would otherwise be indistinguishable from a review that never
+  happened. And it says something on a schedule even when nothing has
+  changed, so silence never has to be interpreted.
+
+  `prwatch 6677 --once` prints where things stand and exits.
+  `prwatch 6677 --expect HEAD` also checks that the commit you have
+  checked out is the one the pull request points at, which catches a
+  push that went somewhere else.
+
+  `prwatch --help` carries the whole guide: the remaining options,
+  what each event tag and each verdict means, and how to run it from
+  an agent. Point people and agents at that rather than at this file.
+  `prwatch-test` drives the paths a green pull request never reaches,
+  against made-up data and no network; run it after changing `prwatch`.
+
+
 `nuke`
 
   Delete the current branch.
