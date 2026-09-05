@@ -49,8 +49,10 @@ WHAT IT WATCHES
 
 EVENTS
 
-  Each event is one line, `HH:MM TAG message`, flushed as it happens. A line
-  that begins with spaces is a continuation of the line above it.
+  Each event is one line, `HH:MM #NUMBER TAG message`, flushed as it
+  happens, where the number is the pull request's, so that the output of two
+  watches running at once can be told apart. A line that begins with spaces
+  is a continuation of the line above it, and carries no number of its own.
 
   WATCHING   the pull request and the commit being watched
   STATUS     the counts at startup
@@ -67,7 +69,8 @@ EVENTS
   REVIEW     a review summary
   THREAD     a review thread opened, resolved, or reopened
   PROGRESS   a periodic summary, while things are moving
-  STALL      nothing has changed for a while and something is unfinished
+  STALL      nothing has changed for a while; the wait before the next
+             one is longer each time
   WARN       GitHub stopped answering for one part of the picture, or
              started answering again
   MERGED     the pull request was merged
@@ -173,6 +176,18 @@ WHEN IT STOPS
   whose workflow has not spawned its jobs yet carries only the check a
   review bot registers within seconds, and by every other measure that looks
   exactly like a finished green build.
+
+  Each STALL waits longer than the one before it: --stall-growth times the
+  wait that preceded it, up to --stall-max. An afternoon spent waiting for
+  a reviewer is a handful of lines rather than one every --stall seconds,
+  and the line says how long the quiet has lasted either way. Any change
+  puts the wait back to --stall, and so does a facet GitHub has stopped
+  answering for: an unread picture is not a quiet one, and a watch that has
+  gone blind keeps saying so at the rate it started with.
+
+  The wait is between reports, not between polls. --interval alone decides
+  how often the pull request is read, so a change is announced on the poll
+  that finds it, however long ago the last STALL line was.
 
   Pass --follow to keep watching past the settling point, which is what you
   want while waiting on a human reviewer.
@@ -684,6 +699,13 @@ class Watcher:
         self.number = number
         self.options = options
         self.slug = f"{owner}/{repo}#{number}"
+        # Every event line is `HH:MM #NUMBER TAG message`, with the number and
+        # the tag padded so that the messages line up. A number too wide for
+        # the padding pushes its own line out rather than being cut short. A
+        # continuation line carries neither number nor tag, and is indented to
+        # where the message starts.
+        self.label = f"#{number}".ljust(6)
+        self.indent = " " * len(f"00:00 {self.label} {'':<9}")
         self.known = {facet: None for facet in Snapshot.FACETS}
         self.head = None
         self.head_since = time.time()
@@ -695,7 +717,9 @@ class Watcher:
         self.expect_met = None
         self.expect_revision = False
         self.last_progress = 0.0
-        self.last_stall = 0.0
+        self.last_stall = time.time()
+        self.stall_since = self.last_stall
+        self.stall_interval = options.stall
         self.last_digest = None
         self.state_path = options.state and Path(options.state)
 
@@ -703,10 +727,10 @@ class Watcher:
 
     def emit(self, tag, message):
         stamp = time.strftime("%H:%M")
-        print(f"{stamp} {tag:<9}{message}", flush=True)
+        print(f"{stamp} {self.label} {tag:<9}{message}", flush=True)
 
     def note(self, message):
-        print(message, flush=True)
+        print(f"{self.indent}{message}", flush=True)
 
     # -- persistence -------------------------------------------------------
 
@@ -1057,10 +1081,10 @@ class Watcher:
 
     def note_outstanding(self, lines):
         for line in lines[:self.options.max_lines]:
-            self.note(f"          {line}")
+            self.note(line)
         if len(lines) > self.options.max_lines:
             extra = len(lines) - self.options.max_lines
-            self.note(f"          …and {extra} more")
+            self.note(f"…and {extra} more")
 
     def unread(self):
         """The facets no successful read has ever filled in.
@@ -1193,18 +1217,18 @@ class Watcher:
             verdict = "GREEN"
         self.emit("SETTLED" if settled else "PENDING",
                   f"{verdict} — {reason}" if settled else reason)
-        self.note(f"          {self.status_line()}")
+        self.note(self.status_line())
         if unread:
-            self.note(f"          never read successfully: "
-                      f"{', '.join(unread)} — this verdict does not cover them")
+            self.note(f"never read successfully: {', '.join(unread)} — "
+                      f"this verdict does not cover them")
         self.note_outstanding(outstanding)
         url = pull.get("html_url") or \
             f"https://{self.gh.hostname}/{self.owner}/{self.repo}/pull/{self.number}"
-        self.note(f"          {url}")
+        self.note(url)
         if settled and not self.options.follow and not self.options.once \
                 and verdict not in ("MERGED", "CLOSED"):
-            self.note("          the watch ends here; --follow keeps it open "
-                      "for a later review or push")
+            self.note("the watch ends here; --follow keeps it open for a "
+                      "later review or push")
         return verdict
 
     def heartbeat(self, settled_reason):
@@ -1212,26 +1236,36 @@ class Watcher:
 
         A watcher that only speaks on change is indistinguishable from a
         watcher that died three hours ago.
+
+        Each further STALL waits --stall-growth times as long as the one
+        before it, up to --stall-max. Any change puts the wait back to
+        --stall, so a pull request that goes quiet again starts over at the
+        interval it started with, and so does a facet GitHub has stopped
+        answering for.
         """
         now = time.time()
         digest = self.digest()
         changed = digest != self.last_digest
         if changed:
             self.last_digest = digest
-            self.last_stall = 0.0
+            self.last_stall = now
             self.stall_since = now
-        else:
-            self.stall_since = getattr(self, "stall_since", now)
+        # While a facet is failing the picture is unread rather than quiet,
+        # and the wait stays at --stall.
+        if changed or self.warned:
+            self.stall_interval = self.options.stall
 
         if changed and now - self.last_progress >= self.options.heartbeat:
             self.last_progress = now
             self.emit("PROGRESS", self.status_line())
             return
 
-        quiet = now - self.stall_since
-        if quiet >= self.options.stall and \
-                now - self.last_stall >= self.options.stall:
+        if now - self.last_stall >= self.stall_interval:
+            quiet = now - self.stall_since
             self.last_stall = now
+            self.stall_interval = min(
+                self.stall_interval * self.options.stall_growth,
+                self.options.stall_max)
             self.emit("STALL", f"nothing has changed for {duration(quiet)} — "
                                f"{settled_reason}; {self.status_line()}")
 
@@ -1402,6 +1436,15 @@ def main(argv):
                         metavar="SECONDS",
                         help="how long nothing may change before prwatch says "
                              "so (default 1800)")
+    parser.add_argument("--stall-growth", type=float, default=2,
+                        metavar="FACTOR",
+                        help="how much longer to wait before each further "
+                             "STALL report; any change puts the wait back to "
+                             "--stall (default 2)")
+    parser.add_argument("--stall-max", type=float, default=86400,
+                        metavar="SECONDS",
+                        help="the longest --stall-growth may stretch the wait "
+                             "between STALL reports (default 86400)")
     parser.add_argument("--stability", type=int, default=3, metavar="POLLS",
                         help="consecutive quiet polls before calling it "
                              "settled (default 3)")
@@ -1427,6 +1470,13 @@ def main(argv):
                         help="exit 1 unless the verdict is GREEN or "
                              "MERGED")
     options = parser.parse_args(argv)
+    if options.stall_growth < 1:
+        raise SystemExit("prwatch: --stall-growth is how much longer to wait "
+                         "before each further STALL report, so it cannot be "
+                         "below 1; pass 1 for a wait that never grows")
+    if options.stall_max < options.stall:
+        raise SystemExit("prwatch: --stall-max is the ceiling on a wait that "
+                         "starts at --stall, so it cannot be below it")
 
     hostname, owner, repo, number = resolve_target(options.pr, options.repo)
     gh = GitHub(hostname)

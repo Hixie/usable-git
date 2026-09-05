@@ -30,7 +30,8 @@ class Options:
 
     def __init__(self, **overrides):
         defaults = dict(expect=None, once=False, follow=False, interval=60,
-                        heartbeat=900, stall=1800, stability=3, min_checks=0,
+                        heartbeat=900, stall=1800, stall_growth=2,
+                        stall_max=86400, stability=3, min_checks=0,
                         no_ci_grace=900, warn_after=3, max_lines=12,
                         detail=True, fresh=True, state=None, exit_code=False,
                         require_review=None, excerpt=300)
@@ -93,6 +94,19 @@ def review(user="cubic-dev-ai[bot]", commit="a" * 40, rid="1", state="COMMENTED"
 def thread(resolved=False, tid="t1"):
     return {tid: {"resolved": resolved, "outdated": False, "path": "f.py",
                   "line": 1, "author": "someone", "url": "u", "body": "why?"}}
+
+
+class Clock:
+    """A stand-in for the time module, so a test can skip ahead by hours."""
+
+    def __init__(self, now=1000.0):
+        self.now = now
+
+    def time(self):
+        return self.now
+
+    def strftime(self, fmt):
+        return "00:00"
 
 
 CASES = []
@@ -524,6 +538,122 @@ def expect_a_commit_id_stays_put():
     print("ok   --expect with a commit id names that one commit" if good
           else f"FAIL expect fixed: {out.getvalue()}")
     return good
+
+
+@case
+def every_event_line_carries_the_number():
+    """Two watches running at once are told apart by the number on each line."""
+    real = prwatch.time
+    prwatch.time = Clock()
+    try:
+        def lines(number):
+            watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r",
+                                      number, Options())
+            out = io.StringIO()
+            with redirect_stdout(out):
+                watcher.emit("FAIL", "Test — failure")
+                watcher.note("a continuation")
+            return out.getvalue().splitlines()
+
+        event, continuation = lines(6922)
+        wide, wide_continuation = lines(1234567)
+    finally:
+        prwatch.time = real
+    problems = []
+    if event != "00:00 #6922  FAIL     Test — failure":
+        problems.append(f"event line is {event!r}")
+    if continuation.index("a continuation") != event.index("Test"):
+        problems.append(f"the continuation does not line up: {continuation!r}")
+    if "#1234567" not in wide:
+        problems.append(f"a number too wide for the padding was cut: {wide!r}")
+    if wide_continuation.index("a") != wide.index("Test"):
+        problems.append(f"a wide number left the continuation behind: "
+                        f"{wide_continuation!r}")
+    if problems:
+        print("FAIL every line carries the number")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   every event line carries the pull request number")
+    return True
+
+
+@case
+def stall_reports_back_off():
+    """A quiet pull request is reported less often the longer it stays quiet."""
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    try:
+        watcher = prwatch.Watcher(
+            prwatch.GitHub("github.com"), "o", "r", 1,
+            Options(stall=10, stall_growth=2, stall_max=25))
+        watcher.known.update({"pull": pull(), "checks": check_run("Test")})
+
+        def tick():
+            """One poll, and whatever it printed."""
+            out = io.StringIO()
+            with redirect_stdout(out):
+                watcher.heartbeat("waiting")
+            return out.getvalue()
+
+        def waits(count):
+            """How long each of the next `count` STALL reports waited.
+
+            Short of `count` entries when the reports stop coming, which the
+            comparison below then fails on.
+            """
+            gaps = []
+            last = clock.now
+            while len(gaps) < count and clock.now - last < 100:
+                clock.now += 1
+                if "STALL" in tick():
+                    gaps.append(clock.now - last)
+                    last = clock.now
+            return gaps
+
+        tick()                                 # take the baseline
+        grew = waits(4)
+        watcher.warned.add("checks")           # GitHub stops answering
+        blind = waits(3)
+        watcher.warned.discard("checks")       # and answers again
+        watcher.known["checks"] = check_run("Test", conclusion="failure")
+        tick()                                 # something moved
+        after = waits(1)
+    finally:
+        prwatch.time = real
+    good = grew == [10, 20, 25, 25] and blind == [10, 10, 10] and after == [10]
+    print("ok   STALL waits longer each time, except while a read is failing"
+          if good else
+          f"FAIL stall backoff: waits were {grew}, then {blind} while a read "
+          f"was failing, then {after}")
+    return good
+
+
+@case
+def a_wait_that_shrinks_is_refused():
+    """The options that widen the wait cannot be set to narrow it instead."""
+    problems = []
+    for argv, wanted in [(["--stall-growth", "0.5"], "--stall-growth"),
+                         (["--stall-growth", "-1"], "--stall-growth"),
+                         (["--stall", "60", "--stall-max", "30"],
+                          "--stall-max")]:
+        try:
+            # The target is deliberately unreadable, so that a run which gets
+            # past the check stops before it reaches the network.
+            prwatch.main(["not-a-pull-request", *argv])
+        except SystemExit as complaint:
+            if wanted not in str(complaint):
+                problems.append(f"{argv} was refused with {complaint}")
+        else:
+            problems.append(f"{argv} was accepted")
+    if problems:
+        print("FAIL a wait that shrinks is refused")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   options that would make the wait shrink are refused")
+    return True
 
 
 def main():
