@@ -10,6 +10,7 @@ import html
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -77,6 +78,8 @@ EVENTS
   CLOSED     the pull request was closed
   PENDING    --once found it unsettled; the reason follows
   SETTLED    the watch is over; the verdict follows
+  STOPPED    something outside the watch ended it: Ctrl-C, or a
+             signal from whatever started it
 
 VERDICTS
 
@@ -191,6 +194,13 @@ WHEN IT STOPS
 
   Pass --follow to keep watching past the settling point, which is what you
   want while waiting on a human reviewer.
+
+  A watch that is ended from outside says so, with a STOPPED line naming
+  Ctrl-C or the signal that arrived. Without that line the log ends at
+  whatever was reported last, which on a quiet pull request is a STALL
+  from up to a day earlier, and a log that ends in a STALL is what a live
+  watch looks like too. SIGKILL is the one that cannot be caught, so it is
+  the one that still ends a watch in silence.
 
   Exit status is 0 whenever the watch itself worked, so that a red pull
   request is not confused with a broken script. Pass --exit-code to have the
@@ -1397,6 +1407,35 @@ class Watcher:
 # ---------------------------------------------------------------------------
 
 
+class Stopped(Exception):
+    """A signal has asked the watch to end."""
+
+    def __init__(self, number):
+        super().__init__(signal.Signals(number).name)
+        self.number = number
+
+
+def report_signals(*numbers):
+    """Make a signal end the watch the way Ctrl-C does, with a line saying so.
+
+    A watch that is killed prints nothing on its way out, so its log ends at
+    whatever it reported last. On a quiet pull request that is a STALL from
+    up to a day earlier, which is also how the log of a watch that is still
+    running ends, so the two cannot be told apart. SIGKILL cannot be caught;
+    the signals that can are turned into an exception here, and the watch
+    still dies by the signal once it has said so.
+    """
+    def stop(number, frame):
+        raise Stopped(number)
+    for number in numbers:
+        signal.signal(number, stop)
+
+
+def die_by(number):
+    signal.signal(number, signal.SIG_DFL)
+    os.kill(os.getpid(), number)
+
+
 def main(argv):
     parser = argparse.ArgumentParser(
         prog="prwatch",
@@ -1484,11 +1523,15 @@ def main(argv):
         number = find_pr_for_branch(gh, owner, repo)
 
     watcher = Watcher(gh, owner, repo, number, options)
+    report_signals(signal.SIGTERM, signal.SIGHUP)
     try:
         verdict = watcher.run()
     except KeyboardInterrupt:
         watcher.emit("STOPPED", "interrupted")
         return 0
+    except Stopped as stopped:
+        watcher.emit("STOPPED", f"{stopped} ended the watch")
+        die_by(stopped.number)
     except GitHubError as error:
         raise SystemExit(f"prwatch: {error}")
     if options.exit_code and verdict not in ("GREEN", "MERGED"):
