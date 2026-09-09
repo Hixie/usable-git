@@ -13,6 +13,8 @@ Run it with no arguments. It touches no network and no repository.
 import importlib.machinery
 import importlib.util
 import io
+import signal
+import subprocess
 import sys
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -654,6 +656,56 @@ def a_wait_that_shrinks_is_refused():
         return False
     print("ok   options that would make the wait shrink are refused")
     return True
+
+
+@case
+def a_killed_watch_says_so():
+    """A signal ends the watch with a line naming it, and still kills it."""
+    # The watch runs in a child process, because the point of the case is
+    # what a signal does to a whole run: the line it prints, and the status
+    # the process leaves behind.
+    child = subprocess.Popen(
+        [sys.executable, "-c", KILLABLE_WATCH, str(Path(__file__).with_name("prwatch"))],
+        stdout=subprocess.PIPE, text=True)
+    problems = []
+    if child.stdout.readline().strip() != "watching":
+        problems.append("the child never reached the watch")
+    else:
+        child.send_signal(signal.SIGTERM)
+    said = child.stdout.read()
+    child.wait()
+    if "STOPPED" not in said or "SIGTERM" not in said:
+        problems.append(f"the line it ended on was {said.strip()!r}")
+    if child.returncode != -signal.SIGTERM:
+        problems.append(f"it left status {child.returncode}, not a SIGTERM "
+                        "death")
+    if problems:
+        print("FAIL a killed watch says so")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   a signal ends the watch with a line naming it")
+    return True
+
+
+KILLABLE_WATCH = """
+import importlib.machinery, importlib.util, sys, time
+spec = importlib.util.spec_from_loader(
+    "prwatch",
+    importlib.machinery.SourceFileLoader("prwatch", sys.argv[1]))
+prwatch = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(prwatch)
+prwatch.resolve_target = lambda pr, repo: ("github.com", "o", "r", 1)
+
+
+def wait_to_be_killed(self):
+    print("watching", flush=True)
+    time.sleep(30)
+
+
+prwatch.Watcher.run = wait_to_be_killed
+sys.exit(prwatch.main([]))
+"""
 
 
 def main():
