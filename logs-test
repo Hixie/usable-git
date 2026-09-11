@@ -14,6 +14,9 @@ set -e
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TEST_DIR=$(mktemp -d)
 ESC=$'\033'
+# A fixed time in the past, so the age a case reports says which file it was
+# taken from rather than how long the case took to run.
+OLD_STAMP=201501020304
 newline='
 '
 passed=0
@@ -60,7 +63,7 @@ commit_file() {
   local message=$4
 
   printf '%s\n' "$content" > "$repo/$path"
-  git -C "$repo" add "$path"
+  git -C "$repo" add -- "$path"
   git -C "$repo" commit --quiet -m "$message"
 }
 
@@ -100,6 +103,96 @@ workspace_row() {
     awk '$2 == "[workspace]"' |
     sed -e 's/  */ /g' \
         -e 's/^+ \[workspace\] .* (Uncommitted) /+ [workspace] (Uncommitted) /'
+}
+
+# The age column of the workspace row, which the row itself reports without.
+workspace_age() {
+  printf '%s\n' "$LOGS_OUTPUT" |
+    awk '$2 == "[workspace]"' |
+    sed -e 's/^+ \[workspace\]  *//' -e 's/  *(Uncommitted).*$//'
+}
+
+# A repository whose one change is to a file of the given name, dated far
+# enough back that the age reported for it says which file it was taken from
+# rather than how long the case took to run. The stamp is fixed, so two
+# repositories built this way agree on the age.
+make_repo_with_dated_change() {
+  local name=$1
+  local file=$2
+  local stamp=${3:-$OLD_STAMP}
+
+  make_repos "$name"
+  commit_file "$TEST_DIR/$name" "$file" original 'the file this case is about'
+  printf 'changed\n' > "$TEST_DIR/$name/$file"
+  touch -t "$stamp" "$TEST_DIR/$name/$file"
+}
+
+# The age of a change to a file git names as it is on disk, and the age when
+# there was no file on disk to take a timestamp from, which is what a deletion
+# leaves behind. Every case below is measured against these, so the comparisons
+# hold as the calendar moves.
+reference_ages() {
+  make_repo_with_dated_change plain-age plain.txt
+  run_logs "$TEST_DIR/plain-age"
+  plain_age=$(workspace_age)
+  make_repos missing-age
+  commit_file "$TEST_DIR/missing-age" gone.txt original 'a file to delete'
+  rm "$TEST_DIR/missing-age/gone.txt"
+  run_logs "$TEST_DIR/missing-age"
+  missing_age=$(workspace_age)
+}
+
+# A file git names plainly was found, or every comparison against plain_age
+# below would hold for the wrong reason.
+test_a_plain_name_is_measured() {
+  local title='a file git names plainly is found on disk'
+
+  if [ "$plain_age" = "$missing_age" ]; then
+    report fail "$title" \
+      "age of a changed file: $plain_age" \
+      "age when no file was found: $missing_age"
+    return
+  fi
+  report ok "$title"
+}
+
+# stat reads its options before its file names, so a changed file named like an
+# option has to reach it as a name.
+test_a_name_that_starts_with_a_dash() {
+  local title='the age of a file whose name starts with a dash is read'
+  local age
+
+  make_repo_with_dated_change dash -dash.txt
+  run_logs "$TEST_DIR/dash"
+  age=$(workspace_age)
+  if [ "$age" != "$plain_age" ]; then
+    report fail "$title" \
+      "age: ${age:-nothing}" \
+      "expected: $plain_age" \
+      "age when no file was found: $missing_age"
+    return
+  fi
+  report ok "$title"
+}
+
+# A deleted file has no timestamp to read, so the age comes from the file
+# beside it that is still there.
+test_a_deletion_beside_a_file_that_is_there() {
+  local title='a deletion does not hide the age of the file beside it'
+  local age
+
+  make_repo_with_dated_change deletion plain.txt
+  rm "$TEST_DIR/deletion/first.txt"
+  run_logs "$TEST_DIR/deletion"
+  age=$(workspace_age)
+  if [ "$age" != "$plain_age" ]; then
+    report fail "$title" \
+      "age: ${age:-nothing}" \
+      "expected: $plain_age" \
+      "age when no file was found: $missing_age"
+    return
+  fi
+  report ok "$title"
 }
 
 short_hashes() {
@@ -628,6 +721,10 @@ SHIM
   report ok 'a git that cannot merge in memory marks nothing'
 }
 
+reference_ages
+test_a_plain_name_is_measured
+test_a_name_that_starts_with_a_dash
+test_a_deletion_beside_a_file_that_is_there
 test_bare_repository_lists_commits
 test_the_git_directory_lists_commits
 test_a_working_tree_still_gets_a_workspace_row

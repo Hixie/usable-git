@@ -326,9 +326,9 @@ if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
 fi
 if [ -n "$changes" ]; then
   if [ "$(stat -f %m . 2>/dev/null)" -ge 0 ] 2>/dev/null; then
-    stat_mtime() { stat -f %m "$1" 2>/dev/null || true; }
+    mtime_format=-f%m
   else
-    stat_mtime() { stat -c %Y "$1" 2>/dev/null || true; }
+    mtime_format=-c%Y
   fi
   file_count=$(printf '%s\n' "$changes" | wc -l | tr -d ' ')
   if [ "$file_count" -eq 1 ]; then
@@ -337,24 +337,19 @@ if [ -n "$changes" ]; then
     description="$file_count files modified"
   fi
   paths=$(printf '%s\n' "$changes" | sed -e 's/^...//' -e 's/.* -> //')
-  newest=
-  name_list=
-  while IFS= read -r changed_path; do
-    [ -n "$changed_path" ] || continue
-    if [ -z "$name_list" ]; then
-      name_list=$changed_path
-    else
-      name_list="$name_list$field_separator$changed_path"
-    fi
-    [ -e "$changed_path" ] || continue
-    mtime=$(stat_mtime "$changed_path")
-    [ -n "$mtime" ] || continue
-    if [ -z "$newest" ] || [ "$mtime" -gt "$newest" ] 2>/dev/null; then
-      newest=$mtime
-    fi
-  done <<EOF
-$paths
-EOF
+  name_list=$(printf '%s' "$paths" | tr '\n' "$field_separator")
+  # The paths go to stat all at once, so a working tree with thousands of
+  # changes costs a handful of processes rather than one for each file. A path
+  # that is not there any more, because the change was a deletion, is left out
+  # of the answer by stat. The paths follow a --, so a name that starts with a
+  # dash is a name and not an option.
+  newest=$(
+    printf '%s' "$paths" |
+      tr '\n' '\000' |
+      xargs -0 stat "$mtime_format" -- 2>/dev/null |
+      sort --numeric-sort |
+      tail -n 1
+  )
   now=$(date +%s)
   if [ -n "$newest" ]; then
     age=$(relative_age "$(( now - newest ))")
