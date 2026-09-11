@@ -392,6 +392,29 @@ test_a_failing_git_status_stops_the_run() {
   report ok "$title"
 }
 
+# git reports the changed paths from the top of the working tree, wherever it
+# was asked from, so that is where they have to be read.
+test_a_run_from_a_subdirectory() {
+  local title='the age is the same from a subdirectory as from the top'
+  local age
+
+  make_repos subdirectory
+  mkdir "$TEST_DIR/subdirectory/deep"
+  commit_file "$TEST_DIR/subdirectory" deep/buried.txt original 'a buried file'
+  printf 'changed\n' > "$TEST_DIR/subdirectory/deep/buried.txt"
+  touch -t "$OLD_STAMP" "$TEST_DIR/subdirectory/deep/buried.txt"
+  run_logs "$TEST_DIR/subdirectory/deep"
+  age=$(workspace_age)
+  if [ "$age" != "$plain_age" ]; then
+    report fail "$title" \
+      "age from the subdirectory: ${age:-nothing}" \
+      "expected: $plain_age" \
+      "age when no file was found: $missing_age"
+    return
+  fi
+  report ok "$title"
+}
+
 # stat reads its options before its file names, so a changed file named like an
 # option has to reach it as a name.
 test_a_name_that_starts_with_a_dash() {
@@ -976,6 +999,7 @@ test_a_rename
 test_a_rename_that_is_not_staged
 test_a_conflict
 test_a_failing_git_status_stops_the_run
+test_a_run_from_a_subdirectory
 test_bare_repository_lists_commits
 test_the_git_directory_lists_commits
 test_a_working_tree_still_gets_a_workspace_row

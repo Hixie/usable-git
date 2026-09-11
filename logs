@@ -364,12 +364,16 @@ if [ -n "$paths" ]; then
   else
     mtime_format=-c%Y
   fi
+  # The paths git reports are relative to the top of the working tree, which is
+  # not where this ran from, so that is where they are read.
+  #
   # The paths go to stat all at once, so a working tree with thousands of
   # changes costs a handful of processes rather than one for each file. A path
   # that is not there any more, because the change was a deletion, is left out
   # of the answer by stat. The paths follow a --, so a name that starts with a
   # dash is a name and not an option.
   newest=$(
+    cd "$(git rev-parse --show-toplevel)" || exit
     printf '%s' "$paths" |
       tr "$field_separator" '\000' |
       xargs -0 stat "$mtime_format" -- 2>/dev/null |
