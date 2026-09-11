@@ -1,0 +1,227 @@
+#!/bin/bash
+
+# Check what logs does in the situations an everyday run does not reach: a
+# repository with no working tree, where git status fails, and a run under
+# zsh, which gives some ordinary variable names a meaning of its own. Each
+# case builds a real repository and runs the real logs script against it.
+#
+# Run it with no arguments. It touches no network and no repository but its own.
+
+set -e
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+TEST_DIR=$(mktemp -d)
+passed=0
+failed=0
+
+# The repositories built below answer to this file and nothing else, so a hook
+# path, a template directory or an alias in the operator's own configuration
+# cannot reach them.
+export GIT_CONFIG_GLOBAL=/dev/null
+export GIT_CONFIG_NOSYSTEM=1
+
+cleanup() {
+  rm -rf "$TEST_DIR"
+}
+trap cleanup EXIT
+
+report() {
+  local outcome=$1
+  local name=$2
+  shift 2
+  if [ "$outcome" = ok ]; then
+    passed=$((passed + 1))
+    printf 'ok   %s\n' "$name"
+  else
+    failed=$((failed + 1))
+    printf 'FAIL %s\n' "$name"
+    local detail
+    for detail in "$@"; do
+      printf '       %s\n' "$detail"
+    done
+  fi
+}
+
+configure() {
+  git -C "$1" config user.name "$2"
+  git -C "$1" config user.email "$3"
+  git -C "$1" config commit.gpgsign false
+}
+
+commit_file() {
+  local repo=$1
+  local path=$2
+  local content=$3
+  local message=$4
+
+  printf '%s\n' "$content" > "$repo/$path"
+  git -C "$repo" add "$path"
+  git -C "$repo" commit --quiet -m "$message"
+}
+
+# An ordinary repository with two commits on main, and a bare clone of it.
+make_repos() {
+  local name=$1
+  local repo="$TEST_DIR/$name"
+
+  git init --quiet "$repo"
+  git -C "$repo" symbolic-ref HEAD refs/heads/main
+  configure "$repo" 'Usable Git Test' 'usable-git@example.com'
+  commit_file "$repo" first.txt one 'first commit'
+  commit_file "$repo" second.txt two 'second commit'
+  git clone --bare --quiet "$repo" "$TEST_DIR/$name.git"
+}
+
+# Leaves what logs printed in LOGS_OUTPUT and its exit status in LOGS_STATUS.
+run_logs() {
+  local directory=$1
+  shift
+  LOGS_STATUS=0
+  LOGS_OUTPUT=$(cd "$directory" && "$SCRIPT_DIR/logs" --color=never --date=iso "$@" 2>&1) ||
+    LOGS_STATUS=$?
+}
+
+# One line per row, the abbreviated commit ID alone, or "[workspace]", taken
+# from what logs printed. The summary line it starts with is dropped.
+logs_ids() {
+  printf '%s\n' "$LOGS_OUTPUT" |
+    awk 'NR > 1 { print ($1 == "+") ? $2 : $1 }'
+}
+
+# The workspace row with its column padding squeezed out and its age taken
+# away, since the age climbs as the calendar moves and the rest does not.
+workspace_row() {
+  printf '%s\n' "$LOGS_OUTPUT" |
+    awk '$2 == "[workspace]"' |
+    sed -e 's/  */ /g' \
+        -e 's/^+ \[workspace\] .* (Uncommitted) /+ [workspace] (Uncommitted) /'
+}
+
+short_hashes() {
+  git -C "$1" --no-pager log --format=%h
+}
+
+one_line() {
+  printf '%s' "$1" | tr '\n' '|'
+}
+
+# logs asks for /bin/sh and is written to POSIX shell, but people do run it as
+# `zsh logs`, and zsh gives a meaning of its own to variable names an ordinary
+# script is free to use. This case holds the script clear of those names.
+test_zsh_prints_what_sh_prints() {
+  local name=shells
+  local title='zsh prints what sh prints'
+  if ! command -v zsh > /dev/null 2>&1; then
+    printf 'skip %s (no zsh installed)\n' "$title"
+    return
+  fi
+  make_repos "$name"
+  printf 'changed\n' > "$TEST_DIR/$name/first.txt"
+  # An old modification time keeps the workspace row's age in the years
+  # bucket, so it reads the same in both runs however long they take.
+  touch -t 200001010000 "$TEST_DIR/$name/first.txt"
+
+  local with_sh with_zsh
+  local sh_status=0 zsh_status=0
+  with_sh=$(cd "$TEST_DIR/$name" &&
+    sh "$SCRIPT_DIR/logs" --color=never --date=iso 2>&1) || sh_status=$?
+  with_zsh=$(cd "$TEST_DIR/$name" &&
+    zsh -f "$SCRIPT_DIR/logs" --color=never --date=iso 2>&1) || zsh_status=$?
+  if [ "$zsh_status" != "$sh_status" ] || [ "$with_zsh" != "$with_sh" ]; then
+    report fail "$title" \
+      "sh  exited $sh_status: $(one_line "$with_sh")" \
+      "zsh exited $zsh_status: $(one_line "$with_zsh")"
+    return
+  fi
+  report ok "$title"
+}
+
+test_bare_repository_lists_commits() {
+  local name=bare
+  local title='a bare repository lists its commits'
+  make_repos "$name"
+
+  run_logs "$TEST_DIR/$name.git"
+  if [ "$LOGS_STATUS" != 0 ]; then
+    report fail "$title" "logs exited $LOGS_STATUS" \
+      "output: $(one_line "$LOGS_OUTPUT")"
+    return
+  fi
+  local expected
+  expected=$(short_hashes "$TEST_DIR/$name")
+  local got
+  got=$(logs_ids)
+  if [ "$got" != "$expected" ]; then
+    report fail "$title" \
+      "want: $(one_line "$expected")" \
+      "got:  $(one_line "$got")"
+    return
+  fi
+  if ! printf '%s\n' "$LOGS_OUTPUT" | grep --quiet --fixed-strings 'second commit'; then
+    report fail "$title" "no commit subject in: $(one_line "$LOGS_OUTPUT")"
+    return
+  fi
+  report ok "$title"
+}
+
+test_the_git_directory_lists_commits() {
+  local name=gitdir
+  local title='the .git directory of a repository lists its commits'
+  make_repos "$name"
+
+  run_logs "$TEST_DIR/$name/.git"
+  if [ "$LOGS_STATUS" != 0 ]; then
+    report fail "$title" "logs exited $LOGS_STATUS" \
+      "output: $(one_line "$LOGS_OUTPUT")"
+    return
+  fi
+  local expected
+  expected=$(short_hashes "$TEST_DIR/$name")
+  local got
+  got=$(logs_ids)
+  if [ "$got" != "$expected" ]; then
+    report fail "$title" \
+      "want: $(one_line "$expected")" \
+      "got:  $(one_line "$got")"
+    return
+  fi
+  report ok "$title"
+}
+
+test_a_working_tree_still_gets_a_workspace_row() {
+  local name=worktree
+  local title='a working tree with changes still gets a workspace row'
+  make_repos "$name"
+  printf 'changed\n' > "$TEST_DIR/$name/first.txt"
+  printf 'changed\n' > "$TEST_DIR/$name/second.txt"
+
+  run_logs "$TEST_DIR/$name"
+  local expected
+  expected=$(printf '[workspace]\n%s\n' "$(short_hashes "$TEST_DIR/$name")")
+  local got
+  got=$(logs_ids)
+  if [ "$got" != "$expected" ]; then
+    report fail "$title" \
+      "want: $(one_line "$expected")" \
+      "got:  $(one_line "$got")"
+    return
+  fi
+  local want_row='+ [workspace] (Uncommitted) 2 files modified: first.txt, second.txt'
+  local got_row
+  got_row=$(workspace_row)
+  if [ "$got_row" != "$want_row" ]; then
+    report fail "$title" \
+      "want: $want_row" \
+      "got:  $got_row"
+    return
+  fi
+  report ok "$title"
+}
+
+test_bare_repository_lists_commits
+test_the_git_directory_lists_commits
+test_a_working_tree_still_gets_a_workspace_row
+test_zsh_prints_what_sh_prints
+
+printf '\n%s/%s passed\n' "$passed" "$((passed + failed))"
+[ "$failed" -eq 0 ]

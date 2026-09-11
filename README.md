@@ -45,6 +45,9 @@ git config --global rerere.enabled true
 
   Show recent commits in one line each, with relative time and author.
 
+  `logs-test` builds real repositories and checks what `logs` prints for
+  them; run it after changing `logs`.
+
 
 `new foo`
 
