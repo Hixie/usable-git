@@ -44,9 +44,17 @@ git config --global rerere.enabled true
 `logs`
 
   Show recent commits in one line each, with relative time and author.
+  Commits that are not yet on upstream/main carry a `+` in the left
+  margin. Those commits are also replayed onto that branch to find
+  where a rebase would stop, and the ID of the commit it would fail to
+  apply appears in reverse video, at most one for each branch on
+  screen. Nothing is marked when that commit is older than the oldest
+  commit shown.
 
   `logs-test` builds real repositories and checks what `logs` prints for
-  them; run it after changing `logs`.
+  them, including the branch shapes a rebase treats specially, where it
+  compares each answer against a real rebase; run it after changing
+  `logs`.
 
 
 `new foo`

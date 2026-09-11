@@ -27,6 +27,14 @@ left margin. When there is no remote named "upstream", origin/main is used
 instead. The branch name comes from \$MAIN when that is set. Long commit
 messages are shortened to fit the terminal width.
 
+Those commits are also replayed onto that branch to find where a rebase would
+stop. The commit ID appears in reverse video on the commit a rebase would fail
+to apply, at most one for each branch in the listing. The replay follows the
+rebase: it drops merges and skips commits whose patch that branch already has.
+Nothing is marked when the commit a rebase would stop on is older than the
+oldest commit shown. Reverse video needs the commit IDs and color, so
+--no-hash and --no-color both turn it off.
+
 Options:
   -n, --count N       Show N commits. The default is at least 10, expanded
                       when needed to include at least two authors.
@@ -287,6 +295,8 @@ else
 fi
 
 field_separator=$(printf '\037')
+newline='
+'
 format="%H%x1f%h%x1f${date_format}%x1f%an%x1f%s"
 
 branch_count=$(git branch | grep -cv '^\* (' || true)
@@ -403,6 +413,105 @@ fi
 LOGS_LOCAL_ONLY=$local_only_hashes
 export LOGS_LOCAL_ONLY
 
+# Find where a rebase onto the comparison ref would stop, for each branch tip in
+# the listing. git replay answers in one pass whether a tip rebases at all; when
+# it does not, the commits are replayed one at a time to find the one that stops
+# the rebase. That second pass replays the way a rebase does: merges are
+# dropped, commits whose patch the comparison ref already has are skipped, and
+# each remaining commit is merged onto the tree built so far. Both passes write
+# to a scratch object store and never fetch, so a run leaves the repository as
+# it found it and stays off the network.
+replay_git() {
+  GIT_OBJECT_DIRECTORY=$replay_objects GIT_NO_LAZY_FETCH=1 git "$@"
+}
+
+conflicting_hashes=
+replay_objects=
+if [ -n "$local_only_hashes" ] && [ "$use_color" -eq 1 ] && [ "$show_hash" -eq 1 ]; then
+  replay_objects=$(mktemp -d 2>/dev/null) || replay_objects=
+fi
+if [ -n "$replay_objects" ]; then
+  trap 'rm -rf "$replay_objects"' EXIT
+  trap 'rm -rf "$replay_objects"; trap - INT; kill -s INT $$' INT
+  trap 'rm -rf "$replay_objects"; trap - TERM; kill -s TERM $$' TERM
+fi
+# The alternates file takes one directory per line, so a repository path with a
+# colon in it names one directory. GIT_ALTERNATE_OBJECT_DIRECTORIES splits on
+# colons.
+replay_available=0
+if [ -n "$replay_objects" ] && mkdir "$replay_objects/info" 2>/dev/null &&
+  git rev-parse --path-format=absolute --git-path objects \
+    > "$replay_objects/info/alternates" 2>/dev/null; then
+  replay_available=1
+fi
+if [ "$replay_available" -eq 1 ]; then
+  onto_tree=$(git rev-parse "$upstream_ref^{tree}")
+  empty_tree=
+  # shellcheck disable=SC2086 # the hashes are separate arguments
+  for tip in $(git merge-base --independent $local_only_hashes); do
+    [ "$replay_available" -eq 1 ] || break
+    if replay_git replay --onto "$upstream_ref" "$upstream_ref..$tip" \
+      >/dev/null 2>&1; then
+      continue
+    fi
+    already_applied=$newline$(git cherry "$upstream_ref" "$tip" 2>/dev/null |
+      sed -n 's/^- //p')$newline
+    head_tree=$onto_tree
+    last_commit=
+    last_tree=
+    while IFS=' ' read -r commit tree parent; do
+      if [ -z "$parent" ]; then
+        if [ -z "$empty_tree" ]; then
+          empty_tree=$(git hash-object -t tree /dev/null)
+        fi
+        base_tree=$empty_tree
+      elif [ "$parent" = "$last_commit" ]; then
+        base_tree=$last_tree
+      else
+        base_tree=$(git rev-parse --quiet --verify "$parent^{tree}") || base_tree=
+      fi
+      last_commit=$commit
+      last_tree=$tree
+      case $already_applied in
+        *"$newline$commit$newline"*)
+          continue
+          ;;
+      esac
+      if [ -z "$base_tree" ]; then
+        replay_available=0
+        break
+      fi
+      if [ "$head_tree" = "$base_tree" ]; then
+        head_tree=$tree
+        continue
+      fi
+      merge_status=0
+      head_tree=$(replay_git merge-tree --write-tree --merge-base="$base_tree" \
+        "$head_tree" "$tree" 2>/dev/null) || merge_status=$?
+      case $merge_status in
+        0)
+          ;;
+        1)
+          conflicting_hashes="$conflicting_hashes$commit$newline"
+          break
+          ;;
+        *)
+          # git is too old for merge-tree --write-tree, or it could not read an
+          # object. Either way the answer is unknown, so nothing is reported.
+          replay_available=0
+          break
+          ;;
+      esac
+    done <<EOF
+$(git --no-pager log --reverse --topo-order --no-merges \
+  --format='%H %T %P' "$upstream_ref..$tip")
+EOF
+  done
+  [ "$replay_available" -eq 1 ] || conflicting_hashes=
+fi
+LOGS_CONFLICTING=$conflicting_hashes
+export LOGS_CONFLICTING
+
 {
   if [ -n "$workspace_row" ]; then
     printf '%s\n' "$workspace_row"
@@ -442,6 +551,12 @@ export LOGS_LOCAL_ONLY
       for (j = 1; j <= n_local; j++) {
         if (local_list[j] != "") {
           is_local[local_list[j]] = 1
+        }
+      }
+      n_conflicting = split(ENVIRON["LOGS_CONFLICTING"], conflicting_list, "\n")
+      for (j = 1; j <= n_conflicting; j++) {
+        if (conflicting_list[j] != "") {
+          is_conflicting[conflicting_list[j]] = 1
         }
       }
     }
@@ -556,9 +671,13 @@ export LOGS_LOCAL_ONLY
           out_subject = clip(out_subject, subject_avail)
         }
         if (show_hash) {
-          printf "%s%s%-*s  %-*s  %-*s%s  %s\n",
-            prefix, gutter, hash_width, hashes[i], date_width, dates[i],
-            author_width, authors[i], suffix, out_subject
+          hash_field = hashes[i]
+          if (use_color && is_conflicting[fullhashes[i]]) {
+            hash_field = escape "[7m" hashes[i] escape "[27m"
+          }
+          printf "%s%s%s%*s  %-*s  %-*s%s  %s\n",
+            prefix, gutter, hash_field, hash_width - length(hashes[i]), "",
+            date_width, dates[i], author_width, authors[i], suffix, out_subject
         } else {
           printf "%s%s%-*s  %-*s%s  %s\n",
             prefix, gutter, date_width, dates[i],

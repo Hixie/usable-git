@@ -1,9 +1,11 @@
 #!/bin/bash
 
 # Check what logs does in the situations an everyday run does not reach: a
-# repository with no working tree, where git status fails, and a run under
-# zsh, which gives some ordinary variable names a meaning of its own. Each
-# case builds a real repository and runs the real logs script against it.
+# repository with no working tree, where git status fails, a run under zsh,
+# which gives some ordinary variable names a meaning of its own, and the branch
+# shapes a rebase treats specially. Each case builds real repositories and runs
+# the real logs script against them; the rebase cases compare what logs says
+# against what a real git rebase does.
 #
 # Run it with no arguments. It touches no network and no repository but its own.
 
@@ -11,6 +13,9 @@ set -e
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TEST_DIR=$(mktemp -d)
+ESC=$'\033'
+newline='
+'
 passed=0
 failed=0
 
@@ -218,10 +223,429 @@ test_a_working_tree_still_gets_a_workspace_row() {
   report ok "$title"
 }
 
+# A remote holding one commit, a clone to work in, and a second clone that
+# stands in for everyone else pushing to the comparison branch.
+make_repos_with_remote() {
+  local name=$1
+  local remote="$TEST_DIR/$name.git"
+  local repo="$TEST_DIR/$name"
+  local other="$TEST_DIR/$name-other"
+
+  git init --bare --quiet "$remote"
+  git --git-dir="$remote" symbolic-ref HEAD refs/heads/main
+  git clone --quiet "$remote" "$repo" 2>/dev/null
+  configure "$repo" 'Usable Git Test' 'usable-git@example.com'
+  printf '1\n2\n3\n' > "$repo/shared.txt"
+  git -C "$repo" add shared.txt
+  git -C "$repo" commit --quiet -m 'base'
+  git -C "$repo" branch -M main
+  git -C "$repo" push --quiet -u origin main
+  git clone --quiet "$remote" "$other" 2>/dev/null
+  configure "$other" 'Someone Else' 'someone@example.com'
+}
+# What the comparison branch gains while the local branch is being written.
+push_to_main() {
+  local name=$1
+  shift
+  commit_file "$TEST_DIR/$name-other" "$@"
+  git -C "$TEST_DIR/$name-other" push --quiet
+  git -C "$TEST_DIR/$name" fetch --quiet origin
+}
+
+colored_logs() {
+  local repo=$1
+  shift
+  (cd "$repo" && "$SCRIPT_DIR/logs" --color=always --date=iso "$@")
+}
+
+# One line per commit, the abbreviated ID alone, reverse video ones bracketed.
+commit_ids() {
+  colored_logs "$@" |
+    sed -e "s/${ESC}\[7m/[/g" -e "s/${ESC}\[27m/]/g" -e "s/${ESC}\[[0-9;]*m//g" |
+    awk 'NR > 1 { if ($1 == "+") { print $2 } else { print $1 } }'
+}
+
+marked_ids() {
+  commit_ids "$@" | sed -n 's/^\[\([0-9a-f]\{4,\}\)\]$/\1/p'
+}
+
+# Abbreviated IDs on stdin, full hashes out.
+full_hashes() {
+  local repo=$1
+  local id
+
+  while read -r id; do
+    [ -n "$id" ] || continue
+    git -C "$repo" rev-parse --verify --quiet "$id" || true
+  done
+}
+
+# The commit a real rebase stops on, in full, or the empty string when the
+# rebase finishes.
+rebase_stops_at() {
+  local repo=$1
+  local scratch="$repo-rebase-check"
+  local stopped=
+
+  rm -rf "$scratch"
+  cp -R "$repo" "$scratch"
+  if ! git -C "$scratch" rebase origin/main >"$TEST_DIR/rebase.log" 2>&1; then
+    stopped=$(sed -n 's/^error: could not apply \([0-9a-f]*\).*/\1/p' \
+      "$TEST_DIR/rebase.log")
+    stopped=$(git -C "$repo" rev-parse --verify --quiet "$stopped" || true)
+  fi
+  rm -rf "$scratch"
+  printf '%s\n' "$stopped"
+}
+
+# logs marks the commit a rebase stops on, and only that commit, and only when
+# it is one of the commits on screen.
+assert_agrees_with_rebase() {
+  local name=$1
+  local repo=$2
+  shift 2
+  local marked
+  local shown
+  local stopped
+  local expected=
+
+  marked=$(marked_ids "$repo" "$@" | full_hashes "$repo" | tr '\n' ' ')
+  shown=$(commit_ids "$repo" "$@" | tr -d '[]' | full_hashes "$repo")
+  stopped=$(rebase_stops_at "$repo")
+  case $newline$shown$newline in
+    *"$newline$stopped$newline"*)
+      [ -z "$stopped" ] || expected="$stopped "
+      ;;
+  esac
+  if [ "$marked" != "$expected" ]; then
+    report fail "$name" \
+      "rebase stops on: ${stopped:-nothing}" \
+      "logs marks:      ${marked:-nothing}" \
+      "expected:        ${expected:-nothing}"
+    return
+  fi
+  report ok "$name"
+}
+
+# A branch whose middle commit rewrites a line the comparison branch also
+# rewrote. The commits either side of it are untouched.
+test_collision() {
+  local repo="$TEST_DIR/collision"
+
+  make_repos_with_remote collision
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" mine.txt 'x' 'clean commit'
+  commit_file "$repo" shared.txt $'1\n2-topic\n3' 'colliding commit'
+  commit_file "$repo" mine.txt $'x\ny' 'commit after the collision'
+  push_to_main collision shared.txt $'1\n2-main\n3' 'comparison branch moves'
+  assert_agrees_with_rebase 'the colliding commit is the one marked' "$repo"
+}
+
+# A rebase drops merges, so a commit after a merge is still replayed, and the
+# merge itself never is.
+test_conflict_after_a_merge() {
+  local repo="$TEST_DIR/after-merge"
+
+  make_repos_with_remote after-merge
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" mine.txt 'x' 'my work'
+  push_to_main after-merge other.txt 'elsewhere' 'comparison branch moves'
+  git -C "$repo" merge --quiet origin/main -m 'merge main into topic'
+  commit_file "$repo" shared.txt $'1\n2-topic\n3' 'colliding commit after the merge'
+  push_to_main after-merge shared.txt $'1\n2-main\n3' 'comparison branch moves on'
+  assert_agrees_with_rebase 'a conflict after a merge is still found' "$repo"
+}
+
+# A rebase drops merges and replays the sides, so a conflict a merge resolved
+# comes back.
+test_merge_on_the_branch() {
+  local repo="$TEST_DIR/merged"
+
+  make_repos_with_remote merged
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" shared.txt $'1\n2-topic\n3' 'topic edits line 2'
+  git -C "$repo" switch --quiet -c side main
+  commit_file "$repo" shared.txt $'1\n2-side\n3' 'side edits line 2'
+  git -C "$repo" switch --quiet topic
+  git -C "$repo" merge side --quiet -m 'merge side' >/dev/null 2>&1 || {
+    printf '1\n2-topic\n3\n' > "$repo/shared.txt"
+    git -C "$repo" add shared.txt
+    git -C "$repo" commit --quiet -m 'merge side'
+  }
+  commit_file "$repo" mine.txt 'x' 'commit after the merge'
+  push_to_main merged unrelated.txt 'elsewhere' 'comparison branch moves'
+  assert_agrees_with_rebase 'a merge on the branch does not hide a conflict' \
+    "$repo"
+}
+
+# Merging the comparison branch in rather than rebasing puts its changes in the
+# merge commit. A rebase drops that merge, so nothing collides.
+test_merge_from_the_comparison_branch() {
+  local repo="$TEST_DIR/merged-in"
+
+  make_repos_with_remote merged-in
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" mine.txt 'x' 'my work'
+  push_to_main merged-in shared.txt $'1\n2\nthree-a' 'comparison branch moves'
+  git -C "$repo" merge --quiet origin/main -m 'merge main into topic'
+  commit_file "$repo" mine.txt $'x\ny' 'more of my work'
+  push_to_main merged-in shared.txt $'1\n2\nthree-b' 'comparison branch moves on'
+  assert_agrees_with_rebase 'merging the comparison branch in marks nothing' \
+    "$repo"
+}
+
+# A rebase skips a commit whose patch is already on the comparison branch, even
+# when that branch has since changed those lines again.
+test_already_applied() {
+  local repo="$TEST_DIR/landed"
+
+  make_repos_with_remote landed
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" landed.txt 'first' 'work that lands upstream'
+  commit_file "$repo" mine.txt 'x' 'work that has not landed'
+  push_to_main landed landed.txt 'first' 'the same patch, upstream'
+  push_to_main landed landed.txt 'second' 'upstream changes it again'
+  assert_agrees_with_rebase 'a commit already on the comparison branch is not marked' \
+    "$repo"
+}
+
+# A branch with its own root adds every file, so it collides with any file of
+# the same name.
+test_orphan_root() {
+  local repo="$TEST_DIR/orphan"
+
+  make_repos_with_remote orphan
+  git -C "$repo" switch --quiet --orphan topic
+  commit_file "$repo" shared.txt 'unrelated history' 'orphan root'
+  push_to_main orphan shared.txt $'1\n2\nchanged' 'comparison branch moves'
+  assert_agrees_with_rebase 'a branch with its own root is marked' "$repo"
+}
+
+# Only the commits on screen can be marked, so a conflict below them marks
+# nothing rather than marking everything above it.
+test_conflict_older_than_the_screen() {
+  local repo="$TEST_DIR/deep"
+  local i
+
+  make_repos_with_remote deep
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" shared.txt $'1\n2-topic\n3' 'the colliding commit'
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
+    commit_file "$repo" "f$i.txt" "$i" "unrelated work $i"
+  done
+  push_to_main deep shared.txt $'1\n2-main\n3' 'comparison branch moves'
+  assert_agrees_with_rebase 'a conflict below the screen marks nothing' "$repo"
+  assert_agrees_with_rebase 'the same conflict is marked once it is on screen' \
+    "$repo" -n 20
+}
+
+test_already_rebased() {
+  local repo="$TEST_DIR/rebased"
+
+  make_repos_with_remote rebased
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" mine.txt 'x' 'first'
+  commit_file "$repo" mine.txt $'x\ny' 'second'
+  push_to_main rebased shared.txt $'1\n2-main\n3' 'comparison branch moves'
+  git -C "$repo" rebase --quiet origin/main
+  assert_agrees_with_rebase 'a branch sitting on the comparison branch is left alone' \
+    "$repo"
+}
+
+# Each branch is replayed on its own, so one branch's conflict says nothing
+# about another's.
+test_branches_are_replayed_apart() {
+  local repo="$TEST_DIR/two"
+  local colliding
+  local marked
+
+  make_repos_with_remote two
+  git -C "$repo" switch --quiet -c clean-branch
+  commit_file "$repo" mine.txt 'x' 'clean branch commit'
+  git -C "$repo" switch --quiet -c colliding-branch origin/main
+  commit_file "$repo" shared.txt $'1\n2-branch\n3' 'colliding branch commit'
+  colliding=$(git -C "$repo" rev-parse --short HEAD)
+  push_to_main two shared.txt $'1\n2-main\n3' 'comparison branch moves'
+
+  marked=$(marked_ids "$repo" --all | tr '\n' ' ')
+  if [ "$marked" != "$colliding " ]; then
+    report fail 'branches shown together are replayed apart' \
+      "expected only $colliding marked, got ${marked:-nothing}"
+    return
+  fi
+  report ok 'branches shown together are replayed apart'
+}
+
+test_no_color_has_no_escapes() {
+  local repo="$TEST_DIR/collision"
+  local plain
+  local stripped
+
+  plain=$(cd "$repo" && "$SCRIPT_DIR/logs" --no-color --date=iso)
+  if printf '%s\n' "$plain" | grep --quiet "$ESC"; then
+    report fail '--no-color writes no escape sequences' \
+      'the output contains an escape sequence'
+    return
+  fi
+  stripped=$(colored_logs "$repo" | sed -e "s/${ESC}\[[0-9;]*m//g")
+  if [ "$plain" != "$stripped" ]; then
+    report fail '--no-color writes no escape sequences' \
+      'the columns move when the escape sequences are removed'
+    return
+  fi
+  report ok '--no-color writes no escape sequences and keeps the columns'
+}
+
+# The workspace row makes the ID column wider than a commit ID, which is the
+# only time a marked ID has to be padded by hand.
+test_columns_survive_a_wide_id_column() {
+  local repo="$TEST_DIR/collision"
+  local field_widths
+  local marked_rows
+
+  printf 'uncommitted\n' >> "$repo/mine.txt"
+  # Past the two-character margin, every row spends the same width on the ID
+  # and the spaces after it.
+  field_widths=$(colored_logs "$repo" |
+    sed -e "s/${ESC}\[[0-9;]*m//g" |
+    awk 'NR > 1 { line = substr($0, 3); match(line, /^[^ ]+ +/); print RLENGTH }' |
+    sort -u | tr '\n' ' ')
+  marked_rows=$(colored_logs "$repo" | grep --count "${ESC}\[7m" || true)
+  git -C "$repo" checkout --quiet -- mine.txt
+  if [ "$marked_rows" -eq 0 ]; then
+    report fail 'a wide ID column keeps the other columns in line' \
+      'no row was marked, so the padding was not exercised'
+    return
+  fi
+  if [ "$field_widths" != "13 " ]; then
+    report fail 'a wide ID column keeps the other columns in line' \
+      "rows spend differing widths on the ID field: $field_widths"
+    return
+  fi
+  report ok 'a wide ID column keeps the other columns in line'
+}
+
+test_repository_is_left_alone() {
+  local repo="$TEST_DIR/untouched"
+  local before
+  local after
+
+  make_repos_with_remote untouched
+  git -C "$repo" switch --quiet -c topic
+  commit_file "$repo" shared.txt $'1\n2-topic\n3' 'colliding commit'
+  commit_file "$repo" mine.txt 'x' 'commit after the collision'
+  push_to_main untouched shared.txt $'1\n2-main\n3' 'comparison branch moves'
+  before=$(find "$repo/.git/objects" -type f | wc -l | tr -d ' ')
+  marked_ids "$repo" >/dev/null
+  after=$(find "$repo/.git/objects" -type f | wc -l | tr -d ' ')
+  if [ "$before" != "$after" ]; then
+    report fail 'the run writes nothing to the repository' \
+      "object count went from $before to $after"
+    return
+  fi
+  report ok 'the run writes nothing to the repository'
+}
+
+# A colon in the path is a separator in GIT_ALTERNATE_OBJECT_DIRECTORIES, so
+# the scratch object store has to reach the repository some other way.
+test_colon_in_the_path() {
+  local repo="$TEST_DIR/collision"
+  local moved="$TEST_DIR/co:lon"
+  local marked
+
+  rm -rf "$moved"
+  cp -R "$repo" "$moved"
+  marked=$(marked_ids "$moved" | tr '\n' ' ')
+  if [ "$marked" != "$(marked_ids "$repo" | tr '\n' ' ')" ]; then
+    report fail 'a colon in the repository path changes nothing' \
+      "marked here: ${marked:-nothing}"
+    return
+  fi
+  if [ -z "$marked" ]; then
+    report fail 'a colon in the repository path changes nothing' \
+      'neither copy marked anything, so the case was not exercised'
+    return
+  fi
+  report ok 'a colon in the repository path changes nothing'
+}
+
+# A git that cannot merge in memory has to leave every commit unmarked, rather
+# than report the part of the answer it reached before giving up.
+test_git_that_cannot_merge() {
+  local repo="$TEST_DIR/late"
+  local shim="$TEST_DIR/shim"
+  local i
+  local marked
+  local shown
+
+  make_repos_with_remote late
+  git -C "$repo" switch --quiet -c topic
+  for i in 1 2 3 4 5; do
+    commit_file "$repo" "f$i.txt" "$i" "unrelated work $i"
+  done
+  commit_file "$repo" shared.txt $'1\n2-topic\n3' 'the colliding commit'
+  push_to_main late shared.txt $'1\n2-main\n3' 'comparison branch moves'
+
+  marked=$(marked_ids "$repo" | tr '\n' ' ')
+  if [ -z "$marked" ]; then
+    report fail 'a git that cannot merge in memory marks nothing' \
+      'nothing was marked even with a working git, so the case is not set up'
+    return
+  fi
+
+  # Let the replay get part way, then take merge-tree away from it.
+  mkdir -p "$shim"
+  {
+    printf '#!/bin/sh\nREAL_GIT=%s\nCOUNT=%s\n' "$(command -v git)" "$shim/count"
+    cat <<'SHIM'
+if [ "$1" = replay ]; then
+  exit 1
+fi
+if [ "$1" = merge-tree ]; then
+  echo x >> "$COUNT"
+  if [ "$(wc -l < "$COUNT")" -gt 2 ]; then
+    echo 'error: unknown option --write-tree' >&2
+    exit 129
+  fi
+fi
+exec "$REAL_GIT" "$@"
+SHIM
+  } > "$shim/git"
+  chmod +x "$shim/git"
+  : > "$shim/count"
+
+  shown=$(PATH="$shim:$PATH" commit_ids "$repo")
+  if [ "$shown" != "$(commit_ids "$repo" | tr -d '[]')" ]; then
+    report fail 'a git that cannot merge in memory marks nothing' \
+      "got: $(printf '%s' "$shown" | tr '\n' ' ')"
+    return
+  fi
+  if [ "$(wc -l < "$shim/count" | tr -d ' ')" -lt 3 ]; then
+    report fail 'a git that cannot merge in memory marks nothing' \
+      'merge-tree was never taken away, so the case was not exercised'
+    return
+  fi
+  report ok 'a git that cannot merge in memory marks nothing'
+}
+
 test_bare_repository_lists_commits
 test_the_git_directory_lists_commits
 test_a_working_tree_still_gets_a_workspace_row
 test_zsh_prints_what_sh_prints
+test_collision
+test_merge_on_the_branch
+test_conflict_after_a_merge
+test_merge_from_the_comparison_branch
+test_already_applied
+test_orphan_root
+test_conflict_older_than_the_screen
+test_already_rebased
+test_branches_are_replayed_apart
+test_no_color_has_no_escapes
+test_columns_survive_a_wide_id_column
+test_repository_is_left_alone
+test_colon_in_the_path
+test_git_that_cannot_merge
 
 printf '\n%s/%s passed\n' "$passed" "$((passed + failed))"
 [ "$failed" -eq 0 ]
