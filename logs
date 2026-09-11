@@ -318,26 +318,52 @@ else
 fi
 
 workspace_row=
-changes=
+name_list=
+paths=
 # The workspace row describes the working tree the command runs in. A bare
 # repository has none, and git will not look at one from inside .git.
+#
+# git quotes a path that holds a space, a backslash, a quote, or a non-ASCII
+# byte, wrapping it in double quotes and escaping the contents, and a quoted
+# path names no file. The -z form quotes nothing: it gives the paths as they
+# are on disk, one per NUL-separated record. A shell variable cannot hold a
+# NUL, so the records are joined with the separator this script already uses
+# for its own fields, and a path already holding that byte has it replaced, so
+# that every remaining one is a join.
+#
+# What comes back is one record per changed path, with the two-character status
+# code taken off. A rename or a copy takes two records, the path as it is now
+# and the path it came from; the path it came from is not a change of its own.
+#
+# git reports through a pipeline here, where its exit status would be lost, so
+# the status follows the records behind an empty record, which git's own output
+# never holds, and awk leaves with it.
 if [ "$(git rev-parse --is-inside-work-tree 2>/dev/null)" = true ]; then
-  changes=$(git status --porcelain --untracked-files=normal)
+  paths=$(
+    {
+      git_status=0
+      git status --porcelain -z --untracked-files=normal || git_status=$?
+      printf '\000%s' "$git_status"
+    } |
+      tr '\037\000' "?$field_separator" |
+      awk -v separator="$field_separator" '
+        BEGIN { RS = separator; ORS = separator }
+        reporting_status { exit $0 + 0 }
+        $0 == "" { reporting_status = 1; next }
+        drop { drop = 0; next }
+        {
+          drop = substr($0, 1, 2) ~ /[RC]/
+          print substr($0, 4)
+        }
+      '
+  )
 fi
-if [ -n "$changes" ]; then
+if [ -n "$paths" ]; then
   if [ "$(stat -f %m . 2>/dev/null)" -ge 0 ] 2>/dev/null; then
     mtime_format=-f%m
   else
     mtime_format=-c%Y
   fi
-  file_count=$(printf '%s\n' "$changes" | wc -l | tr -d ' ')
-  if [ "$file_count" -eq 1 ]; then
-    description="1 file modified"
-  else
-    description="$file_count files modified"
-  fi
-  paths=$(printf '%s\n' "$changes" | sed -e 's/^...//' -e 's/.* -> //')
-  name_list=$(printf '%s' "$paths" | tr '\n' "$field_separator")
   # The paths go to stat all at once, so a working tree with thousands of
   # changes costs a handful of processes rather than one for each file. A path
   # that is not there any more, because the change was a deletion, is left out
@@ -345,11 +371,16 @@ if [ -n "$changes" ]; then
   # dash is a name and not an option.
   newest=$(
     printf '%s' "$paths" |
-      tr '\n' '\000' |
+      tr "$field_separator" '\000' |
       xargs -0 stat "$mtime_format" -- 2>/dev/null |
       sort --numeric-sort |
       tail -n 1
   )
+  # The names shown have their control characters replaced, so each of them
+  # takes one line and one column. The paths measured above are the ones on
+  # disk, untouched.
+  name_list=${paths%"$field_separator"}
+  name_list=$(printf '%s' "$name_list" | tr '\001-\036\177' '[?*]')
   now=$(date +%s)
   if [ -n "$newest" ]; then
     age=$(relative_age "$(( now - newest ))")
@@ -407,6 +438,11 @@ if [ -n "$log_output" ] && git rev-parse --verify --quiet "$upstream_ref" >/dev/
 fi
 LOGS_LOCAL_ONLY=$local_only_hashes
 export LOGS_LOCAL_ONLY
+
+# awk expands backslash escapes in a -v assignment, so a path holding a
+# backslash cannot be passed that way. The environment is read verbatim.
+LOGS_WORKSPACE_FILES=$name_list
+export LOGS_WORKSPACE_FILES
 
 # Find where a rebase onto the comparison ref would stop, for each branch tip in
 # the listing. git replay answers in one pass whether a tip rebases at all; when
@@ -518,8 +554,6 @@ export LOGS_CONFLICTING
   awk -F "$field_separator" \
     -v use_color="$use_color" \
     -v show_hash="$show_hash" \
-    -v workspace_summary="$description" \
-    -v workspace_files="$name_list" \
     -v term_width="$term_width" '
     function clip(text, width) {
       if (term_width <= 0) {
@@ -542,6 +576,12 @@ export LOGS_CONFLICTING
       escape = sprintf("%c", 27)
       reset = escape "[0m"
       marker_char = "+"
+      nfiles = split(ENVIRON["LOGS_WORKSPACE_FILES"], files, sprintf("%c", 31))
+      if (nfiles == 1) {
+        workspace_summary = "1 file modified"
+      } else {
+        workspace_summary = nfiles " files modified"
+      }
       n_local = split(ENVIRON["LOGS_LOCAL_ONLY"], local_list, "\n")
       for (j = 1; j <= n_local; j++) {
         if (local_list[j] != "") {
@@ -631,8 +671,6 @@ export LOGS_CONFLICTING
         out_subject = subjects[i]
         if (is_workspace) {
           out_subject = workspace_summary
-          file_separator = sprintf("%c", 31)
-          nfiles = split(workspace_files, files, file_separator)
           if (nfiles >= 1) {
             avail = subject_avail
             ellipsis_overhead = length("…") - 1

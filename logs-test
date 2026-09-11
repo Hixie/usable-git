@@ -14,9 +14,10 @@ set -e
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 TEST_DIR=$(mktemp -d)
 ESC=$'\033'
-# A fixed time in the past, so the age a case reports says which file it was
+# Two fixed times in the past, so the age a case reports says which file it was
 # taken from rather than how long the case took to run.
 OLD_STAMP=201501020304
+NEWER_STAMP=202001020304
 newline='
 '
 passed=0
@@ -105,6 +106,14 @@ workspace_row() {
         -e 's/^+ \[workspace\] .* (Uncommitted) /+ [workspace] (Uncommitted) /'
 }
 
+# The count and the names the workspace row ends with. Nothing is squeezed,
+# since a name may hold spaces of its own.
+workspace_summary() {
+  printf '%s\n' "$LOGS_OUTPUT" |
+    awk '$2 == "[workspace]"' |
+    sed -e 's/^.*(Uncommitted)  *//'
+}
+
 # The age column of the workspace row, which the row itself reports without.
 workspace_age() {
   printf '%s\n' "$LOGS_OUTPUT" |
@@ -135,6 +144,9 @@ reference_ages() {
   make_repo_with_dated_change plain-age plain.txt
   run_logs "$TEST_DIR/plain-age"
   plain_age=$(workspace_age)
+  make_repo_with_dated_change newer-age plain.txt "$NEWER_STAMP"
+  run_logs "$TEST_DIR/newer-age"
+  newer_age=$(workspace_age)
   make_repos missing-age
   commit_file "$TEST_DIR/missing-age" gone.txt original 'a file to delete'
   rm "$TEST_DIR/missing-age/gone.txt"
@@ -151,6 +163,230 @@ test_a_plain_name_is_measured() {
     report fail "$title" \
       "age of a changed file: $plain_age" \
       "age when no file was found: $missing_age"
+    return
+  fi
+  report ok "$title"
+}
+
+# One changed file under a name git quotes. The age has to match the age of the
+# same change under a name git does not quote, and the name has to be shown as
+# it is on disk, or as the spelling given when a control character in it is
+# replaced.
+check_changed_name() {
+  local directory=$1
+  local title=$2
+  local file=$3
+  local shown=${4:-$3}
+  local age
+  local summary
+
+  make_repo_with_dated_change "$directory" "$file"
+  run_logs "$TEST_DIR/$directory"
+  age=$(workspace_age)
+  summary=$(workspace_summary)
+  if [ "$age" != "$plain_age" ]; then
+    report fail "$title" \
+      "age: ${age:-nothing}" \
+      "expected: $plain_age" \
+      "age when no file was found: $missing_age"
+    return
+  fi
+  if [ "$summary" != "1 file modified: $shown" ]; then
+    report fail "$title" \
+      "summary: ${summary:-nothing}" \
+      "expected: 1 file modified: $shown"
+    return
+  fi
+  report ok "$title"
+}
+
+test_a_name_with_a_space() {
+  check_changed_name space \
+    'a name with a space is found and shown as it is' 'two words.txt'
+}
+
+test_a_name_with_a_non_ascii_character() {
+  check_changed_name non-ascii \
+    'a name with a non-ASCII character is found and shown as it is' 'café.txt'
+}
+
+test_a_name_with_a_backslash() {
+  check_changed_name backslash \
+    'a name with a backslash keeps its backslash' 'back\slash.txt'
+}
+
+test_a_name_with_a_double_quote() {
+  check_changed_name quote \
+    'a name with a double quote keeps it' 'has"quote.txt'
+}
+
+test_a_name_with_spaces_at_the_ends() {
+  check_changed_name ends \
+    'a name keeps the spaces at its ends' ' ends with spaces '
+}
+
+# git reports a rename as "before -> after", so a name holding that spelling
+# used to lose everything up to the last one of them.
+test_a_name_that_looks_like_a_rename() {
+  check_changed_name arrow \
+    'a name reading like a rename is one name' 'before -> after.txt'
+}
+
+# A control character in a name is shown as a question mark, so every name
+# takes one line and one column.
+test_a_name_with_a_tab() {
+  check_changed_name tab \
+    'a name with a tab in it is shown without it' "$(printf 'tab\there.txt')" \
+    'tab?here.txt'
+}
+
+test_a_name_with_a_newline() {
+  check_changed_name newline \
+    'a name with a newline in it is shown without it' "two${newline}lines.txt" \
+    'two?lines.txt'
+}
+
+test_a_name_with_an_escape() {
+  check_changed_name escape \
+    'a name that could recolour the terminal is shown without the escape' \
+    "red${ESC}[31m.txt" 'red?[31m.txt'
+}
+
+# The records are joined with one byte, so a path holding that byte has it
+# replaced. The count is what the replacement protects, and the name beside it
+# has to arrive whole.
+test_a_name_with_the_separator_byte() {
+  local title='a name holding the separator byte does not swallow the next'
+  local expected='2 files modified: plain.txt, a?b.txt'
+  local age
+  local summary
+
+  make_repo_with_dated_change separator plain.txt
+  printf 'new\n' > "$TEST_DIR/separator/$(printf 'a\037b.txt')"
+  run_logs "$TEST_DIR/separator"
+  age=$(workspace_age)
+  summary=$(workspace_summary)
+  if [ "$summary" != "$expected" ]; then
+    report fail "$title" \
+      "summary: ${summary:-nothing}" \
+      "expected: $expected"
+    return
+  fi
+  if [ "$age" != "$plain_age" ]; then
+    report fail "$title" "age: ${age:-nothing}" "expected: $plain_age"
+    return
+  fi
+  report ok "$title"
+}
+
+# The age is the age of the newest changed file, and here that is a file whose
+# name git quotes.
+test_the_newest_of_the_changed_files_gives_the_age() {
+  local title='the newest changed file gives the age, quoted name or not'
+  local expected='2 files modified: plain.txt, two words.txt'
+  local age
+  local summary
+
+  make_repo_with_dated_change newest plain.txt
+  commit_file "$TEST_DIR/newest" 'two words.txt' original 'a name with a space'
+  printf 'changed\n' > "$TEST_DIR/newest/two words.txt"
+  touch -t "$NEWER_STAMP" "$TEST_DIR/newest/two words.txt"
+  run_logs "$TEST_DIR/newest"
+  age=$(workspace_age)
+  summary=$(workspace_summary)
+  if [ "$summary" != "$expected" ]; then
+    report fail "$title" \
+      "summary: ${summary:-nothing}" \
+      "expected: $expected"
+    return
+  fi
+  if [ "$age" != "$newer_age" ]; then
+    report fail "$title" \
+      "age: ${age:-nothing}" \
+      "expected: $newer_age, the age of the newer of the two" \
+      "age of the other: $plain_age"
+    return
+  fi
+  report ok "$title"
+}
+
+# git reports a rename as the name now and the name before. One file changed,
+# so one name is listed, and it is the name the file has now.
+test_a_rename() {
+  local title='a rename lists the name the file has now, and lists it once'
+  local expected='1 file modified: new name.txt'
+  local summary
+
+  make_repos rename
+  git -C "$TEST_DIR/rename" mv first.txt 'new name.txt'
+  run_logs "$TEST_DIR/rename"
+  summary=$(workspace_summary)
+  if [ "$summary" != "$expected" ]; then
+    report fail "$title" \
+      "summary: ${summary:-nothing}" \
+      "expected: $expected"
+    return
+  fi
+  report ok "$title"
+}
+
+# A rename git has been told about but has not staged is reported with the
+# rename in the second of the two status columns rather than the first.
+test_a_rename_that_is_not_staged() {
+  local title='a rename that is not staged lists one name'
+  local expected='1 file modified: new name.txt'
+  local summary
+
+  make_repos unstaged-rename
+  mv "$TEST_DIR/unstaged-rename/first.txt" "$TEST_DIR/unstaged-rename/new name.txt"
+  git -C "$TEST_DIR/unstaged-rename" add --intent-to-add -- 'new name.txt'
+  run_logs "$TEST_DIR/unstaged-rename"
+  summary=$(workspace_summary)
+  if [ "$summary" != "$expected" ]; then
+    report fail "$title" \
+      "summary: ${summary:-nothing}" \
+      "expected: $expected"
+    return
+  fi
+  report ok "$title"
+}
+
+# Both sides of a conflict are one changed file.
+test_a_conflict() {
+  local title='a file left conflicted by a merge is one changed file'
+  local expected='1 file modified: first.txt'
+  local summary
+
+  make_repos conflict
+  git -C "$TEST_DIR/conflict" switch --quiet -c other
+  commit_file "$TEST_DIR/conflict" first.txt theirs 'their change'
+  git -C "$TEST_DIR/conflict" switch --quiet -
+  commit_file "$TEST_DIR/conflict" first.txt mine 'my change'
+  git -C "$TEST_DIR/conflict" merge other >/dev/null 2>&1 || true
+  run_logs "$TEST_DIR/conflict"
+  summary=$(workspace_summary)
+  if [ "$summary" != "$expected" ]; then
+    report fail "$title" \
+      "summary: ${summary:-nothing}" \
+      "expected: $expected"
+    return
+  fi
+  report ok "$title"
+}
+
+# git reports the changed files through a pipeline, so its exit status has to
+# be carried out of one. A corrupt index stops git status and leaves git log
+# working, which is the shape of failure worth reporting.
+test_a_failing_git_status_stops_the_run() {
+  local title='a git status that fails stops the run'
+
+  make_repos failing-status
+  printf 'garbage' > "$TEST_DIR/failing-status/.git/index"
+  run_logs "$TEST_DIR/failing-status"
+  if [ "$LOGS_STATUS" = 0 ]; then
+    report fail "$title" \
+      'logs exited 0' \
+      "output: $(one_line "$LOGS_OUTPUT")"
     return
   fi
   report ok "$title"
@@ -725,6 +961,21 @@ reference_ages
 test_a_plain_name_is_measured
 test_a_name_that_starts_with_a_dash
 test_a_deletion_beside_a_file_that_is_there
+test_a_name_with_a_space
+test_a_name_with_a_non_ascii_character
+test_a_name_with_a_backslash
+test_a_name_with_a_double_quote
+test_a_name_with_spaces_at_the_ends
+test_a_name_that_looks_like_a_rename
+test_a_name_with_a_tab
+test_a_name_with_a_newline
+test_a_name_with_an_escape
+test_a_name_with_the_separator_byte
+test_the_newest_of_the_changed_files_gives_the_age
+test_a_rename
+test_a_rename_that_is_not_staged
+test_a_conflict
+test_a_failing_git_status_stops_the_run
 test_bare_repository_lists_commits
 test_the_git_directory_lists_commits
 test_a_working_tree_still_gets_a_workspace_row
