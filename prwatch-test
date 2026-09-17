@@ -47,6 +47,7 @@ def check(name, snapshot_fields, known, options=None, head="a" * 40):
                               options or Options())
     watcher.known.update(known)
     watcher.head = known.get("_head", head)
+    watcher.merge_state = known.get("_merge")
     snap = prwatch.Snapshot()
     for field, value in snapshot_fields.items():
         setattr(snap, field, value)
@@ -73,8 +74,19 @@ def run_check(fn, expected, forbidden=()):
 
 
 def pull(head="a" * 40, state="open", merged=False, mergeable="clean"):
+    """One reading of a pull request, as the REST API gives it.
+
+    GitHub works out whether a branch merges only for an open pull request,
+    and only once it has got to it. Every other reading gives a merge state
+    of "unknown" and a null mergeable field, so that pairing is made here
+    rather than named at each call.
+    """
+    if state != "open":
+        mergeable = "unknown"
+    answered = None if mergeable == "unknown" else mergeable != "dirty"
     return {"head": {"sha": head}, "state": state, "merged": merged,
             "mergeable_state": mergeable, "title": "t", "draft": False,
+            "mergeable": answered,
             "html_url": "https://example.invalid/pull/1"}
 
 
@@ -167,8 +179,81 @@ def conflict_is_announced():
         lambda: check(
             "a branch that starts conflicting is announced",
             {"pull": pull(mergeable="dirty")},
-            {"pull": pull(mergeable="clean")}),
+            {"pull": pull(mergeable="clean"), "_merge": "clean"}),
         expected=["CONFLICT", "no longer merges cleanly"])
+
+
+@case
+def an_unknown_merge_state_is_not_a_change():
+    """The reported bug: every landing woke every watch, twice.
+
+    GitHub drops its answer about whether a branch merges whenever anything
+    lands on the base branch, so a pull request that has conflicted all
+    afternoon reads "unknown" for a poll or two each time. Reported, that is
+    a conflict that went away and a conflict that came back, and neither
+    happened.
+    """
+    _, watcher, output = check(
+        "an unread merge state is not a conflict going away",
+        {"pull": pull(mergeable="unknown")},
+        {"pull": pull(mergeable="dirty"), "_merge": "dirty"})
+    snap = prwatch.Snapshot()
+    snap.pull = pull(mergeable="dirty")       # and GitHub finishes the sum
+    second = io.StringIO()
+    with redirect_stdout(second):
+        watcher.absorb(snap, announce=True)
+    both = output + second.getvalue()
+    good = "CONFLICT" not in both and watcher.merge_state == "dirty"
+    print("ok   a merge state of unknown is carried past, not reported"
+          if good else f"FAIL unknown merge state: {both!r} "
+                       f"{watcher.merge_state}")
+    return good
+
+
+@case
+def a_conflict_outlives_an_unknown_reading():
+    """A rebase is still owed while GitHub is recomputing the merge."""
+    _, watcher, _ = check(
+        "a conflict that the latest reading did not cover",
+        {"pull": pull(mergeable="unknown"), "checks": check_run("Test"),
+         "runs": workflow(), "statuses": {}, "issue_comments": {},
+         "review_comments": {}, "reviews": review(), "threads": {}},
+        {"pull": pull(mergeable="dirty"), "_merge": "dirty"})
+    lines = watcher.outstanding_lines()
+    good = any("needs a rebase" in line for line in lines) and \
+        "dirty" in watcher.status_line()
+    print("ok   a branch that does not merge stays outstanding across a "
+          "reading GitHub had no answer for" if good
+          else f"FAIL conflict outliving unknown: {lines}")
+    return good
+
+
+@case
+def a_merged_pull_request_owes_no_rebase():
+    """Merging clears the conflict, and GitHub stops answering for it."""
+    _, watcher, output = check(
+        "a pull request that was merged while conflicting",
+        {"pull": pull(state="closed", merged=True),
+         "checks": check_run("Test"), "runs": workflow(), "statuses": {},
+         "issue_comments": {}, "review_comments": {}, "reviews": review(),
+         "threads": {}},
+        {"pull": pull(mergeable="dirty"), "_merge": "dirty"})
+    lines = watcher.outstanding_lines()
+    good = not any("rebase" in line for line in lines) and \
+        "dirty" not in watcher.status_line() and "CONFLICT" not in output
+    print("ok   a merged pull request is not still owed a rebase" if good
+          else f"FAIL merged pull request: {lines} {watcher.status_line()}")
+    return good
+
+
+@case
+def conflicts_going_away_is_announced():
+    return run_check(
+        lambda: check(
+            "a rebase that clears the conflicts is announced",
+            {"pull": pull(mergeable="blocked")},
+            {"pull": pull(mergeable="dirty"), "_merge": "dirty"}),
+        expected=["CONFLICT", "conflicts are gone", "blocked"])
 
 
 @case

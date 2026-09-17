@@ -128,6 +128,18 @@ READING THE NUMBERS
   them, so when the head moves you get a RETARGET line instead, and the
   checks for the old commit stop being reported.
 
+  Whether the branch merges is reported only when GitHub has worked it out.
+  GitHub does that in the background and throws the answer away whenever the
+  head branch or the base branch moves, and a read taken before the next
+  answer is ready says "unknown" rather than giving a state. On a repository
+  where something lands every few minutes, most reads say that. Such a read
+  leaves the state alone rather than replacing it: counted as a state of its
+  own, "unknown" makes a conflict disappear and then come back every time
+  anything at all lands, and neither of those lines is about a change to
+  this pull request. The merge state in a summary line, and the rebase named
+  among the outstanding items, are the last state GitHub gave an answer for
+  rather than the last read.
+
 RUNNING IT FROM AN AGENT
 
   Use this rather than writing a watcher of your own. Its rules come from
@@ -731,6 +743,7 @@ class Watcher:
         self.stall_since = self.last_stall
         self.stall_interval = options.stall
         self.last_digest = None
+        self.merge_state = None
         self.state_path = options.state and Path(options.state)
 
     # -- output ------------------------------------------------------------
@@ -762,12 +775,14 @@ class Watcher:
             return
         self.known.update(saved.get("known", {}))
         self.head = saved.get("head")
+        self.merge_state = saved.get("merge_state")
 
     def save_state(self):
         path = self.state_path or self.default_state_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"slug": self.slug, "head": self.head,
+                                        "merge_state": self.merge_state,
                                         "known": self.known}))
         except OSError:
             pass
@@ -806,6 +821,7 @@ class Watcher:
         if snap.pull is not None:
             self.check_head(snap, announce)
             self.check_pull_state(snap, announce)
+            self.check_merge_state(snap, announce)
         self.check_checks(snap, announce)
         self.check_runs(snap, announce)
         self.check_statuses(snap, announce)
@@ -851,15 +867,45 @@ class Watcher:
                 self.emit("MERGED", f"{self.slug} was merged")
             else:
                 self.emit("CLOSED", f"{self.slug} is now {pull['state']}")
-        # mergeable_state is computed lazily, so "unknown" is not news; a
-        # move into "dirty" is, because it means the branch now conflicts.
+
+    def check_merge_state(self, snap, announce):
+        """Report whether the branch merges, ignoring the reads with no answer.
+
+        GitHub works out whether a pull request still merges in the
+        background, and throws the answer away whenever the head branch or
+        the base branch moves. A read taken before the next answer is ready
+        gives a merge state of "unknown" and a mergeable field of null. On a
+        repository where something lands every few minutes, most reads of an
+        open pull request are that read.
+
+        Counting "unknown" as a state of its own makes a conflict disappear
+        and then come back every time anything at all lands. That is two
+        lines, and neither of them is about a change to this pull request.
+        So the last state GitHub gave an answer for is kept here instead,
+        and it is that state, rather than the last read, that the summary
+        line and the outstanding items report. GitHub says it has no answer
+        in two fields at once, and both are checked: the documented one is
+        the null mergeable field, and the merge state is the one the rest of
+        this reads.
+        """
+        pull = snap.pull
+        if pull.get("state") != "open":
+            # A pull request that is merged or closed has no merge left to
+            # make, and GitHub answers for one the same way it answers for a
+            # branch it has not got to yet.
+            self.merge_state = None
+            return
         state = pull.get("mergeable_state")
-        if state and state != previous.get("mergeable_state"):
-            if state == "dirty":
-                self.emit("CONFLICT", "the branch no longer merges cleanly")
-            elif previous.get("mergeable_state") == "dirty":
-                self.emit("CONFLICT", "conflicts are gone; merge state is "
-                                      f"{state}")
+        if not state or state == "unknown" or pull.get("mergeable") is None:
+            return
+        was, self.merge_state = self.merge_state, state
+        if was is None or state == was or not announce:
+            return
+        if state == "dirty":
+            self.emit("CONFLICT", "the branch no longer merges cleanly")
+        elif was == "dirty":
+            self.emit("CONFLICT", "conflicts are gone; merge state is "
+                                  f"{state}")
 
     def check_checks(self, snap, announce):
         if snap.checks is None:
@@ -1150,9 +1196,8 @@ class Watcher:
             pieces.append(f"threads {len(self.known['threads'])} "
                           f"({len(unresolved_threads(self.known['threads']))}"
                           " unresolved)")
-        pull = self.known.get("pull") or {}
-        if pull.get("mergeable_state") and pull["mergeable_state"] != "unknown":
-            pieces.append(pull["mergeable_state"])
+        if self.merge_state:
+            pieces.append(self.merge_state)
         return " · ".join(pieces)
 
     def outstanding_lines(self):
@@ -1172,7 +1217,7 @@ class Watcher:
         # A branch that no longer merges is not ready to land, and it says so
         # only in the counts unless it is named here: the CONFLICT event fires
         # on the change, and a watch that starts after the change sees none.
-        if (self.known.get("pull") or {}).get("mergeable_state") == "dirty":
+        if self.merge_state == "dirty":
             lines.append("the branch does not merge cleanly; it needs a rebase")
         return lines
 
