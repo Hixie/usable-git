@@ -145,7 +145,16 @@ git config --global rerere.enabled true
 
 `revert quux.dart baz.dart`
 
-  Throw away local changes vs upstream.
+  Throw away local changes vs upstream/main. When there is no remote
+  named upstream, compare with origin/main instead. The main branch name
+  comes from `$MAIN` when that is set.
+
+
+`fixupstream`
+
+  Set the current branch to track upstream/main, or origin/main when
+  there is no remote named upstream. The main branch name comes from
+  `$MAIN` when that is set.
 
 
 `prwatch`
@@ -229,15 +238,26 @@ git config --global rerere.enabled true
 
 `armageddon`
 
-  Blow everything away and reset back to a pristine copy of upstream.
-  Removes all worktree debris, deletes every local branch (including
-  main, but keeping branches checked out in linked worktrees), empties
-  the stash, recreates main tracking upstream/main, and force-pushes
-  your fork's main to match upstream's main. Inside a linked worktree,
+  Blow everything away and reset back to a pristine copy of the source
+  of truth, which is the upstream remote in a repository that has one
+  and origin in a repository that does not. Removes all worktree debris,
+  deletes every local branch (including main, but keeping branches
+  checked out in linked worktrees), empties the stash that every
+  worktree of the repository shares, and recreates main tracking the
+  source of truth's main. A linked worktree that lives inside the
+  checkout is left alone, along with everything in it. Stops without
+  destroying anything when it can see that it could not finish, which
+  happens when the remote cannot be reached, when the source of truth
+  has no main branch to reset to, when another worktree has main checked
+  out, or when git is older than 2.36 and so cannot list the worktrees
+  to keep safely. In a fork, meaning a repository that has both remotes,
+  it also force-pushes your fork's main to match upstream's main;
+  without a fork that step is skipped. Inside a linked worktree,
   destroys only that worktree: wipes it clean, deletes the branch it had
-  checked out, and leaves it detached at upstream/main, keeping other
-  branches, the stash, and your fork untouched. Asks for confirmation
-  first (type "armageddon"), or pass `-y` to skip the prompt. Plays a particle-based cluster-bomb barrage across the whole
+  checked out, and leaves it detached at the source of truth's main,
+  keeping other branches, the stash, and your fork untouched. Asks for
+  confirmation first (type "armageddon"), or pass `-y` to skip the
+  prompt. Plays a particle-based cluster-bomb barrage across the whole
   terminal while the work's output scrolls up through it; your earlier
   console contents scroll up into scrollback, and the work's output is
   left on screen when it finishes. The barrage runs for two seconds past

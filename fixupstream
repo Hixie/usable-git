@@ -1,4 +1,12 @@
 #!/bin/bash
+
 set -e
+
 MAIN="${MAIN:-main}"
-git branch --set-upstream-to upstream/$MAIN
+
+base_remote=origin
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  base_remote=upstream
+fi
+
+git branch --set-upstream-to "$base_remote/$MAIN"

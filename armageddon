@@ -1,22 +1,27 @@
 #!/bin/bash
 
-# Resets this checkout and your fork back to a pristine copy of upstream's
-# main branch, destroying everything else along the way:
+# Resets this checkout and your fork back to a pristine copy of the source of
+# truth's main branch, destroying everything else along the way:
 #
 #   * removes worktree debris (modifications, deletions, type changes,
-#     untracked files, ignored files)
+#     untracked files, ignored files), keeping any linked worktree that lives
+#     inside this checkout
 #   * deletes every local branch, including main (branches checked out in
 #     linked worktrees are kept: git refuses to delete those)
-#   * fetches from upstream and origin
-#   * recreates main tracking upstream/main
+#   * fetches from the remotes it uses
+#   * recreates main tracking the source of truth's main
 #   * empties the stash
-#   * force-pushes the fresh main to origin so your fork's main matches
-#     upstream's main
+#   * in a fork, force-pushes the fresh main to origin so your fork's main
+#     matches upstream's main
+#
+# The source of truth is the upstream remote in a repository that has one, and
+# origin in a repository that has no upstream. The force-push happens only in a
+# fork, meaning a repository that has both remotes, origin being the fork there.
 #
 # Inside a linked worktree (one made with "git worktree add"), the destruction
 # is scoped to that worktree instead: it is wiped clean, the branch it had
-# checked out is deleted, and it is left detached at upstream/main. Branches
-# used elsewhere, the shared stash, and your fork are untouched.
+# checked out is deleted, and it is left detached at the source of truth's
+# main. Branches used elsewhere, the shared stash, and your fork are untouched.
 #
 # While this runs, a cluster-bomb barrage plays over the work's output: a
 # particle system detonates small explosions at random spots, each throwing out a
@@ -30,6 +35,10 @@
 # the work does, or --no-color to skip the animation entirely.
 
 MAIN="${MAIN:-main}"
+
+# The status for having examined the repository and stopped because the reset
+# could not be carried through, as against failing partway through a demolition.
+REFUSED=2
 
 # ---------------------------------------------------------------------------
 # Validation
@@ -51,16 +60,30 @@ if [ "$GITDIR" != "$COMMONDIR" ]; then
   IS_WORKTREE=1
 fi
 
-if (! git remote | grep --fixed-strings --line-regexp --quiet 'upstream'); then
-  echo 'armageddon needs an upstream remote to reset back to. Consider "nuke" for a single branch.'
+# The source of truth is upstream in a fork, and origin in a repository that
+# has no upstream.
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream'); then
+  BASE=upstream
+elif (git remote | grep --fixed-strings --line-regexp --quiet 'origin'); then
+  BASE=origin
+else
+  echo 'armageddon needs an upstream or origin remote to reset back to. Consider "nuke" for a single branch.'
   exit 1
 fi
 
-# Only the full demolition pushes to the fork; the worktree-scoped one never
-# touches origin.
-if [ "$IS_WORKTREE" -ne 1 ] && (! git remote | grep --fixed-strings --line-regexp --quiet 'origin'); then
-  echo 'armageddon needs an origin remote (your fork) to push the reset main to.'
-  exit 1
+# A fork is an origin remote alongside the upstream remote it was forked from.
+# The fork is what the reset main gets pushed to; a repository that has no fork
+# is reset without pushing anything anywhere.
+HAS_FORK=0
+if [ "$BASE" = upstream ] && (git remote | grep --fixed-strings --line-regexp --quiet 'origin'); then
+  HAS_FORK=1
+fi
+
+# What the worktree-scoped demolition leaves alone.
+if [ "$HAS_FORK" -eq 1 ]; then
+  SPARED='Branches used elsewhere, the stash, and your fork are untouched.'
+else
+  SPARED='Branches used elsewhere and the stash are untouched.'
 fi
 
 TOPLEVEL="$(git rev-parse --show-toplevel)"
@@ -81,13 +104,19 @@ for arg in "$@"; do
     -h|--help)
       echo 'Usage: armageddon [-y] [--fast] [--no-color]'
       echo
-      echo 'Obliterate every local branch and reset this checkout and your fork'"'"'s'
-      echo "$MAIN back to a pristine copy of upstream/$MAIN."
+      if [ "$HAS_FORK" -eq 1 ]; then
+        echo 'Obliterate every local branch and reset this checkout and your fork'"'"'s'
+        echo "$MAIN back to a pristine copy of upstream/$MAIN."
+      else
+        echo "Obliterate every local branch and reset this checkout's $MAIN"
+        echo "back to a pristine copy of origin/$MAIN."
+      fi
       echo
       echo 'Inside a linked worktree, only that worktree is destroyed: it is wiped'
       echo 'clean, the branch it has checked out is deleted, and it is left detached'
-      echo "at upstream/$MAIN. Branches used elsewhere, the stash, and your fork are"
-      echo 'untouched.'
+      echo "at $BASE/$MAIN."
+      echo
+      echo "$SPARED"
       echo
       echo '  -y, --yes    skip the confirmation prompt'
       echo '  --fast       end the explosion as soon as the work finishes'
@@ -101,18 +130,38 @@ for arg in "$@"; do
   esac
 done
 
+# The full demolition ends by recreating main here, and git allows a branch to
+# be checked out in only one worktree at a time. A worktree holding main stops
+# that, so say so now, while everything is still where the user left it. Git
+# goes by the registration, so a worktree whose directory has been deleted
+# without being pruned holds main just as firmly as one that is still there.
+if [ "$IS_WORKTREE" -ne 1 ]; then
+  MAINPATH="$(git for-each-ref --format='%(worktreepath)' "refs/heads/$MAIN")"
+  if [ -n "$MAINPATH" ] && [ "$MAINPATH" != "$TOPLEVEL" ]; then
+    echo "Cannot reset $MAIN here: it is checked out in $MAINPATH."
+    echo 'Check out something else there, or remove that worktree, and try again.'
+    exit "$REFUSED"
+  fi
+fi
+
 if [ "$ASSUME_YES" -ne 1 ]; then
   if [ "$IS_WORKTREE" -eq 1 ]; then
     echo "This is a linked worktree. This will DESTROY everything in $TOPLEVEL:"
-    echo "  * discard all uncommitted changes and delete untracked + ignored files"
+    echo "  * discard all uncommitted changes, and delete untracked + ignored"
+    echo "    files apart from any linked worktree inside this one"
     echo "  * delete the branch this worktree has checked out"
-    echo "  * leave the worktree detached at upstream/$MAIN"
-    echo "Branches used elsewhere, the stash, and your fork are untouched."
+    echo "  * leave the worktree detached at $BASE/$MAIN"
+    echo "$SPARED"
   else
-    echo "This will DESTROY everything in $TOPLEVEL that isn't upstream/$MAIN:"
-    echo "  * discard all uncommitted changes and delete untracked + ignored files"
-    echo "  * delete every local branch, including $MAIN, and empty the stash"
-    echo "  * force-push origin/$MAIN to match upstream/$MAIN (rewriting your fork)"
+    echo "This will DESTROY everything in $TOPLEVEL that isn't $BASE/$MAIN:"
+    echo "  * discard all uncommitted changes, and delete untracked + ignored"
+    echo "    files apart from any linked worktree inside this one"
+    echo "  * delete every local branch, including $MAIN, apart from any that a"
+    echo "    linked worktree has checked out"
+    echo "  * empty the stash, which every worktree of this repository shares"
+    if [ "$HAS_FORK" -eq 1 ]; then
+      echo "  * force-push origin/$MAIN to match upstream/$MAIN (rewriting your fork)"
+    fi
   fi
   echo
   if [ ! -t 0 ]; then
@@ -135,10 +184,52 @@ LOG="$(mktemp -t armageddon)"
 DONE="${LOG}.done"
 FADE="${LOG}.fade"
 STOP="${LOG}.stop"
+# Touched by the work when it stops without destroying anything. A file rather
+# than an exit status, because a status is indistinguishable from the same
+# number arriving from git.
+STOPPED="${LOG}.stopped"
 
 work() {
   set -e
   cd "$TOPLEVEL"
+
+  # Fetch before destroying anything, so that a checkout with no reachable
+  # source of truth, or none that has the branch being reset to, is left
+  # exactly as it was found rather than emptied and then abandoned.
+  if ! git fetch --prune "$BASE"; then
+    : > "$STOPPED"
+    exit "$REFUSED"
+  fi
+  if ! git rev-parse --verify --quiet "$BASE/$MAIN^{commit}" > /dev/null; then
+    echo "$BASE has no $MAIN branch to reset back to."
+    : > "$STOPPED"
+    exit "$REFUSED"
+  fi
+
+  # A worktree path can hold a newline, so the list has to be read in its
+  # NUL-separated form. An older git rejects that quietly enough for the loop
+  # below to read nothing and the clean to take every worktree with it, so ask
+  # first and stop if the answer is no.
+  if ! git worktree list --porcelain -z > /dev/null 2>&1; then
+    echo 'Cannot list the worktrees to keep: this git has no'
+    echo '"git worktree list --porcelain -z", which takes git 2.36 or newer.'
+    : > "$STOPPED"
+    exit "$REFUSED"
+  fi
+
+  # Linked worktrees that live inside this checkout are other checkouts, not
+  # debris, so keep them, the same way the branches they have checked out are
+  # kept. "git clean" descends into them and deletes their work otherwise.
+  KEEP=()
+  while IFS= read -r -d '' attribute; do
+    case "$attribute" in
+      "worktree $TOPLEVEL"/*) wtpath="${attribute#worktree }" ;;
+      *) continue ;;
+    esac
+    # gitignore syntax: a leading slash anchors the pattern to this directory,
+    # and a backslash makes the character after it literal.
+    KEEP+=(--exclude "/$(printf '%s' "${wtpath#"$TOPLEVEL"/}" | sed 's/[][*?\\ ]/\\&/g')")
+  done < <(git worktree list --porcelain -z)
 
   if [ "$IS_WORKTREE" -eq 1 ]; then
     # This is a linked worktree: destroy only what belongs to it. A branch can
@@ -151,17 +242,16 @@ work() {
     # and ignored files.
     git checkout --detach
     git reset --hard
-    git clean -xffd
+    git clean -xffd "${KEEP[@]}"
 
     if [ -n "$BRANCH" ]; then
       git branch -D "$BRANCH"
     fi
 
-    # Refresh upstream and end detached at its main. Detached, because main
-    # may be checked out in the primary checkout, and git allows a branch to
-    # be checked out in only one worktree at a time.
-    git fetch --prune upstream
-    git checkout --detach "upstream/$MAIN"
+    # End detached at the source of truth's main. Detached, because main may
+    # be checked out in the primary checkout, and git allows a branch to be
+    # checked out in only one worktree at a time.
+    git checkout --detach "$BASE/$MAIN"
 
     echo
     git status -sb
@@ -173,32 +263,41 @@ work() {
   # finally untracked and ignored files.
   git checkout --detach
   git reset --hard
-  git clean -xffd
+  git clean -xffd "${KEEP[@]}"
 
   # Delete every local branch, including main. Branches checked out in linked
   # worktrees are kept: git refuses to delete a branch that is checked out.
-  git for-each-ref --format='%(refname:short) %(worktreepath)' refs/heads/ |
-    while read -r branch wtpath; do
-      if [ -n "$wtpath" ]; then
-        echo "keeping $branch: checked out in $wtpath"
+  # A branch name can hold neither a space nor a control character, but a
+  # worktree path can hold both, so let the format answer the question and put
+  # the name last, rather than reading a path that may not be one word or even
+  # one line.
+  git for-each-ref \
+      --format='%(if)%(worktreepath)%(then)keep%(else)delete%(end) %(refname:short)' \
+      refs/heads/ |
+    while read -r verdict branch; do
+      if [ "$verdict" = keep ]; then
+        echo "keeping $branch: checked out in $(git for-each-ref --format='%(worktreepath)' "refs/heads/$branch")"
       else
         git branch -D "$branch"
       fi
     done
 
-  # Refresh both remotes and drop stale remote-tracking refs.
-  git fetch --prune upstream
-  git fetch --prune origin
+  # Drop the fork's stale remote-tracking refs too.
+  if [ "$HAS_FORK" -eq 1 ]; then
+    git fetch --prune origin
+  fi
 
-  # Recreate main pointing at, and tracking, upstream/main.
-  git checkout -B "$MAIN" "upstream/$MAIN"
-  git branch --set-upstream-to="upstream/$MAIN" "$MAIN" > /dev/null
+  # Recreate main pointing at, and tracking, the source of truth's main.
+  git checkout -B "$MAIN" "$BASE/$MAIN"
+  git branch --set-upstream-to="$BASE/$MAIN" "$MAIN" > /dev/null
 
   # Empty the stash.
   git stash clear
 
   # Sync your fork's main with upstream's main.
-  git push --force origin "$MAIN:$MAIN"
+  if [ "$HAS_FORK" -eq 1 ]; then
+    git push --force origin "$MAIN:$MAIN"
+  fi
 
   echo
   git branch -vv
@@ -208,6 +307,12 @@ work() {
 # Run it detached, writing all output to the log, and record the exit status
 # when finished. The inner subshell isolates work's "set -e" so a failing step
 # still gets its status recorded.
+# The work stays in this shell's process group, so that a terminal delivers an
+# interrupt to the git command it is running as well as to this shell. Git
+# handles that interrupt itself and stops, which is what stops a demolition
+# while the animation is playing: this shell cannot run a trap then, because
+# bash holds a trap until the command it is waiting on returns, and the
+# animation returns only when the work does.
 ( ( work ) > "$LOG" 2>&1 < /dev/null; echo $? > "$DONE" ) &
 WORKPID=$!
 
@@ -220,15 +325,70 @@ W=80
 H=24
 
 ANIMATING=0
+SHOWN=0
+CLEANED=0
 TIMERPID=""
-cleanup() {
-  tput cnorm 2>/dev/null    # terminfo "cursor normal": make the cursor visible again
-  printf '\033[0m'          # ESC[0m -- SGR 0: reset all colours and text attributes
-  if [ "$ANIMATING" -eq 1 ]; then printf '\n'; fi   # \n line feed: move below the block
-  kill "$WORKPID" 2>/dev/null
-  [ -n "$TIMERPID" ] && kill "$TIMERPID" 2>/dev/null
+
+# Stop a process and everything it started. The work shares this shell's
+# process group, so there is no group of its own to signal, and killing the
+# shell around a git command leaves the git command running.
+kill_tree() {
+  local children child
+  # Never 0, which signals this shell's whole process group, and never 1, which
+  # owns every orphan on the machine.
+  case "$1" in ''|0|1|*[!0-9]*) return ;; esac
+  children="$(ps -Ao pid=,ppid= | awk -v parent="$1" '$2 == parent { print $1 }')"
+  kill "$1" 2>/dev/null
+  for child in $children; do
+    kill_tree "$child"
+  done
 }
-trap cleanup EXIT INT TERM
+
+cleanup() {
+  # A signal runs this and then leaves, which runs it again through the exit
+  # trap. Once is enough, and twice would signal a process id that has been
+  # reaped and may by then belong to someone else.
+  if [ "$CLEANED" -eq 1 ]; then
+    return
+  fi
+  CLEANED=1
+  # Only while the work is still running: once it has recorded its status it
+  # has been waited for, and its number may by now belong to something else.
+  if [ ! -f "$DONE" ]; then
+    kill_tree "$WORKPID"
+  fi
+  # Only a terminal gets the escape sequences that put it back the way it was;
+  # written to a file or a pipe they are just litter in the output.
+  if [ -t 1 ]; then
+    tput cnorm 2>/dev/null    # terminfo "cursor normal": make the cursor visible again
+    printf '\033[0m'          # ESC[0m -- SGR 0: reset all colours and text attributes
+    if [ "$ANIMATING" -eq 1 ]; then printf '\n'; fi   # \n line feed: move below the block
+  fi
+  # A signal can arrive while the work's output is still only in the log. The
+  # animation has it on screen already; without the animation, print it rather
+  # than deleting it unseen.
+  if [ "$ANIMATING" -eq 0 ] && [ "$SHOWN" -eq 0 ]; then
+    cat "$LOG" 2>/dev/null
+  fi
+  ANIMATING=0
+  SHOWN=1
+  [ -n "$TIMERPID" ] && kill_tree "$TIMERPID"
+  # Let the work finish dying before the files it writes are taken away, or it
+  # writes its status back after the tidying up and leaves the litter behind.
+  wait "$WORKPID" 2>/dev/null
+  rm -f "$LOG" "$DONE" "$FADE" "$STOP" "$STOPPED"
+}
+# A signal has to leave, not merely tidy up: carrying on into the report prints
+# a verdict on a run that was never allowed to reach one. Say why it stopped on
+# the way out, since the report is where that is normally said.
+interrupted() {
+  cleanup
+  echo
+  echo 'armageddon was interrupted; the fallout above may be incomplete.'
+}
+trap cleanup EXIT
+trap 'interrupted; exit 130' INT
+trap 'interrupted; exit 143' TERM
 
 # Measure the terminal size without touching the cursor, so the animation just
 # starts wherever the prompt left it and appends downward like any command.
@@ -486,7 +646,10 @@ animate() {
   }'
 }
 
-printf '\a'   # BEL (0x07): ring the terminal bell -- the detonation alert
+if [ -t 1 ]; then
+  printf '\a'   # BEL (0x07): ring the terminal bell -- the detonation alert
+fi
+
 if [ -t 1 ] && [ "$NOCOLOR" -ne 1 ]; then
   tput civis 2>/dev/null    # terminfo "cursor invisible": hide the cursor while animating
   measure_terminal
@@ -499,6 +662,7 @@ if [ -t 1 ] && [ "$NOCOLOR" -ne 1 ]; then
     TIMERPID=$!
   fi
   ANIMATING=1
+  SHOWN=1
   animate
   ANIMATING=0
   tput cnorm 2>/dev/null    # terminfo "cursor normal": show the cursor again
@@ -506,6 +670,7 @@ if [ -t 1 ] && [ "$NOCOLOR" -ne 1 ]; then
   [ -n "$TIMERPID" ] && kill "$TIMERPID" 2>/dev/null
 else
   wait "$WORKPID" 2>/dev/null
+  SHOWN=1
   cat "$LOG"
 fi
 
@@ -515,9 +680,19 @@ fi
 
 wait "$WORKPID" 2>/dev/null
 STATUS="$(cat "$DONE" 2>/dev/null)"
-rm -f "$LOG" "$DONE" "$FADE" "$STOP"
 
-if [ "$STATUS" != "0" ]; then
+if [ -f "$STOPPED" ]; then
+  echo
+  echo 'armageddon stopped before destroying any of your work.'
+  exit "$REFUSED"
+elif [ -z "$STATUS" ]; then
+  # The work never recorded a status, so something stopped it without this
+  # shell's own handler running: it was killed on its own, rather than with the
+  # shell around it.
+  echo
+  echo 'armageddon was interrupted; the fallout above may be incomplete.'
+  exit 130
+elif [ "$STATUS" != "0" ]; then
   echo
   echo "armageddon failed (exit $STATUS); the fallout above may be incomplete."
   exit "${STATUS:-1}"

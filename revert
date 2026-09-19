@@ -1,5 +1,12 @@
 #!/bin/bash
 
 set -e
+
 MAIN="${MAIN:-main}"
-git checkout upstream/$MAIN -- $@
+
+base_remote=origin
+if (git remote | grep --fixed-strings --line-regexp --quiet 'upstream') then
+  base_remote=upstream
+fi
+
+git checkout "$base_remote/$MAIN" -- "$@"
