@@ -400,7 +400,7 @@ def a_failed_read_keeps_what_it_had():
         "user": "someone", "updated": "t", "url": "u", "body": "hello"}}}
     snap = prwatch.Snapshot()
     snap.pull = pull()
-    snap.errors["issue_comments"] = "simulated outage"
+    snap.errors["issue_comments"] = prwatch.GitHubError("simulated outage")
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
                               Options(warn_after=1))
     watcher.known.update(known)
@@ -421,6 +421,348 @@ def a_failed_read_keeps_what_it_had():
             and watcher.known["issue_comments"] == known["issue_comments"])
     print("ok   a failed read changes nothing and re-announces nothing"
           if good else f"FAIL failed read: {output}")
+    return good
+
+
+@case
+def a_failing_commit_status_is_not_green():
+    """CI that reports through the older status API and nothing else."""
+    _, watcher, _ = check(
+        "a failing commit status and nothing else wrong",
+        {"pull": pull(), "checks": check_run("Test"), "runs": workflow(),
+         "statuses": {"buildkite/build": {"state": "failure",
+                                          "url": "http://ci"}},
+         "issue_comments": {}, "review_comments": {}, "reviews": {},
+         "threads": {}},
+        {"pull": pull()}, Options(detail=False))
+    settled, reason = watcher.is_settled()
+    out = io.StringIO()
+    with redirect_stdout(out):
+        verdict = watcher.final_report(reason, settled)
+    good = settled and verdict == "RED" and "buildkite/build" in out.getvalue()
+    print("ok   a failing commit status makes the verdict red" if good
+          else f"FAIL failing status: {verdict} / {out.getvalue()}")
+    return good
+
+
+# -- a token that may not read the checks -----------------------------------
+#
+# Reading the checks directly needs a permission a fine-grained personal
+# access token cannot be given, so on a private repository that read is
+# refused for ever. These check what the watch does with that.
+
+
+class RefusedChecks:
+    """A GitHub that refuses the checks and answers everything else.
+
+    `jobs` is what the one workflow run has, as the jobs endpoint gives it,
+    and `states` is what the rollup counts, by state.
+    """
+
+    hostname = "github.com"
+
+    def __init__(self, jobs, states):
+        self.jobs = jobs
+        self.states = states
+
+    def paged(self, path, key=None, per_page=100):
+        if "/check-runs" in path:
+            raise prwatch.GitHubError(
+                "Resource not accessible by personal access token (HTTP 403)",
+                403)
+        assert "/jobs" in path, path
+        return self.jobs
+
+    def graphql(self, query, **variables):
+        return {"repository": {"object": {"statusCheckRollup": {"contexts": {
+            "checkRunCountsByState": [{"state": state.upper(), "count": count}
+                                      for state, count in self.states.items()]
+        }}}}}
+
+
+def job(name, status="completed", conclusion="success", jid=1):
+    return {"id": jid, "name": name, "status": status,
+            "conclusion": conclusion, "html_url": "u"}
+
+
+def read_refused_checks(jobs, states):
+    snap = prwatch.Snapshot()
+    snap.runs = workflow()
+    gh = RefusedChecks(jobs, states)
+    return snap, prwatch.read_checks(gh, "o", "r", "a" * 40, snap)
+
+
+@case
+def workflow_jobs_stand_in_for_the_checks():
+    snap, checks = read_refused_checks([job("Test"), job("Lint", jid=2)],
+                                       {"success": 2})
+    counts = prwatch.tally_checks(checks)
+    names = sorted(check["name"] for check in checks.values())
+    good = (names == ["Lint", "Test"] and counts["ok"] == 2
+            and "checks" in snap.limits)
+    print("ok   the jobs of a workflow run stand in for the checks" if good
+          else f"FAIL jobs as checks: {names} / {counts} / {snap.limits}")
+    return good
+
+
+@case
+def a_check_the_jobs_do_not_cover_is_still_counted():
+    """The false green this guards: a review bot's check, unreadable."""
+    snap, checks = read_refused_checks([job("Test")],
+                                       {"success": 1, "failure": 1})
+    counts = prwatch.tally_checks(checks)
+    failing = prwatch.failing_names(checks)
+    good = counts == {"ok": 1, "bad": 1, "skipped": 0, "cancelled": 0,
+                      "pending": 0} and len(failing) == 1
+    print("ok   a failing check the jobs cannot name still counts as failing"
+          if good else f"FAIL unnamed check: {counts} / {failing}")
+    return good
+
+
+@case
+def an_unnamed_check_still_in_flight_holds_the_watch_open():
+    snap, checks = read_refused_checks([job("Test")],
+                                       {"success": 1, "in_progress": 1})
+    counts = prwatch.tally_checks(checks)
+    good = counts["pending"] == 1 and counts["ok"] == 1
+    print("ok   a check in flight that the jobs cannot name is pending"
+          if good else f"FAIL unnamed pending check: {counts}")
+    return good
+
+
+@case
+def an_outage_in_the_stand_in_is_not_a_refusal():
+    """A blip while reading the stand-in is a blip, not a permission."""
+
+    class Flaky(RefusedChecks):
+        def paged(self, path, key=None, per_page=100):
+            if "/check-runs" in path:
+                return super().paged(path, key, per_page)
+            raise prwatch.GitHubError("gh failed (HTTP 502)", 502)
+
+    snap = prwatch.Snapshot()
+    snap.runs = workflow()
+    raised = None
+    try:
+        prwatch.read_checks(Flaky([], {}), "o", "r", "a" * 40, snap)
+    except prwatch.GitHubError as error:
+        raised = error
+    good = raised is not None and not prwatch.forbidden(raised)
+    print("ok   a failure while reading the stand-in is not called permanent"
+          if good else f"FAIL stand-in outage: {raised!r}")
+    return good
+
+
+@case
+def a_throttle_is_not_a_permission():
+    """GitHub answers 403 both for "not allowed" and for "slow down"."""
+    good = (not prwatch.forbidden(prwatch.GitHubError(
+                "You have triggered an abuse detection mechanism "
+                "(HTTP 403)", 403))
+            and not prwatch.forbidden(prwatch.GitHubError(
+                "API rate limit exceeded (HTTP 403)", 403))
+            and prwatch.forbidden(prwatch.GitHubError(
+                "Resource not accessible by personal access token "
+                "(HTTP 403)", 403)))
+    print("ok   a throttle is told apart from a permission" if good
+          else "FAIL throttle and permission are not told apart")
+    return good
+
+
+@case
+def a_rollup_without_counts_is_not_a_rollup_of_zero():
+    """An answer in a shape this does not know is not an answer of none."""
+
+    class Shapeless(RefusedChecks):
+        def graphql(self, query, **variables):
+            return {"repository": {"object": {"statusCheckRollup":
+                                              {"contexts": {}}}}}
+
+    snap = prwatch.Snapshot()
+    snap.runs = workflow()
+    raised = None
+    try:
+        prwatch.read_checks(Shapeless([job("Test")], {}), "o", "r", "a" * 40,
+                            snap)
+    except prwatch.GitHubError as error:
+        raised = error
+    good = raised is not None and not prwatch.forbidden(raised)
+    print("ok   counts that did not arrive are not counts of zero" if good
+          else f"FAIL rollup without counts: {raised!r}")
+    return good
+
+
+@case
+def a_commit_with_no_checks_at_all_reads_as_none():
+    """GitHub answers a commit with nothing registered with no rollup."""
+
+    class Bare(RefusedChecks):
+        def graphql(self, query, **variables):
+            return {"repository": {"object": {"statusCheckRollup": None}}}
+
+    snap = prwatch.Snapshot()
+    snap.runs = workflow()
+    checks = prwatch.read_checks(Bare([], {}), "o", "r", "a" * 40, snap)
+    good = checks == {}
+    print("ok   a commit with no checks reads as none, not as an error"
+          if good else f"FAIL bare rollup: {checks}")
+    return good
+
+
+@case
+def a_state_that_does_not_say_how_it_finished_is_not_a_pass():
+    """COMPLETED says a check finished and not how; it cannot read as green."""
+    snap, checks = read_refused_checks([job("Test")],
+                                       {"success": 1, "completed": 1})
+    counts = prwatch.tally_checks(checks)
+    good = counts["bad"] == 1 and counts["pending"] == 0 and counts["ok"] == 1
+    print("ok   a finished check with no outcome counts as a failure" if good
+          else f"FAIL unreadable state: {counts}")
+    return good
+
+
+@case
+def min_checks_does_not_wait_for_checks_nobody_may_read():
+    """--min-checks counts what registered, and nothing registered to count."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(min_checks=5, detail=False))
+    watcher.head = "a" * 40
+    snap = prwatch.Snapshot()
+    snap.pull = pull()
+    snap.runs = workflow()
+    snap.statuses = {}
+    snap.errors["checks"] = prwatch.GitHubError("refused (HTTP 403)", 403)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.report_errors(snap)
+        watcher.absorb(snap, announce=True)
+    settled, reason = watcher.is_settled()
+    good = settled
+    print("ok   --min-checks does not wait for a count that cannot be taken"
+          if good else f"FAIL min-checks refused: {settled} / {reason}")
+    return good
+
+
+@case
+def no_ci_survives_an_unrelated_unread_facet():
+    """Nothing registered is still a finding when the threads went unread."""
+    _, watcher, _ = check(
+        "no CI, and one unrelated facet unread",
+        {"pull": pull(), "checks": {}, "runs": {}, "statuses": {},
+         "issue_comments": {}, "review_comments": {}, "reviews": {}},
+        {"pull": pull()}, Options(no_ci_grace=0, detail=False))
+    settled, reason = watcher.is_settled()
+    out = io.StringIO()
+    with redirect_stdout(out):
+        verdict = watcher.final_report(reason, settled)
+    good = settled and verdict == "NO-CI"
+    print("ok   NO-CI survives an unread facet that is not the checks" if good
+          else f"FAIL no-ci with unread facet: {verdict} / {reason}")
+    return good
+
+
+@case
+def the_verdict_says_when_the_board_was_stood_in_for():
+    """The WARN that said so is hours above the verdict on a long watch."""
+    _, watcher, _ = check(
+        "a board assembled around a permission",
+        {"pull": pull(), "checks": check_run("Test"), "runs": workflow(),
+         "statuses": {}, "issue_comments": {}, "review_comments": {},
+         "reviews": {}, "threads": {}},
+        {"pull": pull()}, Options(detail=False))
+    watcher.limited["checks"] = "checks: assembled from the workflow jobs"
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.final_report("everything registered has finished")
+    good = "assembled from the workflow jobs" in out.getvalue()
+    print("ok   the verdict names the board it was drawn from" if good
+          else f"FAIL stand-in not named: {out.getvalue()}")
+    return good
+
+
+@case
+def a_refusal_is_reported_once_and_does_not_hold_the_watch():
+    """A 403 answers the same way for ever, so waiting waits for ever."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(warn_after=3, detail=False))
+    watcher.head = "a" * 40
+    refused = prwatch.GitHubError(
+        "Resource not accessible by personal access token (HTTP 403)", 403)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        for _ in range(3):
+            snap = prwatch.Snapshot()
+            snap.pull = pull()
+            snap.runs = workflow()
+            snap.statuses = {}
+            snap.errors["checks"] = refused
+            watcher.report_errors(snap)
+            watcher.absorb(snap, announce=True)
+        settled, reason = watcher.is_settled()
+        verdict = watcher.final_report(reason, settled)
+    output = out.getvalue()
+    good = (output.count("refused") == 1 and settled
+            and verdict == "UNKNOWN" and "checks" in watcher.refused)
+    print("ok   a refused read is said once and settles as UNKNOWN" if good
+          else f"FAIL refusal: {settled} / {verdict} / {output}")
+    return good
+
+
+@case
+def a_refusal_after_an_outage_is_still_a_refusal():
+    """The outage has already been reported; the wait must still end."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(warn_after=1))
+    watcher.head = "a" * 40
+    out = io.StringIO()
+    with redirect_stdout(out):
+        for error in (prwatch.GitHubError("gh failed", 502),
+                      prwatch.GitHubError("refused (HTTP 403)", 403)):
+            snap = prwatch.Snapshot()
+            snap.pull = pull()
+            snap.runs = workflow()
+            snap.statuses = {}
+            snap.errors["checks"] = error
+            watcher.report_errors(snap)
+            watcher.absorb(snap, announce=True)
+    settled, reason = watcher.is_settled()
+    good = settled and "checks" in watcher.refused
+    print("ok   a refusal that follows an outage still ends the wait" if good
+          else f"FAIL refusal after outage: {settled} / {watcher.refused}")
+    return good
+
+
+@case
+def a_refusal_does_not_hold_the_stall_wait_down():
+    """A facet that will never be read is not a picture that has gone blind."""
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    try:
+        watcher = prwatch.Watcher(
+            prwatch.GitHub("github.com"), "o", "r", 1,
+            Options(stall=10, stall_growth=2, stall_max=40))
+        watcher.known.update({"pull": pull(), "checks": check_run("Test")})
+        watcher.warned.add("threads")          # refused once, reported once
+        watcher.refused.add("threads")
+        out = io.StringIO()
+        with redirect_stdout(out):
+            watcher.heartbeat("waiting")       # take the baseline
+        gaps = []
+        last = clock.now
+        while len(gaps) < 3 and clock.now - last < 200:
+            clock.now += 1
+            out = io.StringIO()
+            with redirect_stdout(out):
+                watcher.heartbeat("waiting")
+            if "STALL" in out.getvalue():
+                gaps.append(clock.now - last)
+                last = clock.now
+    finally:
+        prwatch.time = real
+    good = gaps == [10, 20, 40]
+    print("ok   a refused facet lets the STALL wait grow" if good
+          else f"FAIL refused stall: waits were {gaps}")
     return good
 
 

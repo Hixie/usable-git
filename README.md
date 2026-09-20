@@ -226,7 +226,10 @@ git config --global rerere.enabled true
 
   `prwatch --help` is the full reference, for you or for an agent that
   goes looking: every option, what each event tag and each verdict
-  means, and how the script behaves when GitHub stops answering.
+  means, how the script behaves when GitHub stops answering, and what
+  it reads instead when the token has no permission for the checks,
+  which is every private repository for a fine-grained personal access
+  token.
   `prwatch-test` drives the paths a green pull request never reaches,
   against made-up data and no network; run it after changing `prwatch`.
 

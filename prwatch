@@ -72,8 +72,8 @@ EVENTS
   PROGRESS   a periodic summary, while things are moving
   STALL      nothing has changed for a while; the wait before the next
              one is longer each time
-  WARN       GitHub stopped answering for one part of the picture, or
-             started answering again
+  WARN       GitHub stopped answering for one part of the picture,
+             refused one outright, or started answering again
   MERGED     the pull request was merged
   CLOSED     the pull request was closed
   PENDING    --once found it unsettled; the reason follows
@@ -121,6 +121,21 @@ READING THE NUMBERS
   rather than on the block of links a bot signs off with. --excerpt sets how
   much is quoted, and --excerpt 0 quotes all of it. Every event carries the
   URL of the thing it is quoting.
+
+  Reading the checks directly needs GitHub's checks permission, which not
+  every token holds: a fine-grained personal access token is answered 403
+  by that endpoint on a private repository. The picture is assembled
+  from what the token does read. The jobs of a workflow run are the checks
+  GitHub Actions creates for it, and the counts in the status check rollup
+  say how many checks the commit has in each state, including the ones an
+  app such as a review bot registered. A check the jobs do not account for
+  is carried as an unnamed check in the state the rollup puts it in, so a
+  bot's failing check still makes the verdict red; what is lost is its name
+  and its link, not the fact of it.
+
+  A facet the token may not read at all is reported once, rather than as a
+  failure on every poll, and the watch settles without it. The verdict is
+  then UNKNOWN, and the line below it names the facet.
 
   A cancelled check is not counted as a failure. Cancellation says the run
   was stopped, not that a test failed. A repository that cancels the run for
@@ -267,6 +282,28 @@ class GitHubError(Exception):
         self.status = status
 
 
+# GitHub asks for a slower caller with a 403 as readily as with a 429, and it
+# has spelled that answer both as a rate limit and as an abuse detection
+# mechanism. Both are a wait. Every other 403 is a permission.
+THROTTLE_WORDS = ("rate limit", "abuse detection")
+
+
+def throttled(text):
+    """True when GitHub is asking to be called less often."""
+    lowered = text.lower()
+    return any(word in lowered for word in THROTTLE_WORDS)
+
+
+def forbidden(error):
+    """True when GitHub refused the request rather than failing to serve it.
+
+    A refusal is a permission the token has not got, and every later poll is
+    answered the same way, so it is news once and never again. A throttle
+    reads as a 403 too and is the opposite: it clears on its own.
+    """
+    return error.status == 403 and not throttled(str(error))
+
+
 class GitHub:
     """A thin wrapper over `gh api` that reports failure instead of hiding it.
 
@@ -294,7 +331,7 @@ class GitHub:
             match = re.search(r"\(HTTP (\d+)\)", stderr)
             if match:
                 status = int(match.group(1))
-            if status in (403, 429) and "rate limit" in stderr.lower():
+            if status in (403, 429) and throttled(stderr):
                 self._note_rate_limit(stderr)
             raise GitHubError(stderr.splitlines()[0] if stderr else "gh failed",
                               status)
@@ -529,6 +566,9 @@ class Snapshot:
         for facet in self.FACETS:
             setattr(self, facet, None)
         self.errors = {}
+        # facet -> what this token cannot see in it, for the facets that were
+        # filled in by a route around a permission the token has not got.
+        self.limits = {}
 
 
 def read_snapshot(gh, owner, repo, number):
@@ -539,23 +579,14 @@ def read_snapshot(gh, owner, repo, number):
         try:
             setattr(snap, facet, fetch())
         except GitHubError as error:
-            snap.errors[facet] = str(error)
+            snap.errors[facet] = error
 
     attempt("pull", lambda: gh.get(f"{base}/pulls/{number}"))
     sha = snap.pull["head"]["sha"] if snap.pull else None
 
     if sha:
-        attempt("checks", lambda: {
-            str(run["id"]): {
-                "name": run["name"],
-                "status": run["status"],
-                "conclusion": run.get("conclusion"),
-                "url": run.get("html_url"),
-                "app": (run.get("app") or {}).get("slug"),
-            }
-            for run in gh.paged(f"{base}/commits/{sha}/check-runs",
-                                key="check_runs")
-        })
+        # The runs are read first because the checks fall back to them when
+        # the checks endpoint is one this token may not read.
         attempt("runs", lambda: {
             str(run["id"]): {
                 "name": run["name"],
@@ -568,6 +599,7 @@ def read_snapshot(gh, owner, repo, number):
             for run in gh.paged(f"{base}/actions/runs?head_sha={sha}",
                                 key="workflow_runs")
         })
+        attempt("checks", lambda: read_checks(gh, owner, repo, sha, snap))
         # The combined status endpoint answers "pending" for a commit that has
         # no statuses at all, which is most commits in an Actions-only repo.
         # Reading that as a pending check would keep a green pull request from
@@ -612,6 +644,149 @@ def read_snapshot(gh, owner, repo, number):
     })
     attempt("threads", lambda: read_threads(gh, owner, repo, number))
     return snap
+
+
+def read_checks(gh, owner, repo, sha, snap):
+    """Every check registered against the commit, by whatever route works.
+
+    Asking for the checks directly needs the token to hold GitHub's checks
+    permission. A fine-grained personal access token is answered 403 by
+    that endpoint on a private repository, and a watch that treats the
+    answer as an outage waits for a reading that is never going to arrive.
+
+    The same picture is assembled instead from two things such a token does
+    read. The jobs of a workflow run are the checks GitHub Actions creates
+    for it, named and concluded the same way. The status check rollup counts
+    every check on the commit by state without naming any of them, and that
+    count includes the checks an app registered, which belong to no workflow
+    run. Both are needed: the jobs alone are a board with the review bots
+    missing from it, which reads as green while a bot's check is failing.
+    """
+    base = f"repos/{owner}/{repo}"
+    try:
+        return {
+            str(run["id"]): {
+                "name": run["name"],
+                "status": run["status"],
+                "conclusion": run.get("conclusion"),
+                "url": run.get("html_url"),
+                "app": (run.get("app") or {}).get("slug"),
+            }
+            for run in gh.paged(f"{base}/commits/{sha}/check-runs",
+                                key="check_runs")
+        }
+    except GitHubError as error:
+        if not forbidden(error) or snap.runs is None:
+            raise
+    try:
+        checks = jobs_as_checks(gh, base, snap.runs)
+        checks.update(unnamed_checks(gh, owner, repo, sha, checks))
+    except GitHubError as error:
+        # The status is the one the stand-in gave, not the 403 that sent the
+        # read here: a blip while reading the stand-in is a blip, and calling
+        # it a permission would drop the checks from the watch for good.
+        raise GitHubError("this token may not read the checks, and what "
+                          f"stands in for them could not be read either "
+                          f"({error})", error.status)
+    snap.limits["checks"] = (
+        "checks: this token may not read them, so they are the jobs of each "
+        "workflow run, and every other check on the commit is counted but "
+        "not named")
+    return checks
+
+
+def jobs_as_checks(gh, base, runs):
+    """The jobs of every workflow run, in the shape the checks use.
+
+    A job of a workflow run and the check GitHub Actions creates for it are
+    one thing described twice, and only one of the two endpoints needs the
+    checks permission. The two carry different identifiers, so the ones from
+    here are marked as jobs rather than passed off as check identifiers.
+    """
+    checks = {}
+    for run in runs:
+        for job in gh.paged(f"{base}/actions/runs/{run}/jobs", key="jobs"):
+            checks[f"job-{job['id']}"] = {
+                "name": job["name"],
+                "status": job["status"],
+                "conclusion": job.get("conclusion"),
+                "url": job.get("html_url"),
+                "app": "github-actions",
+            }
+    return checks
+
+
+ROLLUP_QUERY = """
+query($owner:String!,$repo:String!,$sha:GitObjectID!){
+  repository(owner:$owner,name:$repo){
+    object(oid:$sha){
+      ... on Commit {
+        statusCheckRollup{
+          contexts(first:1){ checkRunCountsByState{ state count } }
+        }
+      }
+    }
+  }
+}
+"""
+
+# The rollup reports a check by its conclusion once it has one, and by its
+# status until then. These are the statuses that mean it has not finished.
+# Everything else it can say is a conclusion, spelled the way the rest of the
+# API spells it, and is classified as one: a state that says a check finished
+# without saying how, such as COMPLETED, is a conclusion this script does not
+# recognise, and an unrecognised conclusion counts as bad. Counting it as
+# pending instead would hold the watch open on a count that never changes.
+UNFINISHED = {"queued", "in_progress", "waiting", "pending", "requested"}
+
+
+def rollup_state(check):
+    """The one word the rollup counts this check under."""
+    return check["conclusion"] or check["status"]
+
+
+def unnamed_checks(gh, owner, repo, sha, named):
+    """Stand-ins for the checks on the commit that `named` does not cover.
+
+    A check an app registers belongs to no workflow run, so a board built
+    from workflow jobs has nothing in it from the review bots. The rollup
+    counts every check on the commit by state and needs no permission the
+    jobs did not need, so the difference between those counts and the jobs
+    is carried here, one entry per check, in the state GitHub put it in and
+    without a name. A failing check nobody can name still counts as a
+    failure, and a pending one still holds the watch open.
+    """
+    data = gh.graphql(ROLLUP_QUERY, owner=owner, repo=repo, sha=sha)
+    commit = (data.get("repository") or {}).get("object")
+    if commit is None:
+        raise GitHubError(f"GitHub does not know a commit {sha[:9]} to count "
+                          "the checks of")
+    rollup = commit.get("statusCheckRollup")
+    if rollup is None:
+        # What GitHub answers for a commit that has no checks at all.
+        return {}
+    states = (rollup.get("contexts") or {}).get("checkRunCountsByState")
+    if states is None:
+        # An answer in a shape this does not know is not an answer of zero.
+        raise GitHubError("the check rollup came back without its counts")
+    counts = {entry["state"].lower(): entry["count"] for entry in states}
+    for check in named.values():
+        state = rollup_state(check)
+        if state in counts:
+            counts[state] -= 1
+    unnamed = {}
+    for state, count in counts.items():
+        for index in range(count):
+            pending = state in UNFINISHED
+            unnamed[f"unnamed-{state}-{index}"] = {
+                "name": "a check this token may not name",
+                "status": state if pending else "completed",
+                "conclusion": None if pending else state,
+                "url": f"https://{gh.hostname}/{owner}/{repo}/commit/{sha}"
+                       "/checks",
+                "app": None,
+            }
+    return unnamed
 
 
 THREADS_QUERY = """
@@ -692,6 +867,21 @@ def failing_runs(runs):
                   if verdict(run["conclusion"]) == "bad")
 
 
+def failing_statuses(statuses):
+    """Commit statuses that ended badly.
+
+    A repository whose CI reports through the older status API rather than
+    through checks puts its result here and nowhere else, so a verdict drawn
+    from the checks and the workflow runs alone passes it over. The FAIL
+    line for such a status is announced as it lands either way, and a
+    verdict that then calls the pull request green contradicts it.
+    """
+    return sorted(f"{context} ({status['state']})"
+                  + (f"  {status['url']}" if status.get("url") else "")
+                  for context, status in (statuses or {}).items()
+                  if status["state"] in ("failure", "error"))
+
+
 def reviews_on(reviews, head):
     """The reviews written against this exact commit.
 
@@ -733,6 +923,8 @@ class Watcher:
         self.head_since = time.time()
         self.failures = {}          # facet -> consecutive failure count
         self.warned = set()
+        self.refused = set()        # facets GitHub refuses this token
+        self.limited = {}           # facet -> what its stand-in cannot see
         self.settled_polls = 0
         self.reported_settled = False
         self.expect = None
@@ -800,20 +992,48 @@ class Watcher:
         A failed request updates nothing. The facet keeps the values it had,
         so a blip cannot look like a deletion, and the poll after a blip has
         nothing new to announce.
+
+        A refusal is not a blip. A request the token has no permission for is
+        answered the same way every time, so it is reported on the first poll
+        rather than after several, and the facet is remembered as one this
+        watch is never going to be given. Waiting several polls to say so
+        turns one permission into a line every poll for as long as the watch
+        runs, and waiting for the facet itself holds the watch open for ever.
+
+        A facet that was filled in by a route around a permission reports
+        what that route cannot see, once.
         """
         for facet in Snapshot.FACETS:
-            if facet in snap.errors:
-                self.failures[facet] = self.failures.get(facet, 0) + 1
-                count = self.failures[facet]
-                if count >= self.options.warn_after and facet not in self.warned:
-                    self.warned.add(facet)
-                    self.emit("WARN", f"{facet}: {plural(count, 'failed read')}"
-                                      f" in a row — {snap.errors[facet]}")
-            else:
+            error = snap.errors.get(facet)
+            if error is None:
                 if facet in self.warned:
                     self.warned.discard(facet)
+                    self.refused.discard(facet)
                     self.emit("WARN", f"{facet}: reading again")
                 self.failures[facet] = 0
+                continue
+            self.failures[facet] = self.failures.get(facet, 0) + 1
+            count = self.failures[facet]
+            refusal = forbidden(error)
+            if refusal:
+                # Marked before the line below is considered, so that a facet
+                # already being warned about for an outage is still known to
+                # be one this watch will not be given.
+                self.refused.add(facet)
+            if facet in self.warned:
+                continue
+            if refusal:
+                self.warned.add(facet)
+                self.emit("WARN", f"{facet}: refused — {error}; the "
+                                  "verdict will not cover it")
+            elif count >= self.options.warn_after:
+                self.warned.add(facet)
+                self.emit("WARN", f"{facet}: {plural(count, 'failed read')}"
+                                  f" in a row — {error}")
+        for facet, limit in snap.limits.items():
+            if facet not in self.limited:
+                self.limited[facet] = limit
+                self.emit("WARN", limit)
 
     # -- change detection --------------------------------------------------
 
@@ -1077,6 +1297,9 @@ class Watcher:
         And a board that has just gone quiet is not trusted on the first poll.
         The state has to hold still for a few polls, which is what separates a
         finished run from the pause between one workflow's jobs and the next.
+
+        A facet GitHub has refused this token is never going to arrive, so
+        the watch settles without it and the verdict says it was never read.
         """
         pull = self.known.get("pull")
         if pull and pull.get("state") != "open":
@@ -1084,11 +1307,11 @@ class Watcher:
                           else "it was closed without merging")
 
         for facet in ("checks", "runs"):
-            if self.known.get(facet) is None:
+            if self.known.get(facet) is None and facet not in self.refused:
                 return False, "no reading of the checks yet"
 
-        runs = self.known["runs"]
-        checks = self.known["checks"]
+        runs = self.known.get("runs") or {}
+        checks = self.known.get("checks") or {}
         statuses = self.known.get("statuses") or {}
 
         if any(run["status"] != "completed" for run in runs.values()):
@@ -1098,7 +1321,8 @@ class Watcher:
             return False, "a check has not concluded"
         if any(status["state"] == "pending" for status in statuses.values()):
             return False, "a commit status is pending"
-        if len(checks) < self.options.min_checks:
+        if "checks" not in self.refused and \
+                len(checks) < self.options.min_checks:
             return False, (f"only {plural(len(checks), 'check')} registered, "
                            f"fewer than the {self.options.min_checks} expected")
 
@@ -1107,16 +1331,22 @@ class Watcher:
         # checks a review bot creates within seconds of the push. Until a
         # workflow run exists there is no evidence either way, so the wait
         # runs for the grace period before the absence is called a finding.
-        if not runs:
+        if not runs and "runs" not in self.refused:
             waited = time.time() - self.head_since
             if waited < self.options.no_ci_grace:
                 return False, "no workflow run has appeared yet"
+            if "checks" in self.refused:
+                return True, (f"no workflow run appeared for {self.head[:9]} "
+                              f"in {duration(waited)}, and the checks are not "
+                              "readable with this token")
             if not checks and not statuses:
                 return True, (f"no check ever appeared for {self.head[:9]} in "
                               f"{duration(waited)}")
             return True, (f"no workflow run appeared for {self.head[:9]} in "
                           f"{duration(waited)}; the checks that did register "
                           "have finished")
+        if self.refused:
+            return True, "everything this token can read has finished"
         return True, "everything registered has finished"
 
     # -- reporting ---------------------------------------------------------
@@ -1207,6 +1437,8 @@ class Watcher:
             lines.append(f"failing run: {name}")
         for name in failing_names(self.known.get("checks")):
             lines.append(f"failing: {name}")
+        for name in failing_statuses(self.known.get("statuses")):
+            lines.append(f"failing: {name}")
         for thread in unresolved_threads(self.known.get("threads")).values():
             lines.append(f"unresolved: {thread['author']} · "
                          f"{where(thread['path'], thread['line'])} · "
@@ -1252,19 +1484,25 @@ class Watcher:
         # UNKNOWN displaces a green result, never a finding. A pull request
         # with a failing check and an unread comment list is red, and saying
         # so matters more than saying the comments went unread, which the
-        # line below the verdict says anyway.
+        # line below the verdict says anyway. NO-CI is the exception: it is
+        # the claim that nothing ever registered, so it survives an unread
+        # facet of any other kind and gives way only when the checks or the
+        # runs are what went unread, which is the reading it rests on.
         unread = self.unread()
+        blind = {"checks", "runs"} & set(unread)
         if not settled:
             verdict = "PENDING"
         elif pull.get("merged"):
             verdict = "MERGED"
         elif pull.get("state") not in (None, "open"):
             verdict = "CLOSED"
-        elif bad or failing_runs(self.known.get("runs")):
+        elif bad or failing_runs(self.known.get("runs")) or \
+                failing_statuses(self.known.get("statuses")):
             verdict = "RED"
         elif outstanding:
             verdict = "FEEDBACK"
-        elif not (self.known.get("checks") or self.known.get("runs")):
+        elif not blind and not (self.known.get("checks")
+                                or self.known.get("runs")):
             verdict = "NO-CI"
         elif unread:
             verdict = "UNKNOWN"
@@ -1276,6 +1514,10 @@ class Watcher:
         if unread:
             self.note(f"never read successfully: {', '.join(unread)} — "
                       f"this verdict does not cover them")
+        # The WARN that said so came at the first poll, which on a watch that
+        # has run for hours is a long way above the verdict.
+        for facet in sorted(self.limited):
+            self.note(self.limited[facet])
         self.note_outstanding(outstanding)
         url = pull.get("html_url") or \
             f"https://{self.gh.hostname}/{self.owner}/{self.repo}/pull/{self.number}"
@@ -1306,8 +1548,10 @@ class Watcher:
             self.last_stall = now
             self.stall_since = now
         # While a facet is failing the picture is unread rather than quiet,
-        # and the wait stays at --stall.
-        if changed or self.warned:
+        # and the wait stays at --stall. A facet the token may not read is
+        # not failing: it was reported once, it will not change, and holding
+        # the wait down for it means a line every --stall seconds for ever.
+        if changed or self.warned - self.refused:
             self.stall_interval = self.options.stall
 
         if changed and now - self.last_progress >= self.options.heartbeat:
