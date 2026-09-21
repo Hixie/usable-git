@@ -16,6 +16,7 @@ import io
 import signal
 import subprocess
 import sys
+import tempfile
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -32,6 +33,7 @@ class Options:
 
     def __init__(self, **overrides):
         defaults = dict(expect=None, once=False, follow=False, interval=60,
+                        interval_growth=2, interval_max=600,
                         heartbeat=900, stall=1800, stall_growth=2,
                         stall_max=86400, stability=3, min_checks=0,
                         no_ci_grace=900, warn_after=3, max_lines=12,
@@ -111,13 +113,20 @@ def thread(resolved=False, tid="t1"):
 
 
 class Clock:
-    """A stand-in for the time module, so a test can skip ahead by hours."""
+    """A stand-in for the time module, so a test can skip ahead by hours.
+
+    Sleeping moves it rather than waiting, so a case about a wait of four
+    minutes takes no longer than one about a wait of four seconds.
+    """
 
     def __init__(self, now=1000.0):
         self.now = now
 
     def time(self):
         return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
 
     def strftime(self, fmt):
         return "00:00"
@@ -566,6 +575,259 @@ def a_throttle_is_not_a_permission():
                 "(HTTP 403)", 403)))
     print("ok   a throttle is told apart from a permission" if good
           else "FAIL throttle and permission are not told apart")
+    return good
+
+
+@case
+def a_throttle_is_recorded_from_everything_gh_said():
+    """gh's first line is the line worth showing; the wording can be below it.
+
+    Whether a 403 is a wait or a permission is decided by the wording, and
+    when the wording is on a later line a watch that reads only the first
+    one calls a throttle a permission and stops covering that part of the
+    picture for the rest of the run.
+    """
+
+    class Refusal:
+        """What subprocess.run gives back for a request gh could not make."""
+
+        def __init__(self, stderr):
+            self.returncode, self.stdout, self.stderr = 1, "", stderr
+
+    class OnlyRun:
+        """A stand-in for the subprocess module, answering every request."""
+
+        def __init__(self, stderr):
+            self.stderr = stderr
+
+        def run(self, *arguments, **named):
+            return Refusal(self.stderr)
+
+    clock = Clock()
+    real_time, real_subprocess = prwatch.time, prwatch.subprocess
+    prwatch.time = clock
+    problems = []
+    try:
+        for name, stderr, until in (
+                ("a throttle said on the first line",
+                 "gh: API rate limit exceeded for user ID 551196 (HTTP 403)",
+                 clock.now + 300),
+                ("a throttle said below it, naming when it resets",
+                 "gh: request failed (HTTP 403)\nYou have exceeded a "
+                 "secondary rate limit. X-RateLimit-Reset: 1789958190",
+                 1789958190.0),
+                ("a permission, which no wait clears",
+                 "gh: Resource not accessible by personal access token "
+                 "(HTTP 403)", 0.0)):
+            prwatch.subprocess = OnlyRun(stderr)
+            gh = prwatch.GitHub("github.com")
+            raised = None
+            try:
+                gh.get("repos/o/r/pulls/1")
+            except prwatch.GitHubError as error:
+                raised = error
+            if raised is None:
+                problems.append(f"{name}: the failure was not reported")
+                continue
+            if gh.rate_limited_until != until:
+                problems.append(f"{name}: the wait runs to "
+                                f"{gh.rate_limited_until}, not to {until}")
+            if prwatch.forbidden(raised) != (until == 0.0):
+                problems.append(f"{name}: forbidden() calls it "
+                                f"{prwatch.forbidden(raised)}")
+    finally:
+        prwatch.time, prwatch.subprocess = real_time, real_subprocess
+    if problems:
+        print("FAIL a throttle is recorded from everything gh said")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   a throttle is recorded from everything gh said, and when "
+          "it clears")
+    return True
+
+
+@case
+def a_throttle_at_the_first_poll_is_waited_out():
+    """The reported bug: a watch that started while the token was throttled.
+
+    GitHub refused the first read, prwatch exited, and the pull request went
+    unwatched for the rest of the session. The same refusal an hour into a
+    watch is waited out, so the first read waits it out too.
+    """
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    try:
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options(interval=60))
+        polls = []
+
+        def refuse_twice_then_answer():
+            polls.append(clock.now)
+            snap = prwatch.Snapshot()
+            if len(polls) > 2:
+                snap.pull = pull()
+                return snap
+            snap.errors["pull"] = prwatch.GitHubError(
+                "gh: API rate limit exceeded for user ID 551196 (HTTP 403)",
+                403)
+            watcher.gh.rate_limited_until = clock.now + 240
+            return snap
+
+        watcher.poll = refuse_twice_then_answer
+        out = io.StringIO()
+        with redirect_stdout(out):
+            snap = watcher.first_poll()
+    finally:
+        prwatch.time = real
+    said = out.getvalue()
+    good = (snap.pull is not None and len(polls) == 3
+            and said.count("rate limited") == 2
+            and polls[1] - polls[0] >= 240)
+    print("ok   a throttle at the first poll is waited out, not fatal" if good
+          else f"FAIL first-poll throttle: {len(polls)} polls at {polls}, "
+               f"which said {said!r}")
+    return good
+
+
+class Waited(Exception):
+    """The watch waited for an answer that is never going to change."""
+
+
+def waiting_is_wrong():
+    """A stand-in for sleep() that turns a wait into a failure.
+
+    A watch that waits for an answer that will not change waits for ever,
+    which in a test is a run that never finishes rather than a case that
+    fails and says why.
+    """
+    raise Waited()
+
+
+@case
+def a_single_reading_does_not_wait_for_a_throttle():
+    """--once answers where a pull request stands now, so it never waits."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(once=True))
+    polls = []
+
+    def refuse():
+        polls.append("polled")
+        snap = prwatch.Snapshot()
+        snap.errors["pull"] = prwatch.GitHubError(
+            "gh: API rate limit exceeded for user ID 551196 (HTTP 403)", 403)
+        return snap
+
+    watcher.poll = refuse
+    watcher.sleep = waiting_is_wrong
+    complaint = None
+    waited = False
+    try:
+        with redirect_stdout(io.StringIO()):
+            watcher.first_poll()
+    except SystemExit as raised:
+        complaint = str(raised)
+    except Waited:
+        waited = True
+    good = not waited and complaint is not None and polls == ["polled"]
+    print("ok   --once reports a throttle rather than waiting it out" if good
+          else f"FAIL --once and a throttle: waited={waited} "
+               f"complaint={complaint!r} polls={polls}")
+    return good
+
+
+@case
+def a_refusal_at_the_first_poll_is_still_fatal():
+    """An answer that will not change is not one to wait for.
+
+    A permission the token has not got, a pull request that is not there,
+    and a network failure are each answered the same way on the next poll as
+    on this one, so each ends the run rather than starting a wait.
+    """
+    problems = []
+    for error in (prwatch.GitHubError("Resource not accessible by personal "
+                                      "access token (HTTP 403)", 403),
+                  prwatch.GitHubError("Not Found (HTTP 404)", 404),
+                  prwatch.GitHubError("dial tcp: no such host", None)):
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options())
+        polls = []
+
+        def refuse():
+            polls.append("polled")
+            snap = prwatch.Snapshot()
+            snap.errors["pull"] = error
+            return snap
+
+        watcher.poll = refuse
+        watcher.sleep = waiting_is_wrong
+        complaint = None
+        try:
+            with redirect_stdout(io.StringIO()):
+                watcher.first_poll()
+        except SystemExit as raised:
+            complaint = str(raised)
+        except Waited:
+            problems.append(f"{error} started a wait that would never end")
+            continue
+        if complaint is None:
+            problems.append(f"{error} did not end the run")
+        elif "cannot read o/r#1" not in complaint or str(error) not in \
+                complaint:
+            problems.append(f"{error} was reported as {complaint!r}")
+        if polls != ["polled"]:
+            problems.append(f"{error} was read {len(polls)} times: {polls}")
+    if problems:
+        print("FAIL a refusal at the first poll is still fatal")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   a failure that will not clear still ends the run at once")
+    return True
+
+
+@case
+def a_throttle_while_naming_the_pull_request_is_waited_out():
+    """A watch given a branch has to ask which pull request that is.
+
+    That request meets a throttle as readily as the reads that follow it,
+    and until it is answered there is no number to put on a line.
+    """
+    clock = Clock()
+    real, real_find = prwatch.time, prwatch.find_pr_for_branch
+    prwatch.time = clock
+    try:
+        attempts = []
+
+        def refuse_twice_then_answer(gh, owner, repo):
+            attempts.append(clock.now)
+            if len(attempts) > 2:
+                return 6677
+            gh.rate_limited_until = clock.now + 120
+            raise prwatch.GitHubError(
+                "gh: API rate limit exceeded for user ID 551196 (HTTP 403)",
+                403)
+
+        prwatch.find_pr_for_branch = refuse_twice_then_answer
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r",
+                                  None, Options(interval=60))
+        before = watcher.label
+        out = io.StringIO()
+        with redirect_stdout(out):
+            watcher.name(watcher.find_number())
+    finally:
+        prwatch.time, prwatch.find_pr_for_branch = real, real_find
+    said = out.getvalue()
+    good = (watcher.number == 6677 and len(attempts) == 3
+            and before.strip() == "#?" and "#?" in said
+            and said.count("rate limited") == 2
+            and watcher.slug == "o/r#6677"
+            and watcher.label.strip() == "#6677")
+    print("ok   a throttle while naming the pull request is waited out"
+          if good else
+          f"FAIL naming under a throttle: {len(attempts)} attempts, label "
+          f"was {before!r} then {watcher.label!r}, said {said!r}")
     return good
 
 
@@ -1059,6 +1321,170 @@ def stall_reports_back_off():
     return good
 
 
+def quiet_watcher(options):
+    """A watcher holding a green pull request that nobody is touching."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              options)
+    watcher.known.update({"pull": pull(), "checks": check_run("Test"),
+                          "runs": workflow(), "statuses": {},
+                          "issue_comments": {}, "review_comments": {},
+                          "reviews": {}, "threads": {}})
+    watcher.head = "a" * 40
+    watcher.merge_state = "clean"
+    return watcher
+
+
+def quiet_polls(watcher, clock, count):
+    """The pace after each of `count` polls that find nothing."""
+    paces = []
+    for _ in range(count):
+        clock.now += 1
+        with redirect_stdout(io.StringIO()):
+            watcher.heartbeat("waiting")
+        paces.append(watcher.poll_interval)
+    return paces
+
+
+@case
+def polling_slows_down_while_nothing_changes():
+    """A pull request nobody has touched since the morning is read less often.
+
+    Several watches, each reading its own pull request every minute under
+    one token, is what GitHub refuses. A watch that has given its verdict
+    and is waiting for a person loses nothing by reading less often, so the
+    wait grows until it reaches --interval-max. A build still in flight is
+    read at --interval throughout.
+    """
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    try:
+        watcher = quiet_watcher(Options(interval=60, interval_growth=2,
+                                        interval_max=240))
+        watcher.reported_settled = True
+        waiting_for_a_person = quiet_polls(watcher, clock, 5)
+        watcher.reported_settled = False       # a push, and CI starts again
+        build_in_flight = quiet_polls(watcher, clock, 3)
+    finally:
+        prwatch.time = real
+    good = (waiting_for_a_person == [60, 120, 240, 240, 240]
+            and build_in_flight == [60, 60, 60])
+    print("ok   polling slows down once there is nothing left to wait for"
+          if good else
+          f"FAIL poll backoff: waits were {waiting_for_a_person} with the "
+          f"verdict in, and {build_in_flight} with a build in flight")
+    return good
+
+
+@case
+def the_watch_loop_waits_longer_as_it_finds_nothing():
+    """The gaps between polls, measured through run() rather than around it.
+
+    The pace is worked out in one place and spent in another, and the other
+    cases about it read the number rather than the wait it produces. This
+    one drives the loop itself, with a clock that moves when the watch
+    sleeps, and records when each poll lands.
+    """
+
+    class Enough(Exception):
+        """Long enough: the case has the polls it came for."""
+
+    comment = {"1": {"user": "someone", "updated": "2026-09-20T10:00:00Z",
+                     "url": "u", "body": "one more thing"}}
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    polls = []
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            watcher = prwatch.Watcher(
+                prwatch.GitHub("github.com"), "o", "r", 1,
+                Options(interval=60, interval_growth=2, interval_max=240,
+                        stability=1, follow=True, detail=False,
+                        state=str(Path(directory) / "state.json")))
+
+            def poll():
+                polls.append(clock.now)
+                if len(polls) > 8:
+                    raise Enough()
+                snap = prwatch.Snapshot()
+                snap.pull = pull()
+                snap.checks = check_run("Test")
+                snap.runs = workflow()
+                snap.statuses = {}
+                # Somebody comments on the sixth reading. Nothing else ever
+                # changes.
+                snap.issue_comments = {} if len(polls) < 6 else comment
+                snap.review_comments = {}
+                snap.reviews = {}
+                snap.threads = {}
+                return snap
+
+            watcher.poll = poll
+            with redirect_stdout(io.StringIO()):
+                try:
+                    watcher.run()
+                except Enough:
+                    pass
+    finally:
+        prwatch.time = real
+    gaps = [round(later - earlier)
+            for earlier, later in zip(polls, polls[1:])]
+    good = gaps == [120, 240, 240, 240, 240, 60, 120, 240]
+    print("ok   the loop spreads its polls out, and comes back on a comment"
+          if good else f"FAIL the loop waited {gaps} between polls")
+    return good
+
+
+@case
+def a_change_puts_the_poll_pace_back():
+    """Anything happening at all means reading at --interval again, at once."""
+    comment = {"1": {"user": "someone", "updated": "2026-09-20T10:00:00Z",
+                     "url": "u", "body": "hello"}}
+    changes = {
+        "a new head": lambda w: setattr(w, "head", "b" * 40),
+        "a check result": lambda w: w.known.update(
+            {"checks": check_run("Test", conclusion="failure")}),
+        "a check going back to pending": lambda w: w.known.update(
+            {"checks": check_run("Test", status="queued", conclusion=None)}),
+        "a comment": lambda w: w.known.update({"issue_comments": comment}),
+        "an inline comment": lambda w: w.known.update(
+            {"review_comments": comment}),
+        "a review": lambda w: w.known.update({"reviews": review()}),
+        "a thread": lambda w: w.known.update({"threads": thread()}),
+        "a conflict": lambda w: setattr(w, "merge_state", "dirty"),
+        "a merge": lambda w: w.known.update(
+            {"pull": pull(state="closed", merged=True)}),
+        "a read that failed": lambda w: w.warned.add("threads"),
+    }
+    real = prwatch.time
+    problems = []
+    for name, change in changes.items():
+        clock = Clock()
+        prwatch.time = clock
+        try:
+            watcher = quiet_watcher(Options(interval=60, interval_growth=2,
+                                            interval_max=600))
+            watcher.reported_settled = True
+            backed_off = quiet_polls(watcher, clock, 4)[-1]
+            change(watcher)
+            after = quiet_polls(watcher, clock, 1)[-1]
+        finally:
+            prwatch.time = real
+        if backed_off <= 60:
+            problems.append(f"the pace had not grown before {name}: "
+                            f"{backed_off}")
+        if after != 60:
+            problems.append(f"{name} left the pace at {after}")
+    if problems:
+        print("FAIL a change puts the poll pace back")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   any change puts the pace back to --interval at once")
+    return True
+
+
 @case
 def a_wait_that_shrinks_is_refused():
     """The options that widen the wait cannot be set to narrow it instead."""
@@ -1066,7 +1492,11 @@ def a_wait_that_shrinks_is_refused():
     for argv, wanted in [(["--stall-growth", "0.5"], "--stall-growth"),
                          (["--stall-growth", "-1"], "--stall-growth"),
                          (["--stall", "60", "--stall-max", "30"],
-                          "--stall-max")]:
+                          "--stall-max"),
+                         (["--interval-growth", "0.5"], "--interval-growth"),
+                         (["--interval", "0"], "--interval"),
+                         (["--interval", "60", "--interval-max", "30"],
+                          "--interval-max")]:
         try:
             # The target is deliberately unreadable, so that a run which gets
             # past the check stops before it reaches the network.

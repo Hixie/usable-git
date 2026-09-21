@@ -191,6 +191,12 @@ git config --global rerere.enabled true
       a notification. Under Codex, `exec_command` starts it and
       repeated `wait` calls on the cell collect the lines.
 
+      A pull request often takes longer to settle than your harness
+      will follow one command for: a monitor under Claude Code runs for
+      half an hour at the most. When yours stops, run the same command
+      again. The new run announces only what happened while you were
+      away.
+
       It reports failing checks as they land, workflow runs as they
       finish, every comment (issue-level, inline, and review
       summaries), and every review thread as it opens or is resolved.
@@ -210,8 +216,8 @@ git config --global rerere.enabled true
       an option you do not have.
 
   Keep it about that long. In particular, do not tell the agent to read
-  `prwatch --help` before it starts: the help is around 2,800 tokens and
-  the text above is around 350, and in the ordinary case the agent will
+  `prwatch --help` before it starts: the help is around 3,300 tokens and
+  the text above is around 400, and in the ordinary case the agent will
   use none of the difference. The output is written to teach at the
   point of need instead, so the line that ends a watch names the flag
   that would have kept it open, and a cancelled check says on the spot

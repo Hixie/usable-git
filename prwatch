@@ -166,6 +166,11 @@ RUNNING IT FROM AN AGENT
   turns each line into a notification. Under Codex, `exec_command` starts it
   and repeated `wait` calls on the cell collect the lines.
 
+  Claude Code's Monitor tool runs for half an hour at the most and then has
+  to be armed again, so a watch that lasts an afternoon is a succession of
+  processes rather than one. That is what the state file is for: each
+  process picks up where the one before it left off.
+
   After a push, `--expect HEAD` checks that the commit you have checked out
   is the one the pull request points at. A push that went to the wrong
   remote or the wrong branch otherwise produces a watch that succeeds at
@@ -207,6 +212,22 @@ WHEN IT STOPS
   review bot registers within seconds, and by every other measure that looks
   exactly like a finished green build.
 
+  A throttle is not a reason to stop either. GitHub answers a caller it
+  wants to slow down with a 403 that says so, and that answer clears on
+  its own, so the watch waits it out and reads again: until the reset
+  GitHub named, or five minutes when it named none. That holds for the
+  first read as much as for one an hour in, and for every request made
+  before there is anything to read, including working out which pull
+  request a branch is for, whose lines carry `#?` where the number goes
+  until GitHub has said. So a watch started while the token is being
+  throttled starts late rather than not at all.
+
+  Two refusals are not waits. A 403 that is a permission the token has
+  not got ends the run at once, because every later read is answered the
+  same way. And --once does not wait for a throttle: it answers where the
+  pull request stands now, so the refusal is reported and no reading is
+  taken.
+
   Each STALL waits longer than the one before it: --stall-growth times the
   wait that preceded it, up to --stall-max. An afternoon spent waiting for
   a reviewer is a handful of lines rather than one every --stall seconds,
@@ -215,9 +236,30 @@ WHEN IT STOPS
   answering for: an unread picture is not a quiet one, and a watch that has
   gone blind keeps saying so at the rate it started with.
 
-  The wait is between reports, not between polls. --interval alone decides
-  how often the pull request is read, so a change is announced on the poll
-  that finds it, however long ago the last STALL line was.
+  The wait between STALL lines is not the wait between polls, and the two
+  grow separately. A change is announced on the poll that finds it, however
+  long ago the last STALL line was.
+
+  How often the pull request is read starts at --interval. Once the verdict
+  has been reported and nothing is changing, each poll waits
+  --interval-growth times as long as the one before it, up to
+  --interval-max, and any change at all puts the wait back to --interval. A
+  pull request that has been green and waiting for a reviewer since the
+  morning is read a few times an hour rather than sixty, and one whose
+  build is still running is read every --interval throughout.
+
+  That growth belongs to --follow, since a watch without it ends at the
+  verdict rather than waiting past it. Each process starts again at
+  --interval: the pace is not carried across a restart, because a process
+  that inherited one would also have to inherit the settling its verdict
+  rests on, and a verdict from a single poll is one GitHub can answer with
+  a head that a push has already replaced.
+
+  Reading less often is worth it because GitHub limits how often it answers
+  a token as well as how much it answers in a day, and every watch running
+  under one token spends that allowance together. Six watches reading once
+  a minute was enough to be refused, and the refusal arrives as a 403 on
+  whichever request comes next.
 
   Pass --follow to keep watching past the settling point, which is what you
   want while waiting on a human reviewer.
@@ -277,9 +319,18 @@ def verdict(conclusion):
 
 
 class GitHubError(Exception):
-    def __init__(self, message, status=None):
+    """A request that failed, with everything GitHub said about it.
+
+    The message is the first line of that, which is the line worth
+    showing. The rest is kept as well, because whether a refusal is a
+    throttle or a permission is decided by its wording, and `gh` does not
+    promise to put the wording on the first line.
+    """
+
+    def __init__(self, message, status=None, detail=None):
         super().__init__(message)
         self.status = status
+        self.detail = detail or message
 
 
 # GitHub asks for a slower caller with a 403 as readily as with a 429, and it
@@ -301,7 +352,18 @@ def forbidden(error):
     answered the same way, so it is news once and never again. A throttle
     reads as a 403 too and is the opposite: it clears on its own.
     """
-    return error.status == 403 and not throttled(str(error))
+    return error.status == 403 and not throttled(error.detail)
+
+
+def rate_limited(error):
+    """True when GitHub answered by asking to be called less often.
+
+    The other half of a 403, and the opposite of a permission: a throttle
+    clears on its own, so the request that met one is worth making again
+    once the wait GitHub named has passed. GitHub spells the same answer
+    with a 429 as readily as with a 403.
+    """
+    return error.status in (403, 429) and throttled(error.detail)
 
 
 class GitHub:
@@ -331,17 +393,20 @@ class GitHub:
             match = re.search(r"\(HTTP (\d+)\)", stderr)
             if match:
                 status = int(match.group(1))
-            if status in (403, 429) and throttled(stderr):
-                self._note_rate_limit(stderr)
-            raise GitHubError(stderr.splitlines()[0] if stderr else "gh failed",
-                              status)
+            error = GitHubError(stderr.splitlines()[0] if stderr
+                                else "gh failed", status, stderr)
+            if rate_limited(error):
+                self._note_rate_limit(error.detail)
+            raise error
         try:
             return json.loads(proc.stdout)
         except json.JSONDecodeError:
             raise GitHubError("gh returned output that is not JSON")
 
     def _note_rate_limit(self, stderr):
-        match = re.search(r"reset[^0-9]*(\d{10})", stderr)
+        # GitHub spells the header X-RateLimit-Reset, and gh passes through
+        # whatever wording the endpoint used, so the search ignores case.
+        match = re.search(r"reset[^0-9]*(\d{10})", stderr, re.I)
         reset = float(match.group(1)) if match else time.time() + 300
         self.rate_limited_until = max(self.rate_limited_until, reset)
 
@@ -908,16 +973,8 @@ class Watcher:
         self.gh = gh
         self.owner = owner
         self.repo = repo
-        self.number = number
         self.options = options
-        self.slug = f"{owner}/{repo}#{number}"
-        # Every event line is `HH:MM #NUMBER TAG message`, with the number and
-        # the tag padded so that the messages line up. A number too wide for
-        # the padding pushes its own line out rather than being cut short. A
-        # continuation line carries neither number nor tag, and is indented to
-        # where the message starts.
-        self.label = f"#{number}".ljust(6)
-        self.indent = " " * len(f"00:00 {self.label} {'':<9}")
+        self.name(number)
         self.known = {facet: None for facet in Snapshot.FACETS}
         self.head = None
         self.head_since = time.time()
@@ -934,9 +991,29 @@ class Watcher:
         self.last_stall = time.time()
         self.stall_since = self.last_stall
         self.stall_interval = options.stall
+        self.poll_interval = options.interval
         self.last_digest = None
         self.merge_state = None
         self.state_path = options.state and Path(options.state)
+
+    def name(self, number):
+        """Say which pull request this is, as soon as that is known.
+
+        A watch given only a branch has to ask GitHub which pull request
+        that branch is for, and GitHub can refuse that request like any
+        other. Until it answers, the lines this prints carry `#?` where the
+        number goes.
+        """
+        self.number = number
+        self.slug = (f"{self.owner}/{self.repo}#{number}" if number
+                     else f"{self.owner}/{self.repo}")
+        # Every event line is `HH:MM #NUMBER TAG message`, with the number and
+        # the tag padded so that the messages line up. A number too wide for
+        # the padding pushes its own line out rather than being cut short. A
+        # continuation line carries neither number nor tag, and is indented to
+        # where the message starts.
+        self.label = (f"#{number}" if number else "#?").ljust(6)
+        self.indent = " " * len(f"00:00 {self.label} {'':<9}")
 
     # -- output ------------------------------------------------------------
 
@@ -1260,8 +1337,19 @@ class Watcher:
         """A string that changes whenever anything worth waiting on does.
 
         Comments are folded in by their edit stamps rather than their count,
-        so a bot rewriting the one comment it owns registers as movement.
+        so a bot rewriting the one comment it owns registers as movement. A
+        review carries no edit stamp, so the summary it holds is folded in
+        as it stands.
+
+        Whether the pull request is still open, whether it merged, and
+        whether it stopped merging cleanly are in it as well. Each is
+        reported as an event of its own, and none of them moves the head or
+        touches a check. The merge state is folded in as whether it is
+        dirty, rather than as itself: GitHub moves a pull request between
+        clean, behind and blocked as other things land, which is movement
+        on the base branch rather than on this pull request.
         """
+        pull = self.known.get("pull") or {}
         checks = self.known.get("checks") or {}
         runs = self.known.get("runs") or {}
         statuses = self.known.get("statuses") or {}
@@ -1269,6 +1357,8 @@ class Watcher:
             list((self.known.get("review_comments") or {}).values())
         return json.dumps([
             self.head,
+            [pull.get("state"), bool(pull.get("merged")),
+             self.merge_state == "dirty"],
             sorted((c["name"], c["status"], c["conclusion"] or "")
                    for c in checks.values()),
             sorted((r["name"], r["status"], r["conclusion"] or "")
@@ -1276,6 +1366,8 @@ class Watcher:
             sorted((context, status["state"])
                    for context, status in statuses.items()),
             sorted(c["updated"] for c in comments),
+            sorted((rid, r["state"], r["body"])
+                   for rid, r in (self.known.get("reviews") or {}).items()),
             sorted((tid, thread["resolved"])
                    for tid, thread in (self.known.get("threads") or {}).items()),
         ], sort_keys=True)
@@ -1539,6 +1631,16 @@ class Watcher:
         --stall, so a pull request that goes quiet again starts over at the
         interval it started with, and so does a facet GitHub has stopped
         answering for.
+
+        The wait before the next poll is worked out here too, and for the
+        same reasons. Once the verdict has been reported, what is left to
+        catch is a person: a comment, a review, a merge. Reading for those
+        as often as for a build in flight spends requests against the limit
+        GitHub puts on how often it answers a token at all, and every watch
+        running under that token spends it together. So each poll that finds
+        nothing waits --interval-growth times as long as the one before it,
+        up to --interval-max, and anything at all puts the wait back to
+        --interval.
         """
         now = time.time()
         digest = self.digest()
@@ -1551,8 +1653,18 @@ class Watcher:
         # and the wait stays at --stall. A facet the token may not read is
         # not failing: it was reported once, it will not change, and holding
         # the wait down for it means a line every --stall seconds for ever.
-        if changed or self.warned - self.refused:
+        held_still = not changed and not (self.warned - self.refused)
+        if not held_still:
             self.stall_interval = self.options.stall
+        # A pull request with a build in flight is read at --interval right
+        # through it, however little each poll finds, because the next poll
+        # is the one that reports the build failing.
+        if held_still and self.reported_settled:
+            self.poll_interval = min(
+                self.poll_interval * self.options.interval_growth,
+                self.options.interval_max)
+        else:
+            self.poll_interval = self.options.interval
 
         if changed and now - self.last_progress >= self.options.heartbeat:
             self.last_progress = now
@@ -1570,15 +1682,70 @@ class Watcher:
 
     # -- the loop ----------------------------------------------------------
 
+    def wait_out(self, error):
+        """Wait when GitHub asked to be called later; refuse when it did not.
+
+        True when the request is worth making again. A throttle clears on
+        its own, so it is waited out and the request repeated. A permission
+        the token has not got, a pull request that is not there and a
+        network failure do not clear, and --once is not waiting for any of
+        them, so the caller is left to say what it could not read.
+        """
+        if self.options.once or not rate_limited(error):
+            return False
+        self.sleep()
+        return True
+
+    def find_number(self):
+        """Ask GitHub which pull request the checked-out branch is for.
+
+        The first request a watch makes when it was told a branch rather
+        than a number, and it meets a throttle as readily as the reads that
+        follow it.
+        """
+        while True:
+            try:
+                return find_pr_for_branch(self.gh, self.owner, self.repo)
+            except GitHubError as error:
+                if not self.wait_out(error):
+                    raise SystemExit(f"prwatch: {error}")
+
+    def first_poll(self):
+        """The first reading, waited out when GitHub asks to be called later.
+
+        A throttle is an answer that clears on its own, and a poll an hour
+        into a watch waits it out. The first poll does the same, so that a
+        watch started while the token is being throttled starts late rather
+        than not at all. Several watches sharing one token are refused that
+        way, and the refusal lands on whichever request comes next, which at
+        startup is this one.
+
+        Every other failure to read the pull request ends the run here. A
+        permission the token has not got, a pull request that is not there,
+        and a network failure are each answered the same way on the next
+        poll as on this one.
+
+        A single reading does not wait at all. --once answers where a pull
+        request stands now, and an hour spent waiting for GitHub to lift a
+        throttle is not that answer; a caller that wanted the wait would
+        have asked for a watch.
+        """
+        while True:
+            snap = self.poll()
+            if snap.pull is not None:
+                return snap
+            error = snap.errors.get("pull")
+            if not (error and self.wait_out(error)):
+                raise SystemExit(f"prwatch: cannot read {self.slug}: {error}")
+
     def run(self):
+        if self.number is None:
+            self.name(self.find_number())
         self.load_state()
         had_state = any(value is not None for value in self.known.values())
 
         self.resolve_expectation()
-        snap = self.poll()
-        if snap.pull is None:
-            raise SystemExit(f"prwatch: cannot read {self.slug}: "
-                             f"{snap.errors.get('pull')}")
+        snap = self.first_poll()
         self.announce_target(snap.pull)
         self.absorb(snap, announce=had_state)
         self.baseline_report()
@@ -1608,7 +1775,13 @@ class Watcher:
             self.save_state()
 
     def sleep(self):
-        delay = max(5.0, self.options.interval)
+        """Wait until the next poll, and past a throttle when there is one.
+
+        The wait is the one heartbeat() worked out: --interval while
+        anything is happening, and longer while nothing is. It is never
+        shorter than five seconds, whatever --interval says.
+        """
+        delay = max(5.0, self.poll_interval)
         wait_out = self.gh.rate_limited_until - time.time()
         if wait_out > 0:
             self.emit("WARN", f"rate limited; waiting {duration(wait_out)}")
@@ -1639,14 +1812,20 @@ class Watcher:
                 raise SystemExit(f"prwatch: --expect {wanted} names nothing in "
                                  "this checkout")
             return
-        try:
-            self.expect = self.gh.get(f"repos/{self.owner}/{self.repo}/"
-                                      f"commits/{wanted}")["sha"]
-        except GitHubError as error:
-            raise SystemExit(
-                f"prwatch: --expect {wanted} is not a commit "
-                f"{self.owner}/{self.repo} knows about — check that the push "
-                f"landed and went to the right branch [{error}]")
+        while True:
+            try:
+                self.expect = self.gh.get(f"repos/{self.owner}/{self.repo}/"
+                                          f"commits/{wanted}")["sha"]
+                return
+            except GitHubError as error:
+                # A throttle says nothing about the commit, so it is waited
+                # out rather than reported as an answer about one.
+                if self.wait_out(error):
+                    continue
+                raise SystemExit(
+                    f"prwatch: --expect {wanted} is not a commit "
+                    f"{self.owner}/{self.repo} knows about — check that the "
+                    f"push landed and went to the right branch [{error}]")
 
     def local_commit(self):
         return git("rev-parse", "--verify", "--quiet",
@@ -1754,8 +1933,19 @@ def main(argv):
     parser.add_argument("--follow", action="store_true",
                         help="keep watching after it settles")
     parser.add_argument("--interval", type=float, default=60,
-                        metavar="SECONDS", help="seconds between polls "
-                                                "(default 60)")
+                        metavar="SECONDS",
+                        help="seconds between polls while anything is "
+                             "happening (default 60)")
+    parser.add_argument("--interval-growth", type=float, default=2,
+                        metavar="FACTOR",
+                        help="how much longer to wait before each further "
+                             "poll, once the verdict is in and nothing is "
+                             "changing; any change puts the wait back to "
+                             "--interval (default 2)")
+    parser.add_argument("--interval-max", type=float, metavar="SECONDS",
+                        help="the longest --interval-growth may stretch the "
+                             "wait between polls (default 600, or --interval "
+                             "itself where that is longer)")
     parser.add_argument("--heartbeat", type=float, default=900,
                         metavar="SECONDS",
                         help="how often progress may be reported while things "
@@ -1798,6 +1988,22 @@ def main(argv):
                         help="exit 1 unless the verdict is GREEN or "
                              "MERGED")
     options = parser.parse_args(argv)
+    if options.interval <= 0:
+        raise SystemExit("prwatch: --interval is how long to wait between "
+                         "polls, so it cannot be zero or negative; the "
+                         "shortest wait a watch takes is five seconds")
+    # A watch told to read every twenty minutes means it, so the ceiling on
+    # the wait follows --interval up rather than refusing it.
+    if options.interval_max is None:
+        options.interval_max = max(600.0, options.interval)
+    if options.interval_growth < 1:
+        raise SystemExit("prwatch: --interval-growth is how much longer to "
+                         "wait before each further poll, so it cannot be "
+                         "below 1; pass 1 for a wait that never grows")
+    if options.interval_max < options.interval:
+        raise SystemExit("prwatch: --interval-max is the ceiling on a wait "
+                         "that starts at --interval, so it cannot be below "
+                         "it")
     if options.stall_growth < 1:
         raise SystemExit("prwatch: --stall-growth is how much longer to wait "
                          "before each further STALL report, so it cannot be "
@@ -1808,9 +2014,6 @@ def main(argv):
 
     hostname, owner, repo, number = resolve_target(options.pr, options.repo)
     gh = GitHub(hostname)
-    if number is None:
-        number = find_pr_for_branch(gh, owner, repo)
-
     watcher = Watcher(gh, owner, repo, number, options)
     report_signals(signal.SIGTERM, signal.SIGHUP)
     try:
