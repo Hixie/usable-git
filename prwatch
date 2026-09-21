@@ -187,7 +187,10 @@ RUNNING IT FROM AN AGENT
 
   If your session restarts, run the same command again. What has already
   been reported is remembered in a state file, so the second run announces
-  only what happened while you were away. Pass --fresh to start over.
+  only what happened while you were away. How long the head commit has gone
+  without a check is remembered with it, so a commit that never gets one is
+  reported as NO-CI however many processes the watch takes. Pass --fresh to
+  start over.
 
   For a single reading, use --once and do not hold anything open.
 
@@ -607,12 +610,21 @@ def plural(count, word):
 
 
 def duration(seconds):
+    """A length of time, in the largest unit it reaches.
+
+    Each unit runs to one and a half of the next one up, so 89 seconds
+    reads as 89s and 90 seconds as 1m, and hours give way to days at 36
+    hours. An hour or more carries the unit below it as well, so a wait
+    of a week reads as 7d00h.
+    """
     seconds = int(seconds)
     if seconds < 90:
         return f"{seconds}s"
     if seconds < 5400:
         return f"{seconds // 60}m"
-    return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    if seconds < 129600:
+        return f"{seconds // 3600}h{(seconds % 3600) // 60:02d}m"
+    return f"{seconds // 86400}d{(seconds % 86400) // 3600:02d}h"
 
 
 # ---------------------------------------------------------------------------
@@ -1033,24 +1045,48 @@ class Watcher:
         return cache / name.replace("/", "_")
 
     def load_state(self):
+        """Take up what the process before this one had read.
+
+        When the head commit was first seen is read back along with the
+        commit itself, and is what the wait for a first check is measured
+        from, so a watch spread across a succession of processes waits
+        once rather than once per process. What it records is when this
+        tool first saw that commit. check_head starts the wait again when
+        the head it reads differs from the one restored here, so a push
+        that landed while nothing was watching is waited out afresh.
+
+        The pace of the polling and the count of quiet polls a verdict
+        rests on are not read back. They say how much watching has been
+        done rather than what the pull request is.
+
+        A file this did not write is ignored rather than trusted:
+        whatever shape it is wrong in, reading it ends in one of the
+        exceptions caught here. A time from a clock ahead of this one is
+        not one of those, so it is taken as now; a wait that started in
+        the future would never end.
+        """
         if self.options.fresh:
             return
         path = self.state_path or self.default_state_path()
         try:
             saved = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
+            if saved.get("slug") != self.slug:
+                return
+            self.known.update(saved.get("known", {}))
+            self.head = saved.get("head")
+            self.merge_state = saved.get("merge_state")
+            since = saved.get("head_since")
+            if since is not None:
+                self.head_since = min(since, time.time())
+        except (OSError, AttributeError, LookupError, TypeError, ValueError):
             return
-        if saved.get("slug") != self.slug:
-            return
-        self.known.update(saved.get("known", {}))
-        self.head = saved.get("head")
-        self.merge_state = saved.get("merge_state")
 
     def save_state(self):
         path = self.state_path or self.default_state_path()
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps({"slug": self.slug, "head": self.head,
+                                        "head_since": self.head_since,
                                         "merge_state": self.merge_state,
                                         "known": self.known}))
         except OSError:

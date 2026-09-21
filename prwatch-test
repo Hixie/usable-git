@@ -13,6 +13,7 @@ Run it with no arguments. It touches no network and no repository.
 import importlib.machinery
 import importlib.util
 import io
+import json
 import signal
 import subprocess
 import sys
@@ -359,6 +360,117 @@ def no_ci_settles_only_after_the_grace_period():
     print("ok   a commit that never gets a check settles as NO-CI" if good
           else f"FAIL no ci: {settled} / {verdict} / {reason}")
     return good
+
+
+@case
+def the_wait_for_a_first_check_survives_a_restart():
+    """The reported bug: every restart started the wait for CI over.
+
+    A commit no workflow will ever build is told from one whose workflow
+    has not spawned its jobs yet by waiting --no-ci-grace seconds from
+    when that commit appeared. A process that measured the wait from its
+    own start began it again each time, so a watch killed and started
+    again inside the grace period never got to the end of it, and --once,
+    which takes one reading and stops, could not reach NO-CI at all
+    however long the commit had gone without a check. This drives six
+    processes over one state file.
+    """
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            state = str(Path(directory) / "state.json")
+
+            def process(head="a" * 40):
+                """One process: take up the state, read once, write it back."""
+                watcher = prwatch.Watcher(
+                    prwatch.GitHub("github.com"), "o", "r", 1,
+                    Options(no_ci_grace=900, fresh=False, state=state))
+                watcher.load_state()
+                snap = prwatch.Snapshot()
+                snap.pull = pull(head=head)
+                for facet in ("checks", "runs", "statuses", "issue_comments",
+                              "review_comments", "reviews", "threads"):
+                    setattr(snap, facet, {})
+                with redirect_stdout(io.StringIO()):
+                    watcher.absorb(snap, announce=False)
+                watcher.save_state()
+                return watcher
+
+            first = process()
+            clock.now += 600
+            early = first.is_settled()        # ten minutes in, still waiting
+            clock.now += 600
+            restarted = process().is_settled()    # twenty minutes in, killed
+            clock.now += 7 * 86400                # and left alone for a week
+            stale = process().is_settled()
+            # A state file an older prwatch wrote records no such time.
+            saved = json.loads(Path(state).read_text())
+            saved.pop("head_since", None)
+            Path(state).write_text(json.dumps(saved))
+            older = process().is_settled()
+            # A clock that has moved backwards leaves a time in the future,
+            # which no wait can have started at.
+            saved = json.loads(Path(state).read_text())
+            saved["head_since"] = clock.now + 7200
+            Path(state).write_text(json.dumps(saved))
+            ahead = process()
+            clock.now += 1000
+            future = ahead.is_settled()
+            clock.now += 600
+            pushed = process(head="b" * 40).is_settled()   # a fix is pushed
+    finally:
+        prwatch.time = real
+    problems = []
+    if early[0]:
+        problems.append(f"it settled inside the grace period: {early[1]}")
+    if not restarted[0]:
+        problems.append("twenty minutes after the commit appeared it still "
+                        f"said {restarted[1]!r}")
+    elif "20m" not in restarted[1]:
+        problems.append(f"it named the wrong wait: {restarted[1]!r}")
+    if not stale[0]:
+        problems.append(f"a week-old state file gave {stale!r}")
+    if older[0]:
+        problems.append("a state file with no such time in it settled at "
+                        f"once: {older[1]}")
+    if not future[0]:
+        problems.append("a time from a clock ahead of this one left it "
+                        f"waiting for ever: {future[1]}")
+    if pushed[0]:
+        problems.append(f"a new commit settled at once: {pushed[1]}")
+    if problems:
+        print("FAIL the wait for a first check survives a restart")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   the wait for a first check survives a restart")
+    return True
+
+
+@case
+def a_length_of_time_names_two_units_at_most():
+    """The lengths the lines that carry a wait read out.
+
+    A watch runs for as long as a pull request takes: --stall-max is a day
+    by default, and a state file can outlive a weekend, so the wait a
+    NO-CI or STALL line names is not always minutes. Each unit runs to one
+    and a half of the next one up.
+    """
+    wanted = {0: "0s", 89: "89s", 90: "1m", 5399: "89m", 5400: "1h30m",
+              86400: "24h00m", 129599: "35h59m", 129600: "1d12h",
+              604800: "7d00h"}
+    got = {seconds: prwatch.duration(seconds) for seconds in wanted}
+    if got != wanted:
+        print("FAIL a length of time names at most two units")
+        for seconds, want in wanted.items():
+            if got[seconds] != want:
+                print(f"       {seconds} seconds read as {got[seconds]!r}, "
+                      f"not {want!r}")
+        return False
+    print("ok   a length of time names at most two units, up to days")
+    return True
 
 
 @case
