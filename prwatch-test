@@ -10,6 +10,8 @@ compares the lines that come out.
 Run it with no arguments. It touches no network and no repository.
 """
 
+import base64
+import email.utils
 import importlib.machinery
 import importlib.util
 import io
@@ -18,6 +20,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
@@ -1477,14 +1480,27 @@ def polling_slows_down_while_nothing_changes():
         waiting_for_a_person = quiet_polls(watcher, clock, 5)
         watcher.reported_settled = False       # a push, and CI starts again
         build_in_flight = quiet_polls(watcher, clock, 3)
+        # With no --interval-max, the ceiling is the one the allowance
+        # spent gives: all of it spent here, and then none.
+        spent = quiet_watcher(Options(interval=60, interval_growth=2,
+                                      interval_max=None))
+        spent.gh.quota_left = 0.0
+        spent.reported_settled = True
+        allowance_spent = quiet_polls(spent, clock, 5)
+        spent.gh.quota_left = 1.0
+        spent.poll_interval = 60
+        allowance_left = quiet_polls(spent, clock, 3)
     finally:
         prwatch.time = real
     good = (waiting_for_a_person == [60, 120, 240, 240, 240]
-            and build_in_flight == [60, 60, 60])
+            and build_in_flight == [60, 60, 60]
+            and allowance_spent == [60, 120, 240, 300, 300]
+            and allowance_left == [60, 60, 60])
     print("ok   polling slows down once there is nothing left to wait for"
           if good else
           f"FAIL poll backoff: waits were {waiting_for_a_person} with the "
-          f"verdict in, and {build_in_flight} with a build in flight")
+          f"verdict in, {build_in_flight} with a build in flight, and "
+          f"{allowance_spent} and {allowance_left} by the allowance")
     return good
 
 
@@ -1843,39 +1859,447 @@ def a_wait_that_shrinks_is_refused():
 
 
 @case
-def the_wait_stops_growing_at_four_minutes():
-    """--interval-max defaults to 240, or to --interval where that is longer."""
+def the_defaults_follow_whose_token_it_reads_with():
+    """A GitHub App reads every 30 seconds, and anything else every 60.
+
+    The environment names the app with two variables that go together, and
+    --interval given on the command line is kept either way.
+    """
 
     class Parsed(Exception):
         pass
 
     def capture(gh, owner, repo, number, options):
-        raise Parsed(options.interval_max)
+        raise Parsed(gh, options)
 
-    real = (prwatch.resolve_target, prwatch.GitHub, prwatch.Watcher)
+    app = {"PRWATCH_GITHUB_APP_ID": "123", "PRWATCH_GITHUB_APP_KEY": "~/k.pem"}
+    real = (prwatch.resolve_target, prwatch.Watcher, dict(prwatch.os.environ))
     prwatch.resolve_target = lambda pr, repo: ("github.com", "o", "r", 1)
-    prwatch.GitHub = lambda hostname: None
     prwatch.Watcher = capture
     problems = []
     try:
-        for argv, wanted in [([], 240), (["--interval", "30"], 240),
-                             (["--interval", "600"], 600),
-                             (["--interval-max", "900"], 900)]:
+        for env, argv, interval, is_app in [
+                ({}, [], 60, False), (app, [], 30, True),
+                ({}, ["--interval", "45"], 45, False),
+                (app, ["--interval", "45"], 45, True)]:
+            for name in app:
+                prwatch.os.environ.pop(name, None)
+            prwatch.os.environ.update(env)
             try:
                 prwatch.main(["1", *argv])
             except Parsed as parsed:
-                if parsed.args[0] != wanted:
-                    problems.append(f"{argv} gave a ceiling of "
-                                    f"{parsed.args[0]}, not {wanted}")
+                gh, options = parsed.args
+                token = gh.token
+                if options.interval != interval:
+                    problems.append(f"{sorted(env)} {argv} read every "
+                                    f"{options.interval}, not {interval}")
+                if options.interval_max is not None:
+                    problems.append(f"{argv} fixed the ceiling at "
+                                    f"{options.interval_max}")
+                if isinstance(token, prwatch.AppToken) != is_app:
+                    problems.append(f"{sorted(env)} read with {token!r}")
+                elif is_app and (token.app_id, token.repository,
+                                 token.key) != ("123", "o/r",
+                                                str(Path.home() / "k.pem")):
+                    problems.append(f"the app was {vars(token)}")
+        prwatch.os.environ.pop("PRWATCH_GITHUB_APP_KEY")
+        try:
+            prwatch.main(["1"])
+            problems.append("an app ID without a key was accepted")
+        except SystemExit as complaint:
+            if "PRWATCH_GITHUB_APP_KEY" not in str(complaint):
+                problems.append(f"an app ID without a key: {complaint}")
     finally:
-        prwatch.resolve_target, prwatch.GitHub, prwatch.Watcher = real
+        prwatch.resolve_target, prwatch.Watcher = real[:2]
+        prwatch.os.environ.clear()
+        prwatch.os.environ.update(real[2])
     if problems:
-        print("FAIL the wait stops growing at four minutes")
+        print("FAIL the defaults follow whose token it reads with")
         for problem in problems:
             print(f"       {problem}")
         return False
-    print("ok   the wait stops growing at four minutes unless told otherwise")
+    print("ok   the defaults follow whose token it reads with")
     return True
+
+
+@case
+def the_ceiling_follows_the_allowance_spent():
+    """30 seconds with none of it spent, 300 with all of it spent.
+
+    It never falls below --interval, and --interval-max given on the
+    command line is kept whatever has been spent.
+    """
+    problems = []
+    for interval, given, left, wanted in [
+            (30, None, None, 30), (30, None, 1.0, 30), (30, None, 0.5, 165),
+            (30, None, 0.0, 300), (60, None, 1.0, 60), (60, None, 0.8, 84),
+            (30, 240, 0.0, 240), (30, 240, 1.0, 240)]:
+        gh = prwatch.GitHub("github.com")
+        gh.quota_left = left
+        watcher = prwatch.Watcher(gh, "o", "r", 1,
+                                  Options(interval=interval, interval_max=given))
+        got = watcher.interval_max()
+        if abs(got - wanted) > 1e-9:
+            problems.append(f"--interval {interval}, --interval-max {given}, "
+                            f"{left} left: a ceiling of {got}, not {wanted}")
+    if problems:
+        print("FAIL the ceiling follows the allowance spent")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   the longest wait follows the share of the allowance spent")
+    return True
+
+
+@case
+def each_read_reports_the_allowance_left_and_uses_the_token():
+    """The allowance left comes from the headers of every REST answer.
+
+    A 304 carries them too. REST and GraphQL have separate allowances, and
+    the figure is the smaller share left; an answer with no headers leaves
+    it as it was. A token source puts its token where gh looks for one on
+    any host, beside the rest of the environment; without one, gh is left
+    to find its own.
+    """
+
+    class Answer:
+        def __init__(self, stdout, returncode=0, stderr=""):
+            self.stdout, self.returncode, self.stderr = stdout, returncode, \
+                stderr
+
+    class Script:
+        def __init__(self, *answers):
+            self.answers = list(answers)
+            self.envs = []
+
+        def run(self, cmd, env=None, **named):
+            self.envs.append(env and (env.get("GH_TOKEN"),
+                                      env.get("GH_ENTERPRISE_TOKEN"),
+                                      env.get("PATH") == prwatch.os.environ.get("PATH")))
+            return self.answers.pop(0)
+
+    def head(status, left, resource="core"):
+        return (f"HTTP/2.0 {status}\nEtag: W/\"e\"\r\nX-Ratelimit-Limit: 5000"
+                f"\r\nX-Ratelimit-Remaining: {left}\r\n"
+                f"X-Ratelimit-Resource: {resource}\r\n\r\n")
+
+    real_subprocess = prwatch.subprocess
+    script = prwatch.subprocess = Script(
+        Answer(head("200 OK", 4000) + "{}"),
+        Answer(head("304 Not Modified", 1250), 1, "gh: HTTP 304"),
+        Answer('{"data": {}}'),
+        Answer(head("200 OK", 1000, "graphql") + '{"data": {}}'),
+        Answer(head("200 OK", 5000) + "{}"))
+    seen = []
+    try:
+        gh = prwatch.GitHub("github.com")
+        seen.append(gh.quota_left)
+        gh.get("repos/o/r/pulls/1")
+        seen.append(gh.quota_left)
+        gh.get("repos/o/r/pulls/1")
+        seen.append(gh.quota_left)
+        gh.graphql("query{}")
+        seen.append(gh.quota_left)
+        gh.graphql("query{}")
+        seen.append(gh.quota_left)
+        gh.token = lambda: "installation-token"
+        gh.get("repos/o/r/pulls/2")
+        seen.append(gh.quota_left)
+    finally:
+        prwatch.subprocess = real_subprocess
+    token = ("installation-token", "installation-token", True)
+    good = (seen == [None, 0.8, 0.25, 0.25, 0.2, 0.2]
+            and script.envs == [None, None, None, None, token])
+    print("ok   each read reports the allowance left, under the right token"
+          if good else f"FAIL allowance and token: {seen} / {script.envs}")
+    return good
+
+
+@case
+def an_app_token_is_made_and_renewed():
+    """A token is asked for with a signed request, and again near its end.
+
+    The request is a JSON Web Token naming the app, signed with its private
+    key. The installation is the first whose token can read the repository,
+    which is found once: GitHub's lookup of an installation by repository
+    does not follow a rename, and a read does. The token in hand is reused
+    until it has five minutes left. GitHub's refusals are reported with the
+    message it gave.
+    """
+    problems = []
+    with tempfile.TemporaryDirectory() as scratch:
+        key = Path(scratch, "app.pem")
+        public = Path(scratch, "public.pem")
+        made = subprocess.run(["openssl", "genrsa", "-out", str(key), "2048"],
+                              capture_output=True)
+        subprocess.run(["openssl", "rsa", "-in", str(key), "-pubout", "-out",
+                        str(public)], capture_output=True)
+        if made.returncode != 0 or not public.exists():
+            print("FAIL an app token is made and renewed: no key was made")
+            return False
+
+        clock = Clock(now=1790000000.0)
+        start = clock.now
+        sent = []
+        answers = []
+
+        # GitHub's clock is a thousand seconds behind this one.
+        skew = 1000
+
+        class Response(io.BytesIO):
+            headers = {"Date": email.utils.formatdate(clock.now - skew,
+                                                      usegmt=True)}
+
+        def urlopen(request):
+            jwt = request.get_header("Authorization").removeprefix("Bearer ")
+            sent.append((request.get_method(), request.full_url, jwt,
+                         request.data and json.loads(request.data)))
+            if not answers:
+                raise prwatch.urllib.error.URLError("an unexpected request")
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            response = Response(json.dumps(answer).encode())
+            response.headers = {"Date": email.utils.formatdate(
+                clock.now - skew, usegmt=True)}
+            return response
+
+        def expiry(seconds):
+            return datetime.fromtimestamp(
+                clock.now - skew + seconds, timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+
+        real = prwatch.time, prwatch.urllib.request.urlopen
+        prwatch.time = clock
+        prwatch.urllib.request.urlopen = urlopen
+        try:
+            token = prwatch.AppToken("github.com", "123", str(key), "o/r")
+            answers[:] = [[{"id": 41}, {"id": 42}],
+                          {"token": "zero", "expires_at": expiry(3600)},
+                          prwatch.urllib.error.HTTPError(
+                              "u", 404, "Not Found", {},
+                              io.BytesIO(b'{"message": "Not Found"}')),
+                          {"token": "one", "expires_at": expiry(3600)},
+                          {"full_name": "o/r"}]
+            got = []
+            try:
+                got.append(token())
+                clock.now += 3000
+                got.append(token())
+                clock.now += 400
+                answers[:] = [{"token": "two", "expires_at": expiry(3600)}]
+                got.append(token())
+            except prwatch.GitHubError as error:
+                got.append(str(error))
+            if got != ["one", "one", "two"]:
+                problems.append(f"the tokens were {got}")
+            paths = [(method, url) for method, url, _, _ in sent]
+            if sent[3][3] != {"permissions": {
+                    "actions": "read", "checks": "read", "contents": "read",
+                    "issues": "read", "metadata": "read",
+                    "pull_requests": "read", "statuses": "read"}}:
+                problems.append(f"the token asked for was {sent[3][3]}")
+            if [jwt for _, _, jwt, _ in sent[:5]][2::2] != ["zero", "one"]:
+                problems.append("the repository was not read with the "
+                                "installation's own token")
+            if paths != [
+                    ("GET", "https://api.github.com/app/installations"
+                            "?per_page=100"),
+                    ("POST", "https://api.github.com/app/installations/41/"
+                             "access_tokens"),
+                    ("GET", "https://api.github.com/repos/o/r"),
+                    ("POST", "https://api.github.com/app/installations/42/"
+                             "access_tokens"),
+                    ("GET", "https://api.github.com/repos/o/r"),
+                    ("POST", "https://api.github.com/app/installations/42/"
+                             "access_tokens")]:
+                problems.append(f"the requests were {paths}")
+            header, claims, signature = sent[0][2].split(".")
+
+            def decode(part):
+                return base64.urlsafe_b64decode(part + "=" * (-len(part) % 4))
+
+            claims = json.loads(decode(claims))
+            if json.loads(decode(header)) != {"alg": "RS256", "typ": "JWT"}:
+                problems.append(f"the JWT header was {decode(header)}")
+            if claims["iss"] != "123" or claims["exp"] - claims["iat"] > 600 \
+                    or claims["iat"] > start:
+                problems.append(f"the JWT claims were {claims}")
+            Path(scratch, "signature").write_bytes(decode(signature))
+            verified = subprocess.run(
+                ["openssl", "dgst", "-sha256", "-verify", str(public),
+                 "-signature", str(Path(scratch, "signature"))],
+                input=sent[0][2].rsplit(".", 1)[0].encode(),
+                capture_output=True)
+            if verified.returncode != 0:
+                problems.append("the JWT signature does not verify")
+
+            # A failure to renew is not reported while the token in hand
+            # still works, and is once it has run out.
+            answers[:] = [prwatch.http.client.RemoteDisconnected("gone")]
+            clock.now += 3400
+            try:
+                if token() != "two":
+                    problems.append("a failed renewal lost the token in hand")
+            except Exception as error:
+                problems.append(f"a failed renewal, with the token in hand "
+                                f"still good, raised {error!r}")
+            answers[:] = [prwatch.urllib.error.HTTPError(
+                "u", 403, "Forbidden", {},
+                io.BytesIO(b'{"message": "installation suspended"}'))]
+            clock.now += 300
+            try:
+                token()
+                problems.append("a refusal was taken as a token")
+            except Exception as error:
+                if not isinstance(error, prwatch.GitHubError) or \
+                        error.status is not None or \
+                        "installation suspended" not in str(error):
+                    problems.append(f"the refusal said {error!r}, "
+                                    f"status {error.status}")
+                elif prwatch.forbidden(error):
+                    problems.append("a refused token was called a permission")
+
+            # An app that no installation of can read the repository.
+            absent = prwatch.AppToken("github.com", "123", str(key), "o/r")
+            answers[:] = [[{"id": 41}],
+                          {"token": "zero", "expires_at": expiry(3600)},
+                          prwatch.urllib.error.HTTPError(
+                              "u", 404, "Not Found", {},
+                              io.BytesIO(b'{"message": "Not Found"}'))]
+            try:
+                absent()
+                problems.append("an app not installed on the repository "
+                                "gave a token")
+            except prwatch.GitHubError as error:
+                if "not installed on o/r" not in str(error) or absent.token:
+                    problems.append(f"an app not installed said {error}, "
+                                    f"and kept {absent.token!r}")
+
+            roots = [prwatch.AppToken(host, "1", "k", "o/r").api
+                     for host in ("github.com", "acme.ghe.com",
+                                  "github.acme.com")]
+            if roots != ["https://api.github.com", "https://api.acme.ghe.com",
+                         "https://github.acme.com/api/v3"]:
+                problems.append(f"the API was at {roots}")
+        finally:
+            prwatch.time, prwatch.urllib.request.urlopen = real
+    if problems:
+        print("FAIL an app token is made and renewed")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   an app token is made with a signed request, and renewed")
+    return True
+
+
+@case
+def an_answer_that_has_not_changed_is_reused():
+    """A read names the last answer's ETag, and a 304 gives that answer back.
+
+    A 200 replaces the answer, and a 304 for a path with no answer yet is a
+    failure rather than an empty reading. An answer is kept for one poll
+    after the last one that read its path, and no longer.
+    """
+
+    class Answer:
+        def __init__(self, status, etag=None, body=""):
+            head = f"HTTP/2.0 {status}\n" + (f"Etag: {etag}\r\n" if etag else "")
+            self.head = f"{head}X-Ratelimit-Used: 1\r\n\r\n"
+            self.body = body
+            self.returncode = 0 if status == 200 else 1
+            self.stderr = "" if status == 200 else f"gh: HTTP {status}"
+
+    class Script:
+        """A stand-in for the subprocess module, giving answers in turn."""
+
+        def __init__(self, *answers):
+            self.answers = list(answers)
+            self.sent = []
+
+        def run(self, cmd, **named):
+            self.sent.append(next((arg for arg in cmd
+                                   if arg.startswith("If-None-Match")), None))
+            answer = self.answers.pop(0)
+            # gh prints the status line and headers only when asked to.
+            answer.stdout = (answer.head if "--include" in cmd else "") + \
+                answer.body
+            return answer
+
+    real_subprocess = prwatch.subprocess
+    script = prwatch.subprocess = Script(
+        Answer(200, 'W/"one"', '{"n": 1}'),
+        Answer(304, 'W/"one"'),
+        Answer(200, 'W/"two"', '{"n": 2}'),
+        Answer(304, 'W/"two"'),
+        Answer(304),
+        Answer(200, 'W/"three"', '{"n": 3}'))
+    problems = []
+    try:
+        gh = prwatch.GitHub("github.com")
+        got = []
+        for _ in range(4):
+            got.append(gh.get("repos/o/r/pulls/1")["n"])
+            gh.forget_unread()
+        if got != [1, 1, 2, 2]:
+            problems.append(f"the readings were {got}")
+        try:
+            gh.get("repos/o/r/pulls/2")
+            problems.append("a 304 with nothing to reuse was taken as an answer")
+        except prwatch.GitHubError:
+            pass
+        gh.forget_unread()
+        gh.forget_unread()
+        if gh.get("repos/o/r/pulls/1")["n"] != 3:
+            problems.append("the answer after two polls without it was wrong")
+    finally:
+        prwatch.subprocess = real_subprocess
+    wanted = [None, 'If-None-Match: W/"one"', 'If-None-Match: W/"one"',
+              'If-None-Match: W/"two"', None, None]
+    if script.sent != wanted:
+        problems.append(f"the requests named {script.sent}")
+    if problems:
+        print("FAIL an answer that has not changed is reused")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   an answer that has not changed is reused")
+    return True
+
+
+@case
+def reads_go_to_the_name_the_repository_has_now():
+    """A repository that moved is read under its new name after one poll.
+
+    The name the watch was started with stays the one it reports under and
+    keeps its state under, and a poll that could not read the pull request
+    leaves the name the reads go to as it was.
+    """
+    asked = []
+
+    def read_snapshot(gh, owner, repo, number):
+        asked.append(f"{owner}/{repo}")
+        snap = prwatch.Snapshot()
+        if len(asked) != 3:
+            snap.pull = {**pull(), "base": {"repo": {"full_name": "new/name"}}}
+        return snap
+
+    real_read = prwatch.read_snapshot
+    prwatch.read_snapshot = read_snapshot
+    try:
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options())
+        with redirect_stdout(io.StringIO()):
+            for _ in range(4):
+                watcher.poll()
+    finally:
+        prwatch.read_snapshot = real_read
+    good = (asked == ["o/r", "new/name", "new/name", "new/name"]
+            and watcher.slug == "o/r#1"
+            and watcher.default_state_path().name == "github.com-o-r-1.json")
+    print("ok   reads go to the name the repository has now" if good
+          else f"FAIL reads after a move: {asked} / {watcher.slug}")
+    return good
 
 
 @case

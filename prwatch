@@ -6,7 +6,10 @@ below. Point a person or an agent at that rather than at this file.
 """
 
 import argparse
+import base64
+import email.utils
 import html
+import http.client
 import json
 import os
 import re
@@ -14,6 +17,9 @@ import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 GUIDE = """
@@ -217,6 +223,22 @@ RUNNING IT FROM AN AGENT
   It reads and never writes. It posts no comments, pushes nothing, and
   merges nothing, so a read-only token is enough.
 
+WHOSE TOKEN IT READS WITH
+
+  By default every read is made by `gh` with the token `gh` would use on
+  its own, such as GH_TOKEN or the account `gh auth login` signed in to. Every token a person holds shares that person's
+  hourly allowance of 5,000 requests with every other tool they run.
+
+  Set PRWATCH_GITHUB_APP_ID to a GitHub App's ID and PRWATCH_GITHUB_APP_KEY
+  to the path of the app's private key, and the reads are made by the app's
+  installation on the repository instead. An installation has an hourly
+  allowance of its own, of between 5,000 and 15,000 requests depending on
+  the organization. prwatch asks GitHub for a token for the installation,
+  one that can read and do nothing else, and for a new one before each
+  expires, which needs the `openssl` command.
+  The app needs read access to actions, checks, commit statuses, contents,
+  issues, and pull requests.
+
 WHEN IT STOPS
 
   It never gives up on its own. There is no deadline, so a run that takes
@@ -258,13 +280,21 @@ WHEN IT STOPS
   grow separately. A change is announced on the poll that finds it, however
   long ago the last STALL line was.
 
-  How often the pull request is read starts at --interval. Once the verdict
-  has been reported and nothing is changing, each poll waits
+  How often the pull request is read starts at --interval: every 30
+  seconds when reading as a GitHub App, and every 60 otherwise. Once the
+  verdict has been reported and nothing is changing, each poll waits
   --interval-growth times as long as the one before it, up to
   --interval-max, and any change at all puts the wait back to --interval. A
-  pull request that has been green and waiting for a reviewer since the
-  morning is read fifteen times an hour rather than sixty, and one whose
-  build is still running is read every --interval throughout.
+  pull request whose build is still running is read every --interval
+  throughout.
+
+  Unless it is given, --interval-max follows how much of the hourly
+  allowance has been spent, as GitHub last reported it, for whichever of
+  the REST and GraphQL allowances has less left: 30
+  seconds when none of it has been spent, 300 when all of it has, in
+  proportion between, and never less than --interval. A quiet pull request
+  is read as often as --interval allows while the allowance is plentiful,
+  and less often as it runs out.
 
   That growth belongs to --follow and --once, since a watch with neither
   ends at the verdict rather than waiting past it. Each process starts again
@@ -278,6 +308,16 @@ WHEN IT STOPS
   under one token spends that allowance together. Six watches reading once
   a minute was enough to be refused, and the refusal arrives as a 403 on
   whichever request comes next.
+
+  Most of what a poll reads has not changed since the poll before it. Each
+  REST read tells GitHub which answer it already has, and GitHub replies
+  "not modified" without counting the request against the token's hourly
+  allowance. The review threads are read through GraphQL, which has an
+  hourly allowance of its own and no such reply, so that read is counted
+  on every poll. A read GitHub has to redirect, because the repository was
+  renamed or moved since the checkout's remote was set, is counted even
+  when the answer it leads to is "not modified", so after the first poll
+  the reads go to the name GitHub gives the repository now.
 
   Pass --follow to keep watching past the settling point, which is what you
   want while waiting on a human reviewer.
@@ -392,23 +432,49 @@ class GitHub:
     deleted".
     """
 
-    def __init__(self, hostname=None):
+    def __init__(self, hostname=None, token=None):
         self.hostname = hostname
+        # Gives the token for gh to use, or None to leave the choice to gh.
+        self.token = token
         self.rate_limited_until = 0.0
+        # resource -> the share of its hourly allowance left, as the last
+        # answer from it reported. REST and GraphQL are separate resources.
+        self.quota = {}
+        # The smallest of those shares, or None before there is one.
+        self.quota_left = None
+        # path -> (ETag, body) for the answers to the GETs of the last poll,
+        # and to those of the poll in progress.
+        self.answers = {}
+        self.reading = {}
 
     def _run(self, args):
-        cmd = ["gh", "api"]
+        """Run `gh api`, and give back the answer's headers and its body."""
+        cmd = ["gh", "api", "--include"]
         if self.hostname and self.hostname != "github.com":
             cmd += ["--hostname", self.hostname]
         cmd += args
+        env = None
+        if self.token:
+            # gh reads GH_ENTERPRISE_TOKEN for a GitHub Enterprise Server host
+            # and GH_TOKEN for any other.
+            token = self.token()
+            env = {**os.environ, "GH_TOKEN": token,
+                   "GH_ENTERPRISE_TOKEN": token}
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True)
+            proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
         except FileNotFoundError:
             raise GitHubError("the `gh` command is not installed")
+        head, body = "", proc.stdout
+        if proc.stdout.startswith("HTTP/"):
+            head, _, body = proc.stdout.replace("\r\n", "\n").partition("\n\n")
+            self._note_quota(head)
         if proc.returncode != 0:
             stderr = proc.stderr.strip()
             status = None
-            match = re.search(r"\(HTTP (\d+)\)", stderr)
+            # gh reports most failures as "(HTTP 403)", but a 304 only in
+            # the status line --include puts at the top of the output.
+            match = (re.search(r"\(HTTP (\d+)\)", stderr)
+                     or re.match(r"HTTP/\S+ (\d+)", head))
             if match:
                 status = int(match.group(1))
             error = GitHubError(stderr.splitlines()[0] if stderr
@@ -416,10 +482,59 @@ class GitHub:
             if rate_limited(error):
                 self._note_rate_limit(error.detail)
             raise error
+        return head, body
+
+    @staticmethod
+    def _parse(text):
         try:
-            return json.loads(proc.stdout)
+            return json.loads(text)
         except json.JSONDecodeError:
             raise GitHubError("gh returned output that is not JSON")
+
+    def _get(self, path):
+        """Read `path`, reusing the last answer when GitHub says it stands.
+
+        Each request names the ETag of the answer before it, and GitHub
+        answers 304 Not Modified when nothing has changed since. A 304 is
+        not counted against the token's hourly allowance, so a poll that
+        finds nothing new costs nothing for the parts that have not moved.
+        """
+        answer = self.reading.get(path) or self.answers.get(path)
+        args = [path]
+        if answer:
+            args += ["--header", f"If-None-Match: {answer[0]}"]
+        try:
+            head, body = self._run(args)
+        except GitHubError as error:
+            if answer:
+                self.reading[path] = answer
+                if error.status == 304:
+                    return self._parse(answer[1])
+            raise
+        etag = re.search(r"^etag:\s*(.+)$", head, re.I | re.M)
+        if etag:
+            self.reading[path] = (etag.group(1).strip(), body)
+        return self._parse(body)
+
+    def forget_unread(self):
+        """Keep only the answers to the paths read since the last call.
+
+        A push moves the head commit, and the paths named after the old one
+        are never read again.
+        """
+        self.answers, self.reading = self.reading, {}
+
+    def _note_quota(self, head):
+        """Record the allowance left, from an answer's headers."""
+        def header(name):
+            match = re.search(rf"^x-ratelimit-{name}:\s*(\S+)", head,
+                              re.I | re.M)
+            return match and match.group(1)
+
+        limit, left = header("limit"), header("remaining")
+        if limit and left and limit.isdigit() and left.isdigit() and int(limit):
+            self.quota[header("resource") or "core"] = int(left) / int(limit)
+            self.quota_left = min(self.quota.values())
 
     def _note_rate_limit(self, stderr):
         # GitHub spells the header X-RateLimit-Reset, and gh passes through
@@ -432,7 +547,7 @@ class GitHub:
         if params:
             query = "&".join(f"{key}={value}" for key, value in params.items())
             path += ("&" if "?" in path else "?") + query
-        return self._run([path])
+        return self._get(path)
 
     def paged(self, path, key=None, per_page=100):
         """Read every page of a list endpoint, or raise.
@@ -444,7 +559,7 @@ class GitHub:
         page = 1
         while True:
             sep = "&" if "?" in path else "?"
-            body = self._run([f"{path}{sep}per_page={per_page}&page={page}"])
+            body = self._get(f"{path}{sep}per_page={per_page}&page={page}")
             chunk = body if key is None else body.get(key, [])
             items.extend(chunk)
             if len(chunk) < per_page:
@@ -458,10 +573,162 @@ class GitHub:
         for key, value in variables.items():
             flag = "-F" if isinstance(value, (int, bool)) else "-f"
             args += [flag, f"{key}={value}"]
-        body = self._run(args)
+        body = self._parse(self._run(args)[1])
         if "errors" in body:
             raise GitHubError(body["errors"][0].get("message", "graphql error"))
         return body["data"]
+
+
+class Missing(GitHubError):
+    """GitHub answered a GitHub App's request with 404 Not Found."""
+
+
+class AppToken:
+    """Tokens for a GitHub App's installation on one repository.
+
+    Calling it gives a token for gh to read with. GitHub makes the token for
+    a request signed with the app's private key, and the token lasts an
+    hour; a new one is asked for whenever the one in hand has less than
+    five minutes left, so a watch of any length reads under a current
+    token. A failure to get a new one is reported only once the one in hand
+    has run out.
+
+    A failure is never reported with an HTTP status. The status belongs to
+    the request for a token, not to any read of the pull request, and a 403
+    from it is not a permission the reads lack.
+    """
+
+    def __init__(self, hostname, app_id, key, repository):
+        if hostname in (None, "github.com"):
+            self.api = "https://api.github.com"
+        elif hostname.endswith(".ghe.com"):
+            self.api = f"https://api.{hostname}"
+        else:
+            self.api = f"https://{hostname}/api/v3"
+        self.app_id = app_id
+        self.key = key
+        self.repository = repository
+        self.installation = None
+        self.token = None
+        self.expires = 0.0
+
+    def __call__(self):
+        if time.time() > self.expires - 300:
+            try:
+                self._renew()
+            except GitHubError:
+                if time.time() >= self.expires:
+                    raise
+        return self.token
+
+    def _renew(self):
+        if self.installation is None:
+            self._find_installation()
+        else:
+            self._make_token(self.installation)
+
+    def _find_installation(self):
+        """Find the installation of the app that can read the repository.
+
+        GitHub looks an installation up by repository only under the name
+        the repository has now, and answers 404 for a name it had before,
+        which is the name a checkout made before a rename still uses. A
+        read of the repository follows the rename, so each installation is
+        given a token in turn until one can read it.
+        """
+        installations, _ = self._request("GET",
+                                         "app/installations?per_page=100")
+        for installation in installations:
+            self._make_token(installation["id"])
+            try:
+                self._request("GET", f"repos/{self.repository}", self.token)
+            except Missing:
+                continue
+            self.installation = installation["id"]
+            return
+        self.token, self.expires = None, 0.0
+        raise GitHubError(f"GitHub App {self.app_id} is not installed on "
+                          f"{self.repository}")
+
+    def _make_token(self, installation):
+        # The token asked for reads and nothing else, whatever else the app
+        # may do.
+        answer, now = self._request(
+            "POST", f"app/installations/{installation}/access_tokens",
+            body={"permissions": {name: "read" for name in (
+                "actions", "checks", "contents", "issues", "metadata",
+                "pull_requests", "statuses")}})
+        # How long the token lasts is measured on GitHub's clock, from the
+        # time it answered, so that a local clock that is wrong does not
+        # move the renewal.
+        lasts = datetime.fromisoformat(
+            answer["expires_at"].replace("Z", "+00:00")).timestamp() - now
+        self.token = answer["token"]
+        self.expires = time.time() + lasts
+
+    def _jwt(self):
+        """A JSON Web Token naming the app, signed with its private key."""
+        def encode(data):
+            return base64.urlsafe_b64encode(data).rstrip(b"=")
+
+        now = int(time.time())
+        # GitHub refuses a token issued in its future or lasting more than
+        # ten minutes, so it starts a minute early and lasts nine.
+        claims = {"iat": now - 60, "exp": now + 540, "iss": self.app_id}
+        signed = (encode(b'{"alg":"RS256","typ":"JWT"}') + b"." +
+                  encode(json.dumps(claims).encode()))
+        try:
+            proc = subprocess.run(["openssl", "dgst", "-sha256", "-sign",
+                                   self.key], input=signed,
+                                  capture_output=True)
+        except FileNotFoundError:
+            raise GitHubError("the `openssl` command is not installed, and "
+                              "it is what signs the GitHub App's requests")
+        if proc.returncode != 0:
+            raise GitHubError(f"could not sign with {self.key}: "
+                              f"{proc.stderr.decode(errors='replace').strip()}")
+        return (signed + b"." + encode(proc.stdout)).decode()
+
+    def _request(self, method, path, token=None, body=None):
+        """Make a request as the app, or with one of its installation's
+        tokens: the answer, and when GitHub gave it."""
+        request = urllib.request.Request(
+            f"{self.api}/{path}", method=method,
+            data=body and json.dumps(body).encode(),
+            headers={"Authorization": f"Bearer {token or self._jwt()}",
+                     "Accept": "application/vnd.github+json"})
+        try:
+            with urllib.request.urlopen(request) as response:
+                date = response.headers.get("Date")
+                answer = json.load(response)
+            now = (email.utils.parsedate_to_datetime(date).timestamp()
+                   if date else time.time())
+            return answer, now
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode(errors="replace")
+            try:
+                message = json.loads(detail).get("message", detail)
+            except ValueError:
+                message = detail
+            raise (Missing if error.code == 404 else GitHubError)(
+                f"GitHub App {self.app_id} could not get a token for "
+                f"{self.repository}: {message} [{error.code}]", None, detail)
+        except (OSError, http.client.HTTPException, ValueError) as error:
+            raise GitHubError(f"GitHub App {self.app_id} could not get a "
+                              f"token from {self.api}: {error}")
+
+
+def app_from_environment():
+    """The ID and key path of the GitHub App the environment names, if any."""
+    app_id = os.environ.get("PRWATCH_GITHUB_APP_ID")
+    key = os.environ.get("PRWATCH_GITHUB_APP_KEY")
+    if not app_id and not key:
+        return None
+    if not (app_id and key):
+        raise SystemExit("prwatch: PRWATCH_GITHUB_APP_ID and "
+                         "PRWATCH_GITHUB_APP_KEY name a GitHub App together, "
+                         "so set both or neither")
+    return app_id, os.path.expanduser(key)
 
 
 # ---------------------------------------------------------------------------
@@ -1006,6 +1273,9 @@ class Watcher:
         self.gh = gh
         self.owner = owner
         self.repo = repo
+        # The owner and name the reads go to, which poll() replaces with the
+        # ones GitHub uses for the repository now.
+        self.location = [owner, repo]
         self.options = options
         self.name(number)
         self.known = {facet: None for facet in Snapshot.FACETS}
@@ -1132,7 +1402,19 @@ class Watcher:
     # -- one poll ----------------------------------------------------------
 
     def poll(self):
-        snap = read_snapshot(self.gh, self.owner, self.repo, self.number)
+        """Read the pull request once.
+
+        A repository that has been renamed or moved to another owner still
+        answers to its old name, but each request to the old name is first
+        answered with a redirect, and GitHub counts the redirect against the
+        token's hourly allowance as a request of its own. The pull request
+        names the repository it belongs to, so every poll after the first
+        asks for it under that name.
+        """
+        snap = read_snapshot(self.gh, *self.location, self.number)
+        self.gh.forget_unread()
+        if snap.pull:
+            self.location = snap.pull["base"]["repo"]["full_name"].split("/")
         self.report_errors(snap)
         return snap
 
@@ -1751,7 +2033,7 @@ class Watcher:
         if held_still and self.reported_settled:
             self.poll_interval = min(
                 self.poll_interval * self.options.interval_growth,
-                self.options.interval_max)
+                self.interval_max())
         else:
             self.poll_interval = self.options.interval
 
@@ -1875,6 +2157,20 @@ class Watcher:
             snap = self.poll()
             self.absorb(snap)
             self.save_state()
+
+    def interval_max(self):
+        """The longest the wait between polls may grow to.
+
+        That is --interval-max when it was given. Otherwise it follows the
+        share of the hourly allowance spent, as GitHub last reported it, for
+        whichever of the REST and GraphQL allowances has less left: 30
+        seconds when none of it has been spent, 300 when all of it has, in
+        proportion between, and never less than --interval.
+        """
+        if self.options.interval_max is not None:
+            return self.options.interval_max
+        left = 1.0 if self.gh.quota_left is None else self.gh.quota_left
+        return max(self.options.interval, 30 + 270 * (1 - left))
 
     def sleep(self):
         """Wait until the next poll, and past a throttle when there is one.
@@ -2043,10 +2339,10 @@ def main(argv):
                              "report the current state and exit")
     ending.add_argument("--follow", action="store_true",
                         help="keep watching after it settles")
-    parser.add_argument("--interval", type=float, default=60,
-                        metavar="SECONDS",
+    parser.add_argument("--interval", type=float, metavar="SECONDS",
                         help="seconds between polls while anything is "
-                             "happening (default 60)")
+                             "happening (default 30 when reading as a "
+                             "GitHub App, 60 otherwise)")
     parser.add_argument("--interval-growth", type=float, default=2,
                         metavar="FACTOR",
                         help="how much longer to wait before each further "
@@ -2055,8 +2351,9 @@ def main(argv):
                              "--interval (default 2)")
     parser.add_argument("--interval-max", type=float, metavar="SECONDS",
                         help="the longest --interval-growth may stretch the "
-                             "wait between polls (default 240, or --interval "
-                             "itself where that is longer)")
+                             "wait between polls (default 30 plus 270 times "
+                             "the share of the hourly allowance spent, and "
+                             "never less than --interval)")
     parser.add_argument("--heartbeat", type=float, default=900,
                         metavar="SECONDS",
                         help="how often progress may be reported while things "
@@ -2099,19 +2396,19 @@ def main(argv):
                         help="exit 1 unless the verdict is GREEN or "
                              "MERGED")
     options = parser.parse_args(argv)
+    app = app_from_environment()
+    if options.interval is None:
+        options.interval = 30.0 if app else 60.0
     if options.interval <= 0:
         raise SystemExit("prwatch: --interval is how long to wait between "
                          "polls, so it cannot be zero or negative; the "
                          "shortest wait a watch takes is five seconds")
-    # A watch told to read every twenty minutes means it, so the ceiling on
-    # the wait follows --interval up rather than refusing it.
-    if options.interval_max is None:
-        options.interval_max = max(240.0, options.interval)
     if options.interval_growth < 1:
         raise SystemExit("prwatch: --interval-growth is how much longer to "
                          "wait before each further poll, so it cannot be "
                          "below 1; pass 1 for a wait that never grows")
-    if options.interval_max < options.interval:
+    if options.interval_max is not None and \
+            options.interval_max < options.interval:
         raise SystemExit("prwatch: --interval-max is the ceiling on a wait "
                          "that starts at --interval, so it cannot be below "
                          "it")
@@ -2124,7 +2421,8 @@ def main(argv):
                          "starts at --stall, so it cannot be below it")
 
     hostname, owner, repo, number = resolve_target(options.pr, options.repo)
-    gh = GitHub(hostname)
+    token = app and AppToken(hostname, *app, f"{owner}/{repo}")
+    gh = GitHub(hostname, token)
     watcher = Watcher(gh, owner, repo, number, options)
     report_signals(signal.SIGTERM, signal.SIGHUP)
     try:
