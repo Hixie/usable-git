@@ -34,7 +34,7 @@ class Options:
 
     def __init__(self, **overrides):
         defaults = dict(expect=None, once=False, follow=False, interval=60,
-                        interval_growth=2, interval_max=600,
+                        interval_growth=2, interval_max=240,
                         heartbeat=900, stall=1800, stall_growth=2,
                         stall_max=86400, stability=3, min_checks=0,
                         no_ci_grace=900, warn_after=3, max_lines=12,
@@ -1624,6 +1624,42 @@ def a_wait_that_shrinks_is_refused():
             print(f"       {problem}")
         return False
     print("ok   options that would make the wait shrink are refused")
+    return True
+
+
+@case
+def the_wait_stops_growing_at_four_minutes():
+    """--interval-max defaults to 240, or to --interval where that is longer."""
+
+    class Parsed(Exception):
+        pass
+
+    def capture(gh, owner, repo, number, options):
+        raise Parsed(options.interval_max)
+
+    real = (prwatch.resolve_target, prwatch.GitHub, prwatch.Watcher)
+    prwatch.resolve_target = lambda pr, repo: ("github.com", "o", "r", 1)
+    prwatch.GitHub = lambda hostname: None
+    prwatch.Watcher = capture
+    problems = []
+    try:
+        for argv, wanted in [([], 240), (["--interval", "30"], 240),
+                             (["--interval", "600"], 600),
+                             (["--interval-max", "900"], 900)]:
+            try:
+                prwatch.main(["1", *argv])
+            except Parsed as parsed:
+                if parsed.args[0] != wanted:
+                    problems.append(f"{argv} gave a ceiling of "
+                                    f"{parsed.args[0]}, not {wanted}")
+    finally:
+        prwatch.resolve_target, prwatch.GitHub, prwatch.Watcher = real
+    if problems:
+        print("FAIL the wait stops growing at four minutes")
+        for problem in problems:
+            print(f"       {problem}")
+        return False
+    print("ok   the wait stops growing at four minutes unless told otherwise")
     return True
 
 
