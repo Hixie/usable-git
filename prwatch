@@ -76,7 +76,8 @@ EVENTS
              refused one outright, or started answering again
   MERGED     the pull request was merged
   CLOSED     the pull request was closed
-  PENDING    --once found it unsettled; the reason follows
+  PENDING    --status found it unsettled, or --once saw a change before it
+             settled; the reason follows
   SETTLED    the watch is over; the verdict follows
   STOPPED    something outside the watch ended it: Ctrl-C, or a
              signal from whatever started it
@@ -91,7 +92,7 @@ VERDICTS
   MERGED     it was merged
   CLOSED     it was closed without merging
   NO-CI      no check ever appeared for the head commit
-  PENDING    --once was used and it has not settled yet
+  PENDING    --status or --once ended before it settled
   UNKNOWN    nothing was found wrong, but some part of the picture was never
              read successfully, so the verdict does not cover it
 
@@ -162,14 +163,27 @@ RUNNING IT FROM AN AGENT
   A fresh script starts without those rules.
 
   Output is flushed a line at a time, so run it under whatever this harness
-  uses to follow a long-running command. Under Claude Code, the Monitor tool
-  turns each line into a notification. Under Codex, `exec_command` starts it
-  and repeated `wait` calls on the cell collect the lines.
+  uses to follow a long-running command. Under Codex, `exec_command` starts
+  it and repeated `wait` calls on the cell collect the lines.
 
-  Claude Code's Monitor tool runs for half an hour at the most and then has
-  to be armed again, so a watch that lasts an afternoon is a succession of
-  processes rather than one. That is what the state file is for: each
-  process picks up where the one before it left off.
+  A harness that follows a command for a limited time, or that says
+  something only when a command exits, is better served by --once. Under
+  Claude Code, the Monitor tool follows a command for half an hour at the
+  most. A background command has no deadline, and the session hears from it
+  when it exits. So under Claude Code, run `prwatch <pr> --expect HEAD
+  --once` as a background command, and run it again each time it exits.
+
+  With --once, prwatch takes up the state file an earlier run left and
+  watches until something happens that no earlier run reported. That is any
+  line other than WATCHING, STATUS, PROGRESS, STALL and WARN. A verdict
+  counts too, unless it is the verdict last reported and nothing has been
+  reported since. It then exits as soon as it can say where the pull request
+  stands. When the pull request is unsettled, that is at once, with a
+  PENDING line. Otherwise it is when the pull request settles, with a
+  verdict. A pull request that has been merged or closed has nothing left
+  to wait for, so every --once run gives it its verdict and exits. The first
+  run for a pull request has no earlier run to compare with, so it reports
+  where the pull request stands and exits.
 
   After a push, `--expect HEAD` checks that the commit you have checked out
   is the one the pull request points at. A push that went to the wrong
@@ -192,7 +206,7 @@ RUNNING IT FROM AN AGENT
   reported as NO-CI however many processes the watch takes. Pass --fresh to
   start over.
 
-  For a single reading, use --once and do not hold anything open.
+  For a single reading, use --status and do not hold anything open.
 
   The watch ends when the pull request settles, which is the wrong moment to
   stop if you are waiting for a reviewer or expect to push again: a settled
@@ -213,7 +227,8 @@ WHEN IT STOPS
   few polls. Waiting for the run to appear is the part that matters. A push
   whose workflow has not spawned its jobs yet carries only the check a
   review bot registers within seconds, and by every other measure that looks
-  exactly like a finished green build.
+  exactly like a finished green build. With --once, a change that no earlier
+  run reported ends the watch too.
 
   A throttle is not a reason to stop either. GitHub answers a caller it
   wants to slow down with a 403 that says so, and that answer clears on
@@ -227,7 +242,7 @@ WHEN IT STOPS
 
   Two refusals are not waits. A 403 that is a permission the token has
   not got ends the run at once, because every later read is answered the
-  same way. And --once does not wait for a throttle: it answers where the
+  same way. And --status does not wait for a throttle: it answers where the
   pull request stands now, so the refusal is reported and no reading is
   taken.
 
@@ -251,9 +266,9 @@ WHEN IT STOPS
   morning is read fifteen times an hour rather than sixty, and one whose
   build is still running is read every --interval throughout.
 
-  That growth belongs to --follow, since a watch without it ends at the
-  verdict rather than waiting past it. Each process starts again at
-  --interval: the pace is not carried across a restart, because a process
+  That growth belongs to --follow and --once, since a watch with neither
+  ends at the verdict rather than waiting past it. Each process starts again
+  at --interval: the pace is not carried across a restart, because a process
   that inherited one would also have to inherit the settling its verdict
   rests on, and a verdict from a single poll is one GitHub can answer with
   a head that a push has already replaced.
@@ -979,6 +994,12 @@ def unresolved_threads(threads):
 # ---------------------------------------------------------------------------
 # The watcher
 
+# The lines that are about the watch rather than about the pull request. Every
+# other tag reports a change to the pull request, and a change is what --once
+# waits for.
+ABOUT_THE_WATCH = {"WATCHING", "STATUS", "PROGRESS", "STALL", "WARN",
+                   "PENDING", "SETTLED", "STOPPED"}
+
 
 class Watcher:
     def __init__(self, gh, owner, repo, number, options):
@@ -996,9 +1017,12 @@ class Watcher:
         self.limited = {}           # facet -> what its stand-in cannot see
         self.settled_polls = 0
         self.reported_settled = False
+        self.verdict = None         # the last verdict reported, until news
+        self.changed = False        # whether a change has been reported
         self.expect = None
         self.expect_met = None
         self.expect_revision = False
+        self.reported_expectation = None
         self.last_progress = 0.0
         self.last_stall = time.time()
         self.stall_since = self.last_stall
@@ -1032,6 +1056,10 @@ class Watcher:
     def emit(self, tag, message):
         stamp = time.strftime("%H:%M")
         print(f"{stamp} {self.label} {tag:<9}{message}", flush=True)
+        if tag not in ABOUT_THE_WATCH:
+            # Whoever hears of a change is owed a fresh verdict.
+            self.changed = True
+            self.verdict = None
 
     def note(self, message):
         print(f"{self.indent}{message}", flush=True)
@@ -1055,6 +1083,10 @@ class Watcher:
         the head it reads differs from the one restored here, so a push
         that landed while nothing was watching is waited out afresh.
 
+        The last verdict reported is read back, and so is whether the head
+        was the commit --expect named. Each was reported already, so --once
+        does not count either as news when it finds it again.
+
         The pace of the polling and the count of quiet polls a verdict
         rests on are not read back. They say how much watching has been
         done rather than what the pull request is.
@@ -1075,6 +1107,8 @@ class Watcher:
             self.known.update(saved.get("known", {}))
             self.head = saved.get("head")
             self.merge_state = saved.get("merge_state")
+            self.verdict = saved.get("verdict")
+            self.reported_expectation = saved.get("expectation")
             since = saved.get("head_since")
             if since is not None:
                 self.head_since = min(since, time.time())
@@ -1088,6 +1122,9 @@ class Watcher:
             path.write_text(json.dumps({"slug": self.slug, "head": self.head,
                                         "head_since": self.head_since,
                                         "merge_state": self.merge_state,
+                                        "verdict": self.verdict,
+                                        "expectation": [self.expect,
+                                                        self.expect_met],
                                         "known": self.known}))
         except OSError:
             pass
@@ -1183,6 +1220,7 @@ class Watcher:
             for facet in ("checks", "runs", "statuses"):
                 self.known[facet] = None
             self.settled_polls = 0
+            self.reported_settled = False
             self.head_since = time.time()
         elif not self.head:
             self.head_since = time.time()
@@ -1486,7 +1524,8 @@ class Watcher:
 
     def baseline_report(self):
         self.emit("STATUS", self.status_line())
-        if self.options.detail and not self.options.once:
+        if self.options.detail and not (self.options.status or
+                                        self.options.once):
             self.note_outstanding(self.outstanding_lines())
         # The baseline has just said everything there is to say, so the first
         # heartbeat is not due until something moves.
@@ -1605,9 +1644,9 @@ class Watcher:
         return (f"no review from {wanted} of {self.head[:9]}, the commit "
                 "being watched")
 
-    def final_report(self, reason, settled=True):
+    def overall(self, settled=True):
+        """The verdict on the pull request as it stands."""
         bad = tally_checks(self.known.get("checks"))["bad"]
-        outstanding = self.outstanding_lines()
         pull = self.known.get("pull") or {}
         # UNKNOWN displaces a green result, never a finding. A pull request
         # with a failing check and an unread comment list is red, and saying
@@ -1619,23 +1658,36 @@ class Watcher:
         unread = self.unread()
         blind = {"checks", "runs"} & set(unread)
         if not settled:
-            verdict = "PENDING"
-        elif pull.get("merged"):
-            verdict = "MERGED"
-        elif pull.get("state") not in (None, "open"):
-            verdict = "CLOSED"
-        elif bad or failing_runs(self.known.get("runs")) or \
+            return "PENDING"
+        if pull.get("merged"):
+            return "MERGED"
+        if pull.get("state") not in (None, "open"):
+            return "CLOSED"
+        if bad or failing_runs(self.known.get("runs")) or \
                 failing_statuses(self.known.get("statuses")):
-            verdict = "RED"
-        elif outstanding:
-            verdict = "FEEDBACK"
-        elif not blind and not (self.known.get("checks")
-                                or self.known.get("runs")):
-            verdict = "NO-CI"
-        elif unread:
-            verdict = "UNKNOWN"
-        else:
-            verdict = "GREEN"
+            return "RED"
+        if self.outstanding_lines():
+            return "FEEDBACK"
+        if not blind and not (self.known.get("checks")
+                              or self.known.get("runs")):
+            return "NO-CI"
+        if unread:
+            return "UNKNOWN"
+        return "GREEN"
+
+    def conclude(self, reason, settled=True):
+        """Give the verdict, and record in the state file that it was given."""
+        verdict = self.final_report(reason, settled)
+        self.save_state()
+        return verdict
+
+    def final_report(self, reason, settled=True):
+        """Give the verdict and everything outstanding."""
+        verdict = self.overall(settled)
+        if settled:
+            self.verdict = verdict
+        unread = self.unread()
+        pull = self.known.get("pull") or {}
         self.emit("SETTLED" if settled else "PENDING",
                   f"{verdict} — {reason}" if settled else reason)
         self.note(self.status_line())
@@ -1646,12 +1698,13 @@ class Watcher:
         # has run for hours is a long way above the verdict.
         for facet in sorted(self.limited):
             self.note(self.limited[facet])
-        self.note_outstanding(outstanding)
+        self.note_outstanding(self.outstanding_lines())
         url = pull.get("html_url") or \
             f"https://{self.gh.hostname}/{self.owner}/{self.repo}/pull/{self.number}"
         self.note(url)
-        if settled and not self.options.follow and not self.options.once \
-                and verdict not in ("MERGED", "CLOSED"):
+        ends = not (self.options.follow or self.options.status or
+                    self.options.once)
+        if settled and ends and verdict not in ("MERGED", "CLOSED"):
             self.note("the watch ends here; --follow keeps it open for a "
                       "later review or push")
         return verdict
@@ -1724,10 +1777,10 @@ class Watcher:
         True when the request is worth making again. A throttle clears on
         its own, so it is waited out and the request repeated. A permission
         the token has not got, a pull request that is not there and a
-        network failure do not clear, and --once is not waiting for any of
+        network failure do not clear, and --status is not waiting for any of
         them, so the caller is left to say what it could not read.
         """
-        if self.options.once or not rate_limited(error):
+        if self.options.status or not rate_limited(error):
             return False
         self.sleep()
         return True
@@ -1761,7 +1814,7 @@ class Watcher:
         and a network failure are each answered the same way on the next
         poll as on this one.
 
-        A single reading does not wait at all. --once answers where a pull
+        A single reading does not wait at all. --status answers where a pull
         request stands now, and an hour spent waiting for GitHub to lift a
         throttle is not that answer; a caller that wanted the wait would
         have asked for a watch.
@@ -1785,25 +1838,38 @@ class Watcher:
         self.announce_target(snap.pull)
         self.absorb(snap, announce=had_state)
         self.baseline_report()
-        self.save_state()
 
-        if self.options.once:
+        # --once waits for news, and news is measured against what an
+        # earlier run reported. With no earlier run, where the pull request
+        # stands is the news.
+        if self.options.status or (self.options.once and not had_state):
             settled, reason = self.is_settled()
-            return self.final_report(reason, settled)
+            return self.conclude(reason, settled)
+        self.save_state()
 
         while True:
             settled, reason = self.is_settled()
             if settled:
                 self.settled_polls += 1
-                if self.settled_polls >= self.options.stability and \
-                        not self.reported_settled:
+                if self.settled_polls >= self.options.stability:
+                    if self.options.once:
+                        # A pull request that is over has nothing left to
+                        # wait for, so its verdict is always the answer.
+                        verdict = self.overall()
+                        due = verdict != self.verdict or \
+                            verdict in ("MERGED", "CLOSED")
+                    else:
+                        due = not self.reported_settled
                     self.reported_settled = True
-                    verdict = self.final_report(reason)
-                    if not self.options.follow:
-                        return verdict
+                    if due:
+                        verdict = self.conclude(reason)
+                        if not self.options.follow:
+                            return verdict
             else:
                 self.settled_polls = 0
                 self.reported_settled = False
+                if self.options.once and self.changed:
+                    return self.conclude(reason, settled=False)
             self.heartbeat(reason)
             self.sleep()
             snap = self.poll()
@@ -1890,7 +1956,11 @@ class Watcher:
         met = self.expect == self.head
         if met == self.expect_met:
             return
+        first = self.expect_met is None
         self.expect_met = met
+        if first and [self.expect, met] == self.reported_expectation:
+            # The process before this one on the same state file said so.
+            return
         if not announce and met:
             return
         named = self.options.expect if self.expect_revision else "the commit"
@@ -1964,9 +2034,14 @@ def main(argv):
     parser.add_argument("--excerpt", type=int, default=300, metavar="CHARS",
                         help="how much of a comment to quote per event, cut "
                              "at a word (default 300; 0 quotes all of it)")
-    parser.add_argument("--once", action="store_true",
+    ending = parser.add_mutually_exclusive_group()
+    ending.add_argument("--status", action="store_true",
                         help="report the current state and exit")
-    parser.add_argument("--follow", action="store_true",
+    ending.add_argument("--once", action="store_true",
+                        help="watch until something happens that no earlier "
+                             "run reported, then exit; with no earlier run, "
+                             "report the current state and exit")
+    ending.add_argument("--follow", action="store_true",
                         help="keep watching after it settles")
     parser.add_argument("--interval", type=float, default=60,
                         metavar="SECONDS",

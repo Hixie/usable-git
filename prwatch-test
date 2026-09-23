@@ -18,7 +18,7 @@ import signal
 import subprocess
 import sys
 import tempfile
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 spec = importlib.util.spec_from_loader(
@@ -33,8 +33,8 @@ class Options:
     """The defaults, so each case names only what it cares about."""
 
     def __init__(self, **overrides):
-        defaults = dict(expect=None, once=False, follow=False, interval=60,
-                        interval_growth=2, interval_max=240,
+        defaults = dict(expect=None, status=False, once=False, follow=False,
+                        interval=60, interval_growth=2, interval_max=240,
                         heartbeat=900, stall=1800, stall_growth=2,
                         stall_max=86400, stability=3, min_checks=0,
                         no_ci_grace=900, warn_after=3, max_lines=12,
@@ -370,7 +370,7 @@ def the_wait_for_a_first_check_survives_a_restart():
     has not spawned its jobs yet by waiting --no-ci-grace seconds from
     when that commit appeared. A process that measured the wait from its
     own start began it again each time, so a watch killed and started
-    again inside the grace period never got to the end of it, and --once,
+    again inside the grace period never got to the end of it, and --status,
     which takes one reading and stops, could not reach NO-CI at all
     however long the commit had gone without a check. This drives six
     processes over one state file.
@@ -819,9 +819,9 @@ def waiting_is_wrong():
 
 @case
 def a_single_reading_does_not_wait_for_a_throttle():
-    """--once answers where a pull request stands now, so it never waits."""
+    """--status answers where a pull request stands now, so it never waits."""
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
-                              Options(once=True))
+                              Options(status=True))
     polls = []
 
     def refuse():
@@ -843,8 +843,8 @@ def a_single_reading_does_not_wait_for_a_throttle():
     except Waited:
         waited = True
     good = not waited and complaint is not None and polls == ["polled"]
-    print("ok   --once reports a throttle rather than waiting it out" if good
-          else f"FAIL --once and a throttle: waited={waited} "
+    print("ok   --status reports a throttle rather than waiting it out" if good
+          else f"FAIL --status and a throttle: waited={waited} "
                f"complaint={complaint!r} polls={polls}")
     return good
 
@@ -1595,6 +1595,221 @@ def a_change_puts_the_poll_pace_back():
         return False
     print("ok   any change puts the pace back to --interval at once")
     return True
+
+
+# -- --once: a watch that ends at the next piece of news ----------------------
+
+class RanOut(Exception):
+    """The case has no more readings to give the watch."""
+
+
+def reading(head="a" * 40, run="completed", conclusion="success",
+            comments=None, state="open", merged=False, lint=None):
+    """One poll of a pull request with one workflow run and one check.
+
+    A `lint` of "queued" or "success" adds a second check in that state.
+    """
+    finished = conclusion if run == "completed" else None
+    snap = prwatch.Snapshot()
+    snap.pull = pull(head=head, state=state, merged=merged)
+    snap.checks = check_run("Test", status=run, conclusion=finished)
+    if lint:
+        snap.checks.update(check_run(
+            "Lint", status="completed" if lint == "success" else lint,
+            conclusion=lint if lint == "success" else None))
+    snap.runs = workflow(status=run, conclusion=finished)
+    snap.statuses = {}
+    snap.issue_comments = comments or {}
+    snap.review_comments = {}
+    snap.reviews = {}
+    snap.threads = {}
+    return snap
+
+
+def process(state, readings, **options):
+    """One prwatch process on the state file `state`, run to its end.
+
+    Each entry of `readings` is the keyword arguments for one poll. Returns
+    what the process printed, how many polls it made, and the verdict it
+    ended on, which is None when it was still watching after the last one.
+    """
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    polls = []
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(fresh=False, state=state, **options))
+    watcher.local_commit = lambda: "a" * 40
+
+    def poll():
+        if len(polls) == len(readings):
+            raise RanOut()
+        polls.append(clock.now)
+        return reading(**readings[len(polls) - 1])
+
+    watcher.poll = poll
+    out = io.StringIO()
+    verdict = None
+    try:
+        with redirect_stdout(out):
+            verdict = watcher.run()
+    except RanOut:
+        pass
+    finally:
+        prwatch.time = real
+    return out.getvalue(), len(polls), verdict
+
+
+def tags(output):
+    """The tag of every event line, in order."""
+    return [line.split()[2] for line in output.splitlines()
+            if not line.startswith(" ")]
+
+
+@case
+def once_waits_for_news_and_then_stops():
+    """--once exits at the first thing no earlier run reported, and no sooner.
+
+    The first run has nothing to compare with, so it answers the way
+    --status does. The second finds the same verdict and the same commit it
+    was told to expect, neither of which is news, and waits until somebody
+    comments. The third has heard of that comment, and waits on, through a
+    check that registers and passes without a line being printed about it.
+    """
+    comment = {"1": {"user": "someone", "updated": "2026-09-20T10:00:00Z",
+                     "url": "u", "body": "one more thing"}}
+    quiet = [{}] * 6
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        first = process(state, quiet, once=True, expect="HEAD")
+        second = process(state, [{}] * 5 + [{"comments": comment}] + quiet,
+                         once=True, expect="HEAD")
+        third = process(state, [{"comments": comment, "lint": "queued"}] * 2
+                        + [{"comments": comment, "lint": "success"}] * 4,
+                        once=True, expect="HEAD")
+    problems = []
+    if first[1:] != (1, "GREEN") or "SETTLED" not in tags(first[0]):
+        problems.append(f"the first run gave {first[1:]}:\n{first[0]}")
+    if second[1:] != (6, "GREEN") or \
+            tags(second[0])[-2:] != ["COMMENT", "SETTLED"] or \
+            "MATCH" in tags(second[0]):
+        problems.append(f"the second run gave {second[1:]}:\n{second[0]}")
+    if third[1:] != (6, None) or \
+            {"COMMENT", "SETTLED"} & set(tags(third[0])):
+        problems.append(f"the third run gave {third[1:]}:\n{third[0]}")
+    if problems:
+        print("FAIL --once waits for news and then stops")
+        for problem in problems:
+            print("       " + problem.replace("\n", "\n       "))
+        return False
+    print("ok   --once waits for news and then stops")
+    return True
+
+
+@case
+def once_ends_on_a_change_while_the_build_runs():
+    """A push is news at once, and so is the failure that follows it.
+
+    While the pull request is unsettled there is no verdict to wait for, so
+    a change ends the run with a PENDING line. A failure that finishes the
+    build ends it with the verdict, once the board has held still for
+    --stability polls. The verdict for the commit before the push is not
+    the verdict for the one after it, even when the two read the same.
+    """
+    pushed = {"head": "b" * 40}
+    building = dict(pushed, run="in_progress")
+    failed = dict(pushed, conclusion="failure")
+    fixed = {"head": "c" * 40}
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}], once=True)
+        push = process(state, [building] * 4, once=True)
+        failure = process(state, [building] * 2 + [failed] * 4, once=True)
+        fix = process(state, [fixed] * 4, once=True)
+    problems = []
+    if push[1:] != (1, "PENDING") or "RETARGET" not in tags(push[0]):
+        problems.append(f"the push gave {push[1:]}:\n{push[0]}")
+    if failure[1:] != (5, "RED") or "FAIL" not in tags(failure[0]):
+        problems.append(f"the failure gave {failure[1:]}:\n{failure[0]}")
+    if fix[1:] != (3, "GREEN"):
+        problems.append(f"the fix gave {fix[1:]}:\n{fix[0]}")
+    if problems:
+        print("FAIL --once ends on a change while the build runs")
+        for problem in problems:
+            print("       " + problem.replace("\n", "\n       "))
+        return False
+    print("ok   --once ends on a change while the build runs")
+    return True
+
+
+@case
+def once_does_not_outlive_the_pull_request():
+    """A merged pull request gets its verdict from every --once, at once.
+
+    Nothing that happens to it afterwards changes the verdict, so a --once
+    that waited for news would wait for ever, polling a pull request that
+    nobody is working on.
+    """
+    merged = {"state": "closed", "merged": True}
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}], once=True)
+        first = process(state, [merged] * 4, once=True)
+        again = process(state, [merged] * 4, once=True)
+    good = first[1:] == (3, "MERGED") and again[1:] == (3, "MERGED")
+    print("ok   --once does not outlive the pull request" if good
+          else f"FAIL --once after a merge gave {first[1:]} then {again[1:]}")
+    return good
+
+
+@case
+def a_new_head_gets_a_verdict_of_its_own():
+    """A --follow watch gives a verdict for every head it settles on.
+
+    A push whose build had finished by the next poll never makes the watch
+    unsettled, so the verdict for the head before it was the last one given.
+    """
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        output, polls, _ = process(state, [{}] * 4 + [{"head": "b" * 40}] * 4,
+                                   follow=True)
+    good = tags(output).count("SETTLED") == 2 and polls == 8
+    print("ok   a new head gets a verdict of its own" if good
+          else f"FAIL a new head and its verdict:\n{output}")
+    return good
+
+
+@case
+def once_waits_out_a_throttle():
+    """--once is a watch, so a throttle is waited out rather than reported."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(once=True))
+    watcher.sleep = lambda: None
+    throttle = prwatch.GitHubError("gh: API rate limit exceeded (HTTP 403)",
+                                   403)
+    good = watcher.wait_out(throttle)
+    print("ok   --once waits out a throttle" if good
+          else "FAIL --once gave up at a throttle")
+    return good
+
+
+@case
+def the_ways_a_run_ends_exclude_each_other():
+    """--status, --once and --follow each say when to stop, differently."""
+    refused = []
+    for pair in (["--status", "--once"], ["--once", "--follow"],
+                 ["--status", "--follow"]):
+        try:
+            with redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()):
+                prwatch.main(["1", "--repo", "o/r"] + pair)
+        except SystemExit as raised:
+            if raised.code == 2:
+                refused.append(pair)
+    good = len(refused) == 3
+    print("ok   --status, --once and --follow exclude each other" if good
+          else f"FAIL only {refused} were refused")
+    return good
 
 
 @case
