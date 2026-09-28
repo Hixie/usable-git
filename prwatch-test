@@ -664,16 +664,28 @@ def an_outage_in_the_stand_in_is_not_a_refusal():
                 return super().paged(path, key, per_page)
             raise prwatch.GitHubError("gh failed (HTTP 502)", 502)
 
+    def stand_in_error(gh, snap):
+        try:
+            prwatch.read_checks(gh, "o", "r", "a" * 40, snap)
+        except prwatch.GitHubError as error:
+            return error
+
     snap = prwatch.Snapshot()
     snap.runs = workflow()
-    raised = None
-    try:
-        prwatch.read_checks(Flaky([], {}), "o", "r", "a" * 40, snap)
-    except prwatch.GitHubError as error:
-        raised = error
-    good = raised is not None and not prwatch.forbidden(raised)
+    raised = stand_in_error(Flaky([], {}), snap)
+    # The runs are the stand-in's first part, so a failure to read them is
+    # the stand-in's failure, and a refusal of them is a refusal.
+    unread = prwatch.Snapshot()
+    unread.errors["runs"] = prwatch.GitHubError("left a run out")
+    blip = stand_in_error(RefusedChecks([], {}), unread)
+    unread.errors["runs"] = prwatch.GitHubError("refused (HTTP 403)", 403)
+    refusal = stand_in_error(RefusedChecks([], {}), unread)
+    good = raised is not None and not prwatch.forbidden(raised) and \
+        blip is not None and not prwatch.forbidden(blip) and \
+        refusal is not None and prwatch.forbidden(refusal)
     print("ok   a failure while reading the stand-in is not called permanent"
-          if good else f"FAIL stand-in outage: {raised!r}")
+          if good else f"FAIL stand-in outage: {raised!r} / {blip!r} / "
+                       f"{refusal!r}")
     return good
 
 
@@ -1796,6 +1808,93 @@ def a_new_head_gets_a_verdict_of_its_own():
 
 
 @case
+def once_waits_after_a_follow_that_saw_news():
+    """A --once that takes over from --follow waits, after news too.
+
+    The --follow watch gives a verdict, then reports a comment, and gives
+    the verdict again for the pull request with the comment on it. The
+    --once run after it has nothing new to say, so it waits.
+    """
+    comment = {"1": {"user": "someone", "updated": "2026-09-20T10:00:00Z",
+                     "url": "u", "body": "one more thing"}}
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        follow = process(state, [{}] * 4 + [{"comments": comment}] * 4,
+                         follow=True)
+        once = process(state, [{"comments": comment}] * 6, once=True)
+    problems = []
+    if tags(follow[0])[-2:] != ["COMMENT", "SETTLED"] or \
+            tags(follow[0]).count("SETTLED") != 2:
+        problems.append(f"the --follow watch gave:\n{follow[0]}")
+    if once[1:] != (6, None):
+        problems.append(f"the --once run gave {once[1:]}:\n{once[0]}")
+    if problems:
+        print("FAIL --once waits after a --follow that saw news")
+        for problem in problems:
+            print("       " + problem.replace("\n", "\n       "))
+        return False
+    print("ok   --once waits after a --follow that saw news")
+    return True
+
+
+@case
+def a_run_left_out_of_one_read_is_not_news():
+    """A run GitHub leaves out of one list is not announced when it returns.
+
+    The read that leaves it out counts as a failed read of the runs, so the
+    runs keep what they had. A run left out of two reads in a row was
+    deleted, so the second list is taken as it stands. A new head has runs
+    of its own, so its list is not held to the old head's.
+    """
+
+    class Runs:
+        """A stand-in for GitHub that lists the runs it is given."""
+
+        def __init__(self, sha):
+            self.sha = sha
+            self.runs = []
+
+        def get(self, path):
+            if "/pulls/" not in path:
+                return {}
+            return {**pull(head=self.sha),
+                    "base": {"repo": {"full_name": "o/r"}}}
+
+        def paged(self, path, key=None, per_page=100):
+            return self.runs if "actions/runs" in path else []
+
+        def graphql(self, query, **variables):
+            raise prwatch.GitHubError("not read in this case")
+
+        def forget_unread(self):
+            pass
+
+    gh = Runs("a" * 40)
+    ran = {"id": 1, "name": "CI", "status": "completed",
+           "conclusion": "success", "html_url": "u"}
+    watcher = prwatch.Watcher(gh, "o", "r", 1, Options())
+    lines = []
+    listed = []
+    readings = [([ran], "a"), ([], "a"), ([ran], "a"), ([], "a"), ([], "a"),
+                ([ran], "b"), ([], "c")]
+    for count, (runs, sha) in enumerate(readings):
+        gh.runs, gh.sha = runs, sha * 40
+        out = io.StringIO()
+        with redirect_stdout(out):
+            snap = watcher.poll()
+            # The first reading is the baseline, as it is in a real watch.
+            watcher.absorb(snap, announce=count > 0)
+        lines += [line.split(None, 2)[2] for line in out.getvalue().splitlines()
+                  if " RUN " in line or " WARN     runs" in line]
+        listed.append(None if snap.runs is None else list(snap.runs))
+    good = (lines == ["RUN      CI completed success  u"]
+            and listed == [["1"], None, ["1"], None, [], ["1"], []])
+    print("ok   a run left out of one read is not news" if good
+          else f"FAIL a run left out of one read: {lines} / {listed}")
+    return good
+
+
+@case
 def once_waits_out_a_throttle():
     """--once is a watch, so a throttle is waited out rather than reported."""
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
@@ -2277,7 +2376,7 @@ def reads_go_to_the_name_the_repository_has_now():
     """
     asked = []
 
-    def read_snapshot(gh, owner, repo, number):
+    def read_snapshot(gh, owner, repo, number, head, runs):
         asked.append(f"{owner}/{repo}")
         snap = prwatch.Snapshot()
         if len(asked) != 3:

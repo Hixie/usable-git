@@ -84,7 +84,8 @@ EVENTS
   CLOSED     the pull request was closed
   PENDING    --status found it unsettled, or --once saw a change before it
              settled; the reason follows
-  SETTLED    the watch is over; the verdict follows
+  SETTLED    the pull request settled; the verdict follows, and the watch
+             ends unless --follow was given
   STOPPED    something outside the watch ended it: Ctrl-C, or a
              signal from whatever started it
 
@@ -320,7 +321,8 @@ WHEN IT STOPS
   the reads go to the name GitHub gives the repository now.
 
   Pass --follow to keep watching past the settling point, which is what you
-  want while waiting on a human reviewer.
+  want while waiting on a human reviewer. Each change it reports after that
+  is followed by a fresh verdict, once the pull request has settled again.
 
   A watch that is ended from outside says so, with a STOPPED line naming
   Ctrl-C or the signal that arrived. Without that line the log ends at
@@ -930,7 +932,16 @@ class Snapshot:
         self.limits = {}
 
 
-def read_snapshot(gh, owner, repo, number):
+def read_snapshot(gh, owner, repo, number, head=None, runs=None):
+    """Read every facet of the pull request, recording each failure.
+
+    `runs` are the workflow runs an earlier read listed for the commit
+    `head`. GitHub now and then answers the list of a commit's runs with
+    runs left out that it listed before, and lists them again at the next
+    read. A listed run stays listed unless somebody deletes it, so a list
+    that leaves one out is a failed read rather than news. Passing no `runs`
+    accepts whatever list GitHub gives.
+    """
     snap = Snapshot()
     base = f"repos/{owner}/{repo}"
 
@@ -943,10 +954,8 @@ def read_snapshot(gh, owner, repo, number):
     attempt("pull", lambda: gh.get(f"{base}/pulls/{number}"))
     sha = snap.pull["head"]["sha"] if snap.pull else None
 
-    if sha:
-        # The runs are read first because the checks fall back to them when
-        # the checks endpoint is one this token may not read.
-        attempt("runs", lambda: {
+    def read_runs():
+        listed = {
             str(run["id"]): {
                 "name": run["name"],
                 "status": run["status"],
@@ -957,7 +966,17 @@ def read_snapshot(gh, owner, repo, number):
             }
             for run in gh.paged(f"{base}/actions/runs?head_sha={sha}",
                                 key="workflow_runs")
-        })
+        }
+        missing = (runs or {}).keys() - listed.keys() if sha == head else ()
+        if missing:
+            raise GitHubError(f"the list of workflow runs left out "
+                              f"{plural(len(missing), 'run')} it listed before")
+        return listed
+
+    if sha:
+        # The runs are read first because the checks fall back to them when
+        # the checks endpoint is one this token may not read.
+        attempt("runs", read_runs)
         attempt("checks", lambda: read_checks(gh, owner, repo, sha, snap))
         # The combined status endpoint answers "pending" for a commit that has
         # no statuses at all, which is most commits in an Actions-only repo.
@@ -1035,9 +1054,11 @@ def read_checks(gh, owner, repo, sha, snap):
                                 key="check_runs")
         }
     except GitHubError as error:
-        if not forbidden(error) or snap.runs is None:
+        if not forbidden(error):
             raise
     try:
+        if snap.runs is None:
+            raise snap.errors["runs"]
         checks = jobs_as_checks(gh, base, snap.runs)
         checks.update(unnamed_checks(gh, owner, repo, sha, checks))
     except GitHubError as error:
@@ -1411,7 +1432,11 @@ class Watcher:
         names the repository it belongs to, so every poll after the first
         asks for it under that name.
         """
-        snap = read_snapshot(self.gh, *self.location, self.number)
+        # A run left out of two reads in a row was deleted, so after a
+        # failed read of the runs, the list is taken as it stands.
+        runs = None if self.failures.get("runs") else self.known.get("runs")
+        snap = read_snapshot(self.gh, *self.location, self.number, self.head,
+                             runs)
         self.gh.forget_unread()
         if snap.pull:
             self.location = snap.pull["base"]["repo"]["full_name"].split("/")
@@ -2134,14 +2159,17 @@ class Watcher:
             if settled:
                 self.settled_polls += 1
                 if self.settled_polls >= self.options.stability:
+                    verdict = self.overall()
                     if self.options.once:
                         # A pull request that is over has nothing left to
                         # wait for, so its verdict is always the answer.
-                        verdict = self.overall()
                         due = verdict != self.verdict or \
                             verdict in ("MERGED", "CLOSED")
                     else:
-                        due = not self.reported_settled
+                        # A change reported since the last verdict is owed
+                        # a fresh one, as it is under --once.
+                        due = not self.reported_settled or \
+                            verdict != self.verdict
                     self.reported_settled = True
                     if due:
                         verdict = self.conclude(reason)
