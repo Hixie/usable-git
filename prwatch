@@ -84,7 +84,7 @@ EVENTS
   CLOSED     the pull request was closed
   PENDING    --status found it unsettled, or --once saw a change before it
              settled; the reason follows
-  SETTLED    the pull request settled; the verdict follows, and the watch
+  WAITING    the pull request settled; the verdict follows, and the watch
              ends unless --follow was given
   STOPPED    something outside the watch ended it: Ctrl-C, or a
              signal from whatever started it
@@ -1286,7 +1286,7 @@ def unresolved_threads(threads):
 # other tag reports a change to the pull request, and a change is what --once
 # waits for.
 ABOUT_THE_WATCH = {"WATCHING", "STATUS", "PROGRESS", "STALL", "WARN",
-                   "PENDING", "SETTLED", "STOPPED"}
+                   "PENDING", "WAITING", "STOPPED"}
 
 
 class Watcher:
@@ -1995,7 +1995,7 @@ class Watcher:
             self.verdict = verdict
         unread = self.unread()
         pull = self.known.get("pull") or {}
-        self.emit("SETTLED" if settled else "PENDING",
+        self.emit("WAITING" if settled else "PENDING",
                   f"{verdict} — {reason}" if settled else reason)
         self.note(self.status_line())
         if unread:

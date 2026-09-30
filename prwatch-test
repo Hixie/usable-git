@@ -1716,14 +1716,14 @@ def once_waits_for_news_and_then_stops():
                         + [{"comments": comment, "lint": "success"}] * 4,
                         once=True, expect="HEAD")
     problems = []
-    if first[1:] != (1, "GREEN") or "SETTLED" not in tags(first[0]):
+    if first[1:] != (1, "GREEN") or "WAITING" not in tags(first[0]):
         problems.append(f"the first run gave {first[1:]}:\n{first[0]}")
     if second[1:] != (6, "GREEN") or \
-            tags(second[0])[-2:] != ["COMMENT", "SETTLED"] or \
+            tags(second[0])[-2:] != ["COMMENT", "WAITING"] or \
             "MATCH" in tags(second[0]):
         problems.append(f"the second run gave {second[1:]}:\n{second[0]}")
     if third[1:] != (6, None) or \
-            {"COMMENT", "SETTLED"} & set(tags(third[0])):
+            {"COMMENT", "WAITING"} & set(tags(third[0])):
         problems.append(f"the third run gave {third[1:]}:\n{third[0]}")
     if problems:
         print("FAIL --once waits for news and then stops")
@@ -1801,7 +1801,7 @@ def a_new_head_gets_a_verdict_of_its_own():
         state = str(Path(directory) / "state.json")
         output, polls, _ = process(state, [{}] * 4 + [{"head": "b" * 40}] * 4,
                                    follow=True)
-    good = tags(output).count("SETTLED") == 2 and polls == 8
+    good = tags(output).count("WAITING") == 2 and polls == 8
     print("ok   a new head gets a verdict of its own" if good
           else f"FAIL a new head and its verdict:\n{output}")
     return good
@@ -1823,8 +1823,8 @@ def once_waits_after_a_follow_that_saw_news():
                          follow=True)
         once = process(state, [{"comments": comment}] * 6, once=True)
     problems = []
-    if tags(follow[0])[-2:] != ["COMMENT", "SETTLED"] or \
-            tags(follow[0]).count("SETTLED") != 2:
+    if tags(follow[0])[-2:] != ["COMMENT", "WAITING"] or \
+            tags(follow[0]).count("WAITING") != 2:
         problems.append(f"the --follow watch gave:\n{follow[0]}")
     if once[1:] != (6, None):
         problems.append(f"the --once run gave {once[1:]}:\n{once[0]}")
