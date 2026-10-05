@@ -180,17 +180,23 @@ RUNNING IT FROM AN AGENT
   when it exits. So under Claude Code, run `prwatch <pr> --expect HEAD
   --once` as a background command, and run it again each time it exits.
 
-  With --once, prwatch takes up the state file an earlier run left and
-  watches until something happens that no earlier run reported. That is any
-  line other than WATCHING, STATUS, PROGRESS, STALL and WARN. A verdict
-  counts too, unless it is the verdict last reported and nothing has been
-  reported since. It then exits as soon as it can say where the pull request
-  stands. When the pull request is unsettled, that is at once, with a
-  PENDING line. Otherwise it is when the pull request settles, with a
-  verdict. A pull request that has been merged or closed has nothing left
-  to wait for, so every --once run gives it its verdict and exits. The first
-  run for a pull request has no earlier run to compare with, so it reports
-  where the pull request stands and exits.
+  Every run reads and writes the same state file for a pull request,
+  whichever of --follow, --once and --status it was given, so an earlier run
+  means the last run of any of the three. With --once, prwatch takes up that
+  file and watches until something happens that no earlier run reported.
+  That is any line other than WATCHING, STATUS, PROGRESS, STALL and WARN. A
+  verdict counts too, unless it is the verdict last reported and nothing has
+  been reported since. It then exits as soon as it can say where the pull
+  request stands. When the pull request is unsettled, that is at once, with
+  a PENDING line. Otherwise it is when the pull request settles, with a
+  verdict. A pull request that has been merged or closed has nothing left to
+  wait for, so every --once run gives it its verdict and exits. A --follow
+  run stopped before it gave its verdict, as a harness's time limit can stop
+  one, leaves the last verdict reported as it was. The --once run after it
+  then gives the verdict at once when it differs from that one, even though
+  nothing has happened since the --follow run stopped. The first run for a
+  pull request has no earlier run to compare with, so it reports where the
+  pull request stands and exits.
 
   After a push, `--expect HEAD` checks that the commit you have checked out
   is the one the pull request points at. A push that went to the wrong
@@ -2363,8 +2369,9 @@ def main(argv):
                         help="report the current state and exit")
     ending.add_argument("--once", action="store_true",
                         help="watch until something happens that no earlier "
-                             "run reported, then exit; with no earlier run, "
-                             "report the current state and exit")
+                             "run (--follow, --once or --status) reported, "
+                             "then exit; with no earlier run, report the "
+                             "current state and exit")
     ending.add_argument("--follow", action="store_true",
                         help="keep watching after it settles")
     parser.add_argument("--interval", type=float, metavar="SECONDS",
