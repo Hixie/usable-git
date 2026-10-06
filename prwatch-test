@@ -42,7 +42,8 @@ class Options:
                         stall_max=86400, stability=3, min_checks=0,
                         no_ci_grace=900, warn_after=3, max_lines=12,
                         detail=True, fresh=True, state=None, exit_code=False,
-                        require_review=None, excerpt=300)
+                        require_review=None, excerpt=300,
+                        for_seconds=None)
         defaults.update(overrides)
         self.__dict__.update(defaults)
 
@@ -1662,6 +1663,7 @@ def process(state, readings, **options):
     ended on, which is None when it was still watching after the last one.
     """
     clock = Clock()
+    started = clock.now
     real = prwatch.time
     prwatch.time = clock
     polls = []
@@ -1683,6 +1685,8 @@ def process(state, readings, **options):
             verdict = watcher.run()
     except RanOut:
         pass
+    except prwatch.TimeUp:
+        verdict = f"time up after {clock.now - started:.0f}s"
     finally:
         prwatch.time = real
     return out.getvalue(), len(polls), verdict
@@ -1768,6 +1772,82 @@ def once_ends_on_a_change_while_the_build_runs():
         return False
     print("ok   --once ends on a change while the build runs")
     return True
+
+
+@case
+def for_ends_a_quiet_watch_and_the_next_one_carries_on():
+    """--for ends a watch at the time it names, and a later run picks it up.
+
+    A green pull request that nobody touches gives --once nothing to report,
+    so only --for ends that run, and it ends it at the time --for names. The
+    next run has the same state, so it reports the comment that arrived
+    after, and nothing it had already reported.
+    """
+    comment = {"1": {"user": "someone", "updated": "2026-09-20T10:00:00Z",
+                     "url": "u", "body": "one more thing"}}
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}], once=True)
+        quiet = process(state, [{}] * 200, once=True, for_seconds=7000)
+        news = process(state, [{"comments": comment}] * 4, once=True,
+                       for_seconds=7000)
+    problems = []
+    if quiet[2] != "time up after 7000s" or quiet[1] == 200 or \
+            set(tags(quiet[0])) - {"WATCHING", "STATUS", "STALL"}:
+        problems.append(f"the quiet run gave {quiet[1:]}:\n{quiet[0]}")
+    if news[1:] != (3, "GREEN") or \
+            [t for t in tags(news[0]) if t not in ("WATCHING", "STATUS")] \
+            != ["COMMENT", "WAITING"]:
+        problems.append(f"the next run gave {news[1:]}:\n{news[0]}")
+    if problems:
+        print("FAIL --for ends a quiet watch and the next one carries on")
+        for problem in problems:
+            print("       " + problem.replace("\n", "\n       "))
+        return False
+    print("ok   --for ends a quiet watch and the next one carries on")
+    return True
+
+
+@case
+def the_end_of_for_is_announced():
+    """The watch says that --for ended it, and exits as a working watch does."""
+    saved = (prwatch.resolve_target, prwatch.app_from_environment,
+             prwatch.Watcher.run,
+             {n: signal.getsignal(n) for n in (signal.SIGTERM, signal.SIGHUP)})
+
+    def run_out(self):
+        raise prwatch.TimeUp()
+
+    prwatch.resolve_target = lambda pr, repo: ("github.com", "o", "r", 1)
+    prwatch.app_from_environment = lambda: None
+    prwatch.Watcher.run = run_out
+    out = io.StringIO()
+    try:
+        with redirect_stdout(out):
+            status = prwatch.main(["--once", "--for", "7000", "--fresh"])
+        with redirect_stderr(io.StringIO()):
+            try:
+                prwatch.main(["--once", "--for", "0"])
+                refused = False
+            except SystemExit:
+                refused = True
+            try:
+                prwatch.main(["--once", "--for", "nan"])
+                refused = False
+            except SystemExit:
+                pass
+    finally:
+        (prwatch.resolve_target, prwatch.app_from_environment,
+         prwatch.Watcher.run, handlers) = saved
+        for number, handler in handlers.items():
+            signal.signal(number, handler)
+    said = out.getvalue()
+    good = status == 0 and refused and "STOPPED" in said and \
+        "--for 1h56m ran out; run it again to keep watching" in said
+    print("ok   the end of --for is announced" if good
+          else f"FAIL the end of --for gave status {status}, refused a "
+               f"zero and a nan --for: {refused}, and said:\n{said}")
+    return good
 
 
 @case

@@ -86,8 +86,8 @@ EVENTS
              settled; the reason follows
   WAITING    the pull request settled; the verdict follows, and the watch
              ends unless --follow was given
-  STOPPED    something outside the watch ended it: Ctrl-C, or a
-             signal from whatever started it
+  STOPPED    something ended the watch before it was done: Ctrl-C, a
+             signal from whatever started it, or the end of --for
 
 VERDICTS
 
@@ -176,9 +176,20 @@ RUNNING IT FROM AN AGENT
   A harness that follows a command for a limited time, or that says
   something only when a command exits, is better served by --once. Under
   Claude Code, the Monitor tool follows a command for half an hour at the
-  most. A background command has no deadline, and the session hears from it
-  when it exits. So under Claude Code, run `prwatch <pr> --expect HEAD
-  --once` as a background command, and run it again each time it exits.
+  most. A background command runs for two hours at the most, and the
+  session hears from it when it exits. So under Claude Code, run `prwatch
+  <pr> --expect HEAD --once --for 7000` as a background command with a
+  timeout of 7200000 milliseconds, and run it again each time it exits.
+
+  --for SECONDS ends the watch at the first wait between polls that would
+  run past that long, with a STOPPED line that says so. A poll already
+  under way is finished first, so give --for a few minutes less than the
+  harness allows. A watch the harness kills says so too, but the harness
+  then reports the command as killed rather than finished, which reads as
+  a fault. --for does nothing for a watch the harness kills first, so it
+  is no use without a timeout longer than it. What a watch has reported
+  is saved after every poll, so the next run carries on from where this
+  one ended, and announces only what happened since.
 
   Every run reads and writes the same state file for a pull request,
   whichever of --follow, --once and --status it was given, so an earlier run
@@ -1308,6 +1319,8 @@ class Watcher:
         self.known = {facet: None for facet in Snapshot.FACETS}
         self.head = None
         self.head_since = time.time()
+        self.ends_at = None if options.for_seconds is None else \
+            time.time() + options.for_seconds
         self.failures = {}          # facet -> consecutive failure count
         self.warned = set()
         self.refused = set()        # facets GitHub refuses this token
@@ -2211,13 +2224,17 @@ class Watcher:
 
         The wait is the one heartbeat() worked out: --interval while
         anything is happening, and longer while nothing is. It is never
-        shorter than five seconds, whatever --interval says.
+        shorter than five seconds, whatever --interval says. A wait that
+        would reach the end of --for ends the watch there instead.
         """
         delay = max(5.0, self.poll_interval)
         wait_out = self.gh.rate_limited_until - time.time()
         if wait_out > 0:
             self.emit("WARN", f"rate limited; waiting {duration(wait_out)}")
             delay = max(delay, wait_out + 5)
+        if self.ends_at is not None and time.time() + delay >= self.ends_at:
+            time.sleep(max(0.0, self.ends_at - time.time()))
+            raise TimeUp()
         time.sleep(delay)
 
     def resolve_expectation(self):
@@ -2311,6 +2328,10 @@ class Watcher:
 # ---------------------------------------------------------------------------
 
 
+class TimeUp(Exception):
+    """--for has run out."""
+
+
 class Stopped(Exception):
     """A signal has asked the watch to end."""
 
@@ -2374,6 +2395,10 @@ def main(argv):
                              "current state and exit")
     ending.add_argument("--follow", action="store_true",
                         help="keep watching after it settles")
+    parser.add_argument("--for", dest="for_seconds", type=float,
+                        metavar="SECONDS",
+                        help="end the watch at the first wait that would run "
+                             "past this long, with a STOPPED line")
     parser.add_argument("--interval", type=float, metavar="SECONDS",
                         help="seconds between polls while anything is "
                              "happening (default 30 when reading as a "
@@ -2438,6 +2463,9 @@ def main(argv):
         raise SystemExit("prwatch: --interval is how long to wait between "
                          "polls, so it cannot be zero or negative; the "
                          "shortest wait a watch takes is five seconds")
+    if options.for_seconds is not None and not options.for_seconds > 0:
+        raise SystemExit("prwatch: --for is how long to watch, so it cannot "
+                         "be zero or negative")
     if options.interval_growth < 1:
         raise SystemExit("prwatch: --interval-growth is how much longer to "
                          "wait before each further poll, so it cannot be "
@@ -2464,6 +2492,10 @@ def main(argv):
         verdict = watcher.run()
     except KeyboardInterrupt:
         watcher.emit("STOPPED", "interrupted")
+        return 0
+    except TimeUp:
+        watcher.emit("STOPPED", f"--for {duration(options.for_seconds)} ran "
+                                "out; run it again to keep watching")
         return 0
     except Stopped as stopped:
         watcher.emit("STOPPED", f"{stopped} ended the watch")

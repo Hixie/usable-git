@@ -192,15 +192,18 @@ git config --global rerere.enabled true
       same command again; the new run announces only what happened
       while you were away.
 
-      Under Claude Code, run `prwatch <pr> --expect HEAD --once` as a
-      background command instead, and run it again each time it exits.
+      Under Claude Code, run `prwatch <pr> --expect HEAD --once --for
+      7000` as a background command with a timeout of 7200000 instead,
+      and run it again each time it exits.
       It exits when something happens that no earlier run reported, as
       soon as it can say where the pull request stands. An earlier run
       is the last one of any kind, `--follow` included. A `--follow`
       watch stopped before it printed its verdict leaves that verdict
       unreported, so the next `--once` may print it and exit at once. A
-      background command has no deadline; a monitor runs for half an
-      hour at most.
+      background command runs for two hours at most, so `--for` ends the
+      watch a little before that with a STOPPED line, rather than
+      leaving the harness to kill it; a monitor runs for half an hour at
+      most.
 
       It reports failing checks as they land, workflow runs as they
       finish, every comment (issue-level, inline, and review
