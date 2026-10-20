@@ -7,17 +7,23 @@ below. Point a person or an agent at that rather than at this file.
 
 import argparse
 import base64
+import contextlib
 import email.utils
 import html
 import http.client
+import io
 import json
 import os
+import queue
 import re
 import signal
+import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -256,6 +262,63 @@ WHOSE TOKEN IT READS WITH
   expires, which needs the `openssl` command.
   The app needs read access to actions, checks, commit statuses, contents,
   issues, and pull requests.
+
+LISTENING FOR WEBHOOKS
+
+  --github-webhook-relay HOST:PORT connects to a relay that passes on every
+  webhook GitHub sends it. A webhook carries the object it is about, so the
+  watch takes the change from the webhook and reports it as a read would
+  have, without reading. That holds for the pull request itself, its
+  comments, inline comments and reviews, the commit statuses of its head
+  commit, and the checks and workflow runs of its head commit that the
+  watch already holds.
+
+  GitHub does not promise to deliver webhooks in order. A webhook that puts
+  an item earlier than the one held is passed over when GitHub stamped both
+  with the time they changed, as it does the pull request, comments and
+  commit statuses. Otherwise it is read for, since either it was overtaken
+  or the item really went back, and only a read says which. A comment once
+  deleted stays deleted, whatever later webhooks say of it. A read that
+  puts an item earlier than a webhook did, leaves out an item a webhook
+  announced, or says otherwise about it, is believed only when a second
+  read --interval later says the same, since a read can be answered from
+  before a change whose webhook has already arrived.
+
+  Some changes come with no webhook that describes them, and those are
+  read, no more often than every --interval:
+    - a push to either branch, after which GitHub works out again whether
+      the pull request merges, and sends nothing when it has, so the pull
+      request is read until it says;
+    - a new head commit, whose checks may have been reported before the
+      webhook that announced the push, and which moves the lines of inline
+      comments and review threads;
+    - anything about a review thread, which is known by an id only a read
+      gives, and whose webhooks carry nothing to put two in order;
+    - a check, a job or a workflow run not held, which may be a later
+      attempt of one that is, since a read gives only the latest attempt;
+    - a check an app registered, where the token may not read the checks
+      and they are counted rather than named;
+    - a facet whose last read failed.
+  The --stability a verdict waits for is measured in quiet --intervals
+  rather than in reads. Nothing announces a commit in the working tree,
+  so when --expect names a revision, the working tree is looked at every
+  --interval. Otherwise nothing is read at all while the relay is
+  connected, and --interval-growth and --interval-max have nothing to do.
+
+  The relay passes on every webhook while a watch is connected, and keeps
+  nothing for one that is not, so the watch connects before its first
+  read. A connection that ends, that goes quiet because its far end has
+  gone, or that carries something that is not a webhook, is reported with
+  a WARN line. Webhooks may have been missed, so the watch reads everything
+  at once and polls as it does without a relay. It tries to connect again
+  in the background, and at the poll after an attempt succeeds it listens
+  again, reading everything once more.
+
+  The relay is only as complete as the GitHub webhook that feeds it, which
+  needs to send these events: pull requests, pull request reviews, review
+  comments and review threads, issue comments, check runs, workflow runs
+  and workflow jobs, commit statuses, and pushes. --status reads once and
+  does not connect.
 
 WHEN IT STOPS
 
@@ -543,6 +606,12 @@ class GitHub:
         """
         self.answers, self.reading = self.reading, {}
 
+    def keep_read(self):
+        """Add the answers to the paths read since the last call to the rest,
+        after a read of only some of them."""
+        self.answers.update(self.reading)
+        self.reading = {}
+
     def _note_quota(self, head):
         """Record the allowance left, from an answer's headers."""
         def header(name):
@@ -751,6 +820,147 @@ def app_from_environment():
 
 
 # ---------------------------------------------------------------------------
+# Hearing from GitHub
+
+
+class RelayLost(Exception):
+    """The webhook relay can no longer be heard from."""
+
+
+# GitHub sends no payload larger than 25 MB, and the headers with it are a
+# few kilobytes.
+LONGEST_WEBHOOK = 26 * 1024 * 1024
+
+
+def webhook(packet):
+    """The event a webhook is about, and its payload, from GitHub's request.
+
+    GitHub names the event in a header, and sends the payload as JSON, or as
+    a form with the JSON in its `payload` field, whichever the webhook was
+    configured for.
+    """
+    stream = io.BytesIO(packet)
+    stream.readline()
+    headers = http.client.parse_headers(stream)
+    body = stream.read()
+    if headers.get_content_type() == "application/x-www-form-urlencoded":
+        body = urllib.parse.parse_qs(body.decode(), strict_parsing=True,
+                                     max_num_fields=1)["payload"][0]
+    return headers.get("X-GitHub-Event", ""), json.loads(body)
+
+
+class Relay:
+    """A connection to a relay that passes on every GitHub webhook it gets.
+
+    The relay sends each webhook as its length, an unsigned 32-bit number
+    with the most significant byte first, followed by that many bytes: the
+    HTTP request GitHub made to deliver it, headers and body. It keeps
+    nothing for a subscriber that is not connected, and it drops one that
+    falls too far behind. So the connection is read on a thread of its own
+    for as long as the watch runs, and each webhook is queued for the watch
+    to look at. Once the watch has set `repositories`, the webhooks from
+    every other repository are passed over as they arrive.
+
+    A connection that ends, or that carries something that is not a
+    webhook, is lost. Any webhook after that point could be the one about
+    this pull request, so the watch has to stop relying on them.
+    """
+
+    def __init__(self, address, connection=None):
+        host, _, port = address.rpartition(":")
+        if not host or not port.isdigit():
+            raise SystemExit("prwatch: --github-webhook-relay wants "
+                             f"HOST:PORT, not '{address}'")
+        self.address = address
+        self.connection = connection
+        self.repositories = None
+        self.lost = None
+        # Set once the relay is connected to, or once connecting has failed.
+        self.ready = threading.Event()
+        self.webhooks = queue.Queue()
+        threading.Thread(target=self._receive,
+                         args=(host.strip("[]"), int(port)),
+                         daemon=True).start()
+
+    def _receive(self, host, port):
+        """Connect, and read webhooks until the relay is lost; then say why.
+
+        Connecting happens here rather than in the constructor, so that a
+        relay that does not answer holds up nothing but this thread.
+        """
+        try:
+            if self.connection is None:
+                self.connection = self._connect(host, port)
+            self.ready.set()
+            self._read(self.connection.makefile("rb"))
+        except RelayLost as error:
+            self.lost = f"the webhook relay at {self.address} {error}"
+        except Exception as error:
+            self.lost = (f"the connection to the webhook relay at "
+                         f"{self.address} failed: {error}")
+        self.ready.set()
+        self.webhooks.put(None)
+
+    def _connect(self, host, port):
+        try:
+            connection = socket.create_connection((host, port))
+        except OSError as error:
+            raise RelayLost(f"cannot be connected to: {error}")
+        # The relay sends nothing while nothing happens, so a far end that
+        # vanished without closing the connection is found by the kernel's
+        # probes: the first after a minute of quiet, and the connection is
+        # given up after another minute of probes going unanswered. Linux
+        # and macOS name the first of these settings differently.
+        connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPALIVE", 60),
+                            ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 6)):
+            if hasattr(socket, name):
+                connection.setsockopt(socket.IPPROTO_TCP,
+                                      getattr(socket, name), value)
+        return connection
+
+    def close(self):
+        """End the connection, which ends the thread reading it."""
+        if self.connection is not None:
+            with contextlib.suppress(OSError):
+                self.connection.shutdown(socket.SHUT_RDWR)
+
+    def _read(self, stream):
+        while True:
+            size = stream.read(4)
+            if not size:
+                raise RelayLost("closed the connection")
+            length = int.from_bytes(size, "big")
+            if length > LONGEST_WEBHOOK:
+                raise RelayLost(f"sent a length of {length} bytes, which no "
+                                "webhook has")
+            packet = stream.read(length) if len(size) == 4 else b""
+            if len(size) < 4 or len(packet) < length:
+                raise RelayLost("closed the connection partway through a "
+                                "webhook")
+            try:
+                event, payload = webhook(packet)
+                repository = (payload.get("repository") or {}).get("id")
+            except Exception as error:
+                raise RelayLost("sent something that is not a GitHub "
+                                f"webhook: {error}")
+            wanted = self.repositories
+            if wanted is None or repository in wanted:
+                self.webhooks.put((event, payload))
+
+    def next(self, until):
+        """The next webhook's event and payload, or None if none comes by
+        `until`."""
+        try:
+            heard = self.webhooks.get(timeout=max(0.0, until - time.time()))
+        except queue.Empty:
+            return None
+        if heard is None:
+            raise RelayLost(self.lost)
+        return heard
+
+
+# ---------------------------------------------------------------------------
 # Working out which pull request is meant
 
 
@@ -929,6 +1139,75 @@ def duration(seconds):
 
 
 # ---------------------------------------------------------------------------
+# Items
+#
+# Each facet of the pull request is a dict of items, and each item is made
+# from the object GitHub gives for it, which is the same object whether a
+# read or a webhook brought it, but for the spelling of a review's state.
+
+
+def run_item(run):
+    return {"name": run["name"], "status": run["status"],
+            "conclusion": run.get("conclusion"), "url": run.get("html_url"),
+            "attempt": run.get("run_attempt", 1), "event": run.get("event")}
+
+
+def check_item(run):
+    return {"name": run["name"], "status": run["status"],
+            "conclusion": run.get("conclusion"), "url": run.get("html_url"),
+            "app": (run.get("app") or {}).get("slug")}
+
+
+def job_item(job):
+    return {"name": job["name"], "status": job["status"],
+            "conclusion": job.get("conclusion"), "url": job.get("html_url"),
+            "app": "github-actions"}
+
+
+def status_item(status):
+    return {"state": status["state"], "url": status.get("target_url"),
+            "updated": status.get("updated_at") or ""}
+
+
+def comment_item(comment):
+    return {"user": comment["user"]["login"], "updated": comment["updated_at"],
+            "url": comment["html_url"], "body": comment.get("body") or ""}
+
+
+def review_comment_item(comment):
+    return {**comment_item(comment), "path": comment.get("path"),
+            "line": comment.get("line") or comment.get("original_line"),
+            "reply_to": comment.get("in_reply_to_id")}
+
+
+def review_item(review):
+    # A webhook spells the state in lower case, and a read in upper case.
+    return {"user": review["user"]["login"] if review.get("user") else "?",
+            "state": review["state"].upper(),
+            "commit": review.get("commit_id") or "",
+            "url": review.get("html_url"), "body": review.get("body") or ""}
+
+
+# How far along a check, a job or a workflow run is, by its status, and a
+# review, by its state. A workflow run starts again with its next attempt,
+# and a check can be sent back to the queue by the app that made it.
+STAGES = {"in_progress": 1, "completed": 2, "DISMISSED": 1}
+
+
+def progress(item):
+    """Where an item stands, for telling which of two words about it is later.
+
+    GitHub does not promise to deliver webhooks in the order it sent them,
+    so one about an item can arrive after a later one about the same item.
+    The pull request carries the time it was last changed under a name of
+    its own.
+    """
+    return (item.get("attempt", 1),
+            STAGES.get(item.get("status") or item.get("state"), 0),
+            item.get("updated") or item.get("updated_at") or "")
+
+
+# ---------------------------------------------------------------------------
 # The snapshot
 #
 # One poll produces one Snapshot. Each field is filled in by its own request,
@@ -947,10 +1226,17 @@ class Snapshot:
         # facet -> what this token cannot see in it, for the facets that were
         # filled in by a route around a permission the token has not got.
         self.limits = {}
+        # The facets a read was attempted for.
+        self.read = set(self.FACETS)
 
 
-def read_snapshot(gh, owner, repo, number, head=None, runs=None):
-    """Read every facet of the pull request, recording each failure.
+def read_snapshot(gh, owner, repo, number, head=None, runs=None,
+                  facets=Snapshot.FACETS):
+    """Read `facets` of the pull request, recording each failure.
+
+    The checks are read with the runs, since they can be made from them.
+    The facets that belong to the head commit are read for the commit the
+    pull request names when it is read, and for `head` when it is not.
 
     `runs` are the workflow runs an earlier read listed for the commit
     `head`. GitHub now and then answers the list of a commit's runs with
@@ -960,27 +1246,28 @@ def read_snapshot(gh, owner, repo, number, head=None, runs=None):
     accepts whatever list GitHub gives.
     """
     snap = Snapshot()
+    snap.read = set()
     base = f"repos/{owner}/{repo}"
+    wanted = set(facets) | ({"runs"} if "checks" in facets else set())
 
     def attempt(facet, fetch):
+        if facet not in wanted:
+            return
+        snap.read.add(facet)
         try:
             setattr(snap, facet, fetch())
         except GitHubError as error:
             snap.errors[facet] = error
 
     attempt("pull", lambda: gh.get(f"{base}/pulls/{number}"))
-    sha = snap.pull["head"]["sha"] if snap.pull else None
+    if "pull" in wanted:
+        sha = snap.pull["head"]["sha"] if snap.pull else None
+    else:
+        sha = head
 
     def read_runs():
         listed = {
-            str(run["id"]): {
-                "name": run["name"],
-                "status": run["status"],
-                "conclusion": run.get("conclusion"),
-                "url": run.get("html_url"),
-                "attempt": run.get("run_attempt", 1),
-                "event": run.get("event"),
-            }
+            str(run["id"]): run_item(run)
             for run in gh.paged(f"{base}/actions/runs?head_sha={sha}",
                                 key="workflow_runs")
         }
@@ -1000,41 +1287,21 @@ def read_snapshot(gh, owner, repo, number, head=None, runs=None):
         # Reading that as a pending check would keep a green pull request from
         # ever settling, so an empty list is recorded as an empty dict.
         attempt("statuses", lambda: {
-            item["context"]: {"state": item["state"],
-                              "url": item.get("target_url")}
+            item["context"]: status_item(item)
             for item in gh.get(f"{base}/commits/{sha}/status").get("statuses",
                                                                   [])
         })
 
     attempt("issue_comments", lambda: {
-        str(c["id"]): {
-            "user": c["user"]["login"],
-            "updated": c["updated_at"],
-            "url": c["html_url"],
-            "body": c.get("body") or "",
-        }
+        str(c["id"]): comment_item(c)
         for c in gh.paged(f"{base}/issues/{number}/comments")
     })
     attempt("review_comments", lambda: {
-        str(c["id"]): {
-            "user": c["user"]["login"],
-            "updated": c["updated_at"],
-            "url": c["html_url"],
-            "body": c.get("body") or "",
-            "path": c.get("path"),
-            "line": c.get("line") or c.get("original_line"),
-            "reply_to": c.get("in_reply_to_id"),
-        }
+        str(c["id"]): review_comment_item(c)
         for c in gh.paged(f"{base}/pulls/{number}/comments")
     })
     attempt("reviews", lambda: {
-        str(r["id"]): {
-            "user": r["user"]["login"] if r.get("user") else "?",
-            "state": r["state"],
-            "commit": r.get("commit_id") or "",
-            "url": r.get("html_url"),
-            "body": r.get("body") or "",
-        }
+        str(r["id"]): review_item(r)
         for r in gh.paged(f"{base}/pulls/{number}/reviews")
     })
     attempt("threads", lambda: read_threads(gh, owner, repo, number))
@@ -1060,13 +1327,7 @@ def read_checks(gh, owner, repo, sha, snap):
     base = f"repos/{owner}/{repo}"
     try:
         return {
-            str(run["id"]): {
-                "name": run["name"],
-                "status": run["status"],
-                "conclusion": run.get("conclusion"),
-                "url": run.get("html_url"),
-                "app": (run.get("app") or {}).get("slug"),
-            }
+            str(run["id"]): check_item(run)
             for run in gh.paged(f"{base}/commits/{sha}/check-runs",
                                 key="check_runs")
         }
@@ -1103,13 +1364,7 @@ def jobs_as_checks(gh, base, runs):
     checks = {}
     for run in runs:
         for job in gh.paged(f"{base}/actions/runs/{run}/jobs", key="jobs"):
-            checks[f"job-{job['id']}"] = {
-                "name": job["name"],
-                "status": job["status"],
-                "conclusion": job.get("conclusion"),
-                "url": job.get("html_url"),
-                "app": "github-actions",
-            }
+            checks[f"job-{job['id']}"] = job_item(job)
     return checks
 
 
@@ -1238,6 +1493,16 @@ def read_threads(gh, owner, repo, number):
 # Counting
 
 
+def merge_answered(pull):
+    """Whether GitHub had worked out if the branch merges when it was read.
+
+    Watcher.check_merge_state says what GitHub answers when it had not.
+    """
+    state = pull.get("mergeable_state")
+    return bool(state) and state != "unknown" and \
+        pull.get("mergeable") is not None
+
+
 def tally_checks(checks):
     counts = {"ok": 0, "bad": 0, "skipped": 0, "cancelled": 0, "pending": 0}
     for check in (checks or {}).values():
@@ -1307,8 +1572,9 @@ ABOUT_THE_WATCH = {"WATCHING", "STATUS", "PROGRESS", "STALL", "WARN",
 
 
 class Watcher:
-    def __init__(self, gh, owner, repo, number, options):
+    def __init__(self, gh, owner, repo, number, options, relay=None):
         self.gh = gh
+        self.relay = relay
         self.owner = owner
         self.repo = repo
         # The owner and name the reads go to, which poll() replaces with the
@@ -1338,6 +1604,14 @@ class Watcher:
         self.stall_since = self.last_stall
         self.stall_interval = options.stall
         self.poll_interval = options.interval
+        self.last_read = time.time()
+        self.last_tick = time.time()    # the last read --stability counted
+        self.last_look = time.time()    # the last look at --expect's revision
+        self.wanted = set()             # facets a webhook could not describe
+        self.gone = set()               # (facet, key) of items deleted
+        self.doubted = set()            # facets a read went back on
+        self.announced = {}             # (facet, key) -> what a webhook said
+        self.connecting = None          # a Relay being connected to
         self.last_digest = None
         self.merge_state = None
         self.state_path = options.state and Path(options.state)
@@ -1441,8 +1715,8 @@ class Watcher:
 
     # -- one poll ----------------------------------------------------------
 
-    def poll(self):
-        """Read the pull request once.
+    def poll(self, facets=Snapshot.FACETS):
+        """Read the pull request once, or the `facets` of it given.
 
         A repository that has been renamed or moved to another owner still
         answers to its old name, but each request to the old name is first
@@ -1455,10 +1729,17 @@ class Watcher:
         # failed read of the runs, the list is taken as it stands.
         runs = None if self.failures.get("runs") else self.known.get("runs")
         snap = read_snapshot(self.gh, *self.location, self.number, self.head,
-                             runs)
-        self.gh.forget_unread()
+                             runs, facets)
+        if facets == Snapshot.FACETS:
+            self.gh.forget_unread()
+        else:
+            self.gh.keep_read()
         if snap.pull:
             self.location = snap.pull["base"]["repo"]["full_name"].split("/")
+            if self.relay is not None:
+                self.relay.repositories = {
+                    (side.get("repo") or {}).get("id")
+                    for side in (snap.pull["base"], snap.pull["head"])}
         self.report_errors(snap)
         return snap
 
@@ -1480,6 +1761,8 @@ class Watcher:
         what that route cannot see, once.
         """
         for facet in Snapshot.FACETS:
+            if facet not in snap.read:
+                continue
             error = snap.errors.get(facet)
             if error is None:
                 if facet in self.warned:
@@ -1593,7 +1876,7 @@ class Watcher:
             self.merge_state = None
             return
         state = pull.get("mergeable_state")
-        if not state or state == "unknown" or pull.get("mergeable") is None:
+        if not merge_answered(pull):
             return
         was, self.merge_state = self.merge_state, state
         if was is None or state == was or not announce:
@@ -2148,6 +2431,7 @@ class Watcher:
         while True:
             snap = self.poll()
             if snap.pull is not None:
+                self.last_read = time.time()
                 return snap
             error = snap.errors.get("pull")
             if not (error and self.wait_out(error)):
@@ -2173,10 +2457,13 @@ class Watcher:
             return self.conclude(reason, settled)
         self.save_state()
 
+        fresh = True
         while True:
             settled, reason = self.is_settled()
             if settled:
-                self.settled_polls += 1
+                if fresh or not self.settled_polls:
+                    self.settled_polls += 1
+                    self.last_tick = time.time()
                 if self.settled_polls >= self.options.stability:
                     verdict = self.overall()
                     if self.options.once:
@@ -2200,10 +2487,7 @@ class Watcher:
                 if self.options.once and self.changed:
                     return self.conclude(reason, settled=False)
             self.heartbeat(reason)
-            self.sleep()
-            snap = self.poll()
-            self.absorb(snap)
-            self.save_state()
+            fresh = self.step(settled)
 
     def interval_max(self):
         """The longest the wait between polls may grow to.
@@ -2219,15 +2503,17 @@ class Watcher:
         left = 1.0 if self.gh.quota_left is None else self.gh.quota_left
         return max(self.options.interval, 30 + 270 * (1 - left))
 
-    def sleep(self):
+    def sleep(self, delay=None):
         """Wait until the next poll, and past a throttle when there is one.
 
-        The wait is the one heartbeat() worked out: --interval while
-        anything is happening, and longer while nothing is. It is never
-        shorter than five seconds, whatever --interval says. A wait that
-        would reach the end of --for ends the watch there instead.
+        The wait is `delay` when it is given. Otherwise it is the one
+        heartbeat() worked out: --interval while anything is happening, and
+        longer while nothing is, and never shorter than five seconds,
+        whatever --interval says. A wait that would reach the end of --for
+        ends the watch there instead.
         """
-        delay = max(5.0, self.poll_interval)
+        delay = max(5.0, self.poll_interval) if delay is None else \
+            max(0.0, delay)
         wait_out = self.gh.rate_limited_until - time.time()
         if wait_out > 0:
             self.emit("WARN", f"rate limited; waiting {duration(wait_out)}")
@@ -2236,6 +2522,289 @@ class Watcher:
             time.sleep(max(0.0, self.ends_at - time.time()))
             raise TimeUp()
         time.sleep(delay)
+
+    def step(self, settled):
+        """Wait, and bring the picture of the pull request up to date.
+
+        Without a webhook relay, that is a poll after the wait between
+        polls. With one, see listen(). A relay that is lost may have dropped
+        any number of webhooks, so everything is read at once, and the
+        watch polls until the relay can be connected to again.
+
+        True when the step counts towards the --stability a verdict waits
+        for: a poll, or a quiet --interval.
+        """
+        if self.relay is not None:
+            try:
+                return self.listen(settled)
+            except RelayLost as lost:
+                self.relay.close()
+                self.relay = None
+                self.doubted.clear()
+                self.announced.clear()
+                self.emit("WARN", f"{lost}; polling until it can be "
+                                  "reached again")
+                self.reconnect()
+        else:
+            self.sleep()
+            self.reconnect()
+        self.read(Snapshot.FACETS)
+        return True
+
+    def reconnect(self):
+        """Listen to the webhook relay again, once it answers.
+
+        Each attempt connects on a thread of its own, and is taken up at the
+        poll after it succeeds, before that poll's read, so that nothing
+        happens between the two that neither of them hears about. One that
+        fails is followed by another.
+        """
+        attempt = self.connecting
+        if attempt is not None and attempt.ready.is_set():
+            self.connecting = None
+            if attempt.lost is None:
+                self.relay = attempt
+                self.emit("WARN", f"the webhook relay at {attempt.address} "
+                                  "can be reached again; listening from "
+                                  "here on")
+                return
+        address = self.options.github_webhook_relay
+        if self.connecting is None and address is not None:
+            self.connecting = Relay(address)
+
+    def read(self, facets):
+        self.wanted -= set(facets)
+        snap = self.poll(facets)
+        if self.relay is not None:
+            self.doubt(snap)
+        self.absorb(snap)
+        self.save_state()
+        self.last_read = time.time()
+
+    def doubt(self, snap):
+        """Believe a read that goes back on a webhook only once it is read
+        twice.
+
+        A read can answer from before a change whose webhook has already
+        been heard. Taken as it stands, it would put the earlier state back
+        and report that as news, and no webhook would come to undo it. So an
+        item a read gives as earlier than the one held, or a deleted item a
+        read still gives, is kept as held, and the facet is read again
+        --interval later. So is a facet whose read leaves out an item a
+        webhook announced, or says other than the webhook did about it. A
+        second read that says the same is believed: an app can send its
+        check back to the queue, and a read is the only word on that.
+        """
+        for facet in Snapshot.FACETS:
+            fresh, held = getattr(snap, facet), self.known.get(facet)
+            if fresh is None or held is None:
+                continue
+            fresh_items = {"": fresh} if facet == "pull" else fresh
+            held_items = {"": held} if facet == "pull" else held
+            behind = {key for key, item in fresh_items.items()
+                      if (facet, key) in self.gone or key in held_items and
+                      progress(item) < progress(held_items[key])}
+            announced = {key: said for (place, key), said
+                         in self.announced.items() if place == facet}
+            unheard = any(key not in fresh_items or any(
+                fresh_items[key].get(name) != value
+                for name, value in said.items())
+                for key, said in announced.items())
+            if not (behind or unheard) or facet in self.doubted:
+                self.doubted.discard(facet)
+                self.gone -= {(facet, key) for key in behind}
+                for key in announced:
+                    del self.announced[facet, key]
+                continue
+            self.doubted.add(facet)
+            self.wanted.add(facet)
+            if facet == "pull":
+                snap.pull = held
+                continue
+            kept = dict(fresh)
+            for key in behind:
+                kept.pop(key)
+                if key in held:
+                    kept[key] = held[key]
+            setattr(snap, facet, kept)
+
+    def listen(self, settled):
+        """Wait for webhooks, and bring the picture up to date with them.
+
+        Webhooks are not dropped while the relay is connected, so between
+        them nothing is read except what no webhook can describe; see
+        needs_reading(). That is read every --interval until it has been
+        read. The --stability a verdict waits for is measured in quiet
+        --intervals rather than in reads, and with --expect naming a
+        revision, the working tree is looked at every --interval, since
+        nothing announces a commit made there.
+        """
+        interval = max(5.0, self.options.interval)
+        now = time.time()
+        ticking = settled and self.settled_polls < self.options.stability
+        times = [self.last_stall + self.stall_interval]
+        if self.needs_reading():
+            times.append(self.last_read + interval)
+        if ticking:
+            times.append(self.last_tick + interval)
+        if self.expect_revision:
+            times.append(self.last_look + interval)
+        grace = self.head_since + self.options.no_ci_grace
+        if not self.known.get("runs") and grace > now:
+            times.append(grace)
+        if self.ends_at is not None:
+            times.append(self.ends_at)
+        heard = self.relay.next(min(times))
+        while heard:
+            try:
+                self.wanted |= self.hear(*heard)
+            except Exception as error:
+                raise RelayLost(f"the webhook relay at {self.relay.address} "
+                                f"sent a {heard[0]} webhook that does not "
+                                f"read as one: {error!r}")
+            heard = self.relay.next(time.time())
+        self.save_state()
+        now = time.time()
+        if self.ends_at is not None and now >= self.ends_at:
+            raise TimeUp()
+        if self.expect_revision and now >= self.last_look + interval:
+            self.last_look = now
+            self.check_expectation(announce=True)
+        facets = self.needs_reading()
+        if facets and now >= self.last_read + interval:
+            self.read(tuple(f for f in Snapshot.FACETS if f in facets))
+        return ticking and now >= self.last_tick + interval
+
+    def needs_reading(self):
+        """The facets only a read can bring up to date.
+
+        Those are the facets a webhook said had changed without saying how,
+        the facets never read or whose last read failed, and the pull request
+        while GitHub has not said whether its branch merges, since GitHub
+        sends nothing when it has worked that out.
+        """
+        facets = self.wanted | {
+            facet for facet in Snapshot.FACETS if facet not in self.refused
+            and (self.failures.get(facet) or self.known.get(facet) is None)}
+        pull = self.known.get("pull") or {}
+        if pull.get("state") == "open" and not merge_answered(pull):
+            facets.add("pull")
+        return facets
+
+    def hear(self, event, payload):
+        """Bring the picture up to date with what a webhook says.
+
+        A webhook carries the object a read would give for the item it is
+        about, so the item is put in place and the change is reported as a
+        read would report it. put() says what becomes of a webhook about an
+        item earlier than the one held, which arrived after a later one.
+
+        Returns the facets the webhook says have changed without describing
+        them, for reading. A push to either branch changes whether the pull
+        request merges, which GitHub works out afterwards. A new head moves
+        the lines of inline comments and threads. A review thread is known
+        by an id that only a read of the threads gives, and its webhooks
+        carry nothing to put two of them in order. A check, a job or a
+        workflow run not held may be a later attempt of one that is. And
+        where this token may not read the checks, a check an app registered
+        is one of those counted but not named.
+        """
+        pull = self.known.get("pull") or {}
+        base, head = pull.get("base") or {}, pull.get("head") or {}
+
+        def branch(side):
+            return ((side.get("repo") or {}).get("id"),
+                    f"refs/heads/{side.get('ref')}")
+
+        def field(key, name):
+            return (payload.get(key) or {}).get(name)
+
+        if event == "push":
+            pushed = (field("repository", "id"), payload.get("ref"))
+            return {"pull"} if pushed in (branch(base), branch(head)) else set()
+        if field("repository", "id") != branch(base)[0]:
+            return set()
+        snap, reads = Snapshot(), set()
+
+        def put(facet, key, item, new=True):
+            """Put `item` in place in `facet`, or with None take it out.
+
+            With `new` false, an item not held is read for instead. A check
+            run again is a new check, and a read gives only the newest of a
+            check's attempts, so the one it replaces goes. An item earlier
+            than the one held was overtaken when GitHub stamped both with
+            the time they changed, and is passed over. Otherwise it is read
+            for, since either the webhook was overtaken or the item has gone
+            back, and only a read says which.
+            """
+            held = self.known.get(facet)
+            if held is None or not (new or key in held):
+                self.announced[facet, key] = {}
+                reads.add(facet)
+                return
+            if item and (facet, key) in self.gone:
+                return
+            if item and key in held and progress(item) < progress(held[key]):
+                if not item.get("updated"):
+                    reads.add(facet)
+                return
+            if not item:
+                self.gone.add((facet, key))
+            value = dict(getattr(snap, facet) or held)
+            value.pop(key, None)
+            if item:
+                value[key] = item
+            setattr(snap, facet, value)
+
+        action = payload.get("action")
+        number = field("pull_request", "number") or field("issue", "number")
+        commit = payload.get("sha") or field(event, "head_sha")
+        if number == self.number:
+            if event == "pull_request":
+                fresh = payload["pull_request"]
+                if progress(fresh) >= progress(pull):
+                    snap.pull = fresh
+                    if fresh["head"]["sha"] != self.head:
+                        # Inline comments and threads move with the head.
+                        reads |= {"review_comments", "threads"}
+            elif event == "issue_comment":
+                comment = payload["comment"]
+                put("issue_comments", str(comment["id"]),
+                    action != "deleted" and comment_item(comment))
+            elif event == "pull_request_review_comment":
+                comment = payload["comment"]
+                put("review_comments", str(comment["id"]),
+                    action != "deleted" and review_comment_item(comment))
+                if comment.get("in_reply_to_id") is None and \
+                        action != "edited":
+                    reads.add("threads")
+            elif event == "pull_request_review":
+                review = payload["review"]
+                put("reviews", str(review["id"]), review_item(review))
+            elif event == "pull_request_review_thread":
+                # Nothing in a thread's webhook says which of two came first.
+                self.announced["threads", field("thread", "node_id")] = {
+                    "resolved": action == "resolved"}
+                reads.add("threads")
+        elif commit and commit == self.head:
+            item = payload.get(event) or {}
+            if event == "workflow_run":
+                put("runs", str(item["id"]), run_item(item), new=False)
+            elif event == "status":
+                put("statuses", payload["context"], status_item(payload))
+            elif "checks" in self.limited:
+                # The checks are the jobs of each workflow run, and every
+                # other check on the commit is counted but not named.
+                if event == "workflow_job":
+                    put("checks", f"job-{item['id']}", job_item(item),
+                        new=False)
+                elif event == "check_run" and \
+                        (item.get("app") or {}).get("slug") != "github-actions":
+                    reads.add("checks")
+            elif event == "check_run":
+                put("checks", str(item["id"]), check_item(item), new=False)
+        self.absorb(snap)
+        return reads
 
     def resolve_expectation(self):
         """Work out what --expect names, and prove GitHub has it.
@@ -2399,6 +2968,10 @@ def main(argv):
                         metavar="SECONDS",
                         help="end the watch at the first wait that would run "
                              "past this long, with a STOPPED line")
+    parser.add_argument("--github-webhook-relay", metavar="HOST:PORT",
+                        help="read the pull request when the relay at "
+                             "this address passes on a GitHub webhook about "
+                             "it, rather than polling")
     parser.add_argument("--interval", type=float, metavar="SECONDS",
                         help="seconds between polls while anything is "
                              "happening (default 30 when reading as a "
@@ -2486,7 +3059,15 @@ def main(argv):
     hostname, owner, repo, number = resolve_target(options.pr, options.repo)
     token = app and AppToken(hostname, *app, f"{owner}/{repo}")
     gh = GitHub(hostname, token)
-    watcher = Watcher(gh, owner, repo, number, options)
+    # The relay is connected to before anything is read, so that a change
+    # made while the first reading is under way is still heard about.
+    relay = None
+    if options.github_webhook_relay and not options.status:
+        relay = Relay(options.github_webhook_relay)
+        relay.ready.wait()
+        if relay.lost:
+            raise SystemExit(f"prwatch: {relay.lost}")
+    watcher = Watcher(gh, owner, repo, number, options, relay)
     report_signals(signal.SIGTERM, signal.SIGHUP)
     try:
         verdict = watcher.run()

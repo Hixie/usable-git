@@ -238,6 +238,10 @@ git config --global rerere.enabled true
   the agent will not be handed a green result on a commit that reviewer
   never reached.
 
+  Add `--github-webhook-relay HOST:PORT` where a relay passes on GitHub's
+  webhooks over the network, and the watch takes each change from the
+  webhook that announces it, rather than polling for changes.
+
   `prwatch --help` is the full reference, for you or for an agent that
   goes looking: every option, what each event tag and each verdict
   means, how the script behaves when GitHub stops answering, and what

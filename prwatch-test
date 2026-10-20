@@ -17,9 +17,13 @@ import importlib.util
 import io
 import json
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
+import time
+import urllib.parse
 from datetime import datetime, timezone
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
@@ -43,7 +47,7 @@ class Options:
                         no_ci_grace=900, warn_after=3, max_lines=12,
                         detail=True, fresh=True, state=None, exit_code=False,
                         require_review=None, excerpt=300,
-                        for_seconds=None)
+                        for_seconds=None, github_webhook_relay=None)
         defaults.update(overrides)
         self.__dict__.update(defaults)
 
@@ -91,9 +95,11 @@ def pull(head="a" * 40, state="open", merged=False, mergeable="clean"):
     if state != "open":
         mergeable = "unknown"
     answered = None if mergeable == "unknown" else mergeable != "dirty"
-    return {"head": {"sha": head}, "state": state, "merged": merged,
+    return {"head": {"sha": head, "ref": "feature", "repo": {"id": 7}},
+            "state": state, "merged": merged,
             "mergeable_state": mergeable, "title": "t", "draft": False,
-            "mergeable": answered,
+            "mergeable": answered, "number": 1,
+            "base": {"ref": "main", "repo": {"id": 7, "full_name": "o/r"}},
             "html_url": "https://example.invalid/pull/1"}
 
 
@@ -1544,7 +1550,7 @@ def the_watch_loop_waits_longer_as_it_finds_nothing():
                         stability=1, follow=True, detail=False,
                         state=str(Path(directory) / "state.json")))
 
-            def poll():
+            def poll(facets=prwatch.Snapshot.FACETS):
                 polls.append(clock.now)
                 if len(polls) > 8:
                     raise Enough()
@@ -1633,14 +1639,16 @@ class RanOut(Exception):
 
 
 def reading(head="a" * 40, run="completed", conclusion="success",
-            comments=None, state="open", merged=False, lint=None):
+            comments=None, state="open", merged=False, lint=None,
+            mergeable="clean"):
     """One poll of a pull request with one workflow run and one check.
 
     A `lint` of "queued" or "success" adds a second check in that state.
     """
     finished = conclusion if run == "completed" else None
     snap = prwatch.Snapshot()
-    snap.pull = pull(head=head, state=state, merged=merged)
+    snap.pull = pull(head=head, state=state, merged=merged,
+                     mergeable=mergeable)
     snap.checks = check_run("Test", status=run, conclusion=finished)
     if lint:
         snap.checks.update(check_run(
@@ -1671,7 +1679,7 @@ def process(state, readings, **options):
                               Options(fresh=False, state=state, **options))
     watcher.local_commit = lambda: "a" * 40
 
-    def poll():
+    def poll(facets=prwatch.Snapshot.FACETS):
         if len(polls) == len(readings):
             raise RanOut()
         polls.append(clock.now)
@@ -2048,7 +2056,7 @@ def the_defaults_follow_whose_token_it_reads_with():
     class Parsed(Exception):
         pass
 
-    def capture(gh, owner, repo, number, options):
+    def capture(gh, owner, repo, number, options, relay):
         raise Parsed(gh, options)
 
     app = {"PRWATCH_GITHUB_APP_ID": "123", "PRWATCH_GITHUB_APP_KEY": "~/k.pem"}
@@ -2456,7 +2464,7 @@ def reads_go_to_the_name_the_repository_has_now():
     """
     asked = []
 
-    def read_snapshot(gh, owner, repo, number, head, runs):
+    def read_snapshot(gh, owner, repo, number, head, runs, facets):
         asked.append(f"{owner}/{repo}")
         snap = prwatch.Snapshot()
         if len(asked) != 3:
@@ -2529,6 +2537,800 @@ def wait_to_be_killed(self):
 prwatch.Watcher.run = wait_to_be_killed
 sys.exit(prwatch.main([]))
 """
+
+# -- listening to a webhook relay ------------------------------------------
+
+def delivery(payload, event="ping", form=False):
+    """One webhook as the relay sends it: its length, then GitHub's request."""
+    body = json.dumps(payload).encode()
+    kind = "application/json"
+    if form:
+        body = urllib.parse.urlencode({"payload": body}).encode()
+        kind = "application/x-www-form-urlencoded"
+    request = (f"POST /webhook HTTP/1.1\r\nHost: relay\r\n"
+               f"Content-Type: {kind}\r\nContent-Length: {len(body)}\r\n"
+               f"X-GitHub-Event: {event}\r\n\r\n").encode() + body
+    return len(request).to_bytes(4, "big") + request
+
+
+def relay_receiving(*chunks, repositories=None):
+    """A Relay reading `chunks` from a connection that then closes."""
+    ours, theirs = socket.socketpair()
+    relay = prwatch.Relay("relay:1", ours)
+    relay.repositories = repositories
+    for chunk in chunks:
+        theirs.sendall(chunk)
+    theirs.close()
+    return relay
+
+
+def hear(relay):
+    """The next webhook, or the reason the relay was lost."""
+    try:
+        return relay.next(time.time() + 3600)
+    except prwatch.RelayLost as lost:
+        return str(lost)
+
+
+@case
+def webhooks_are_read_from_the_relay():
+    """Each webhook is a length and a request, in either encoding GitHub uses.
+
+    Once the watch names its repositories, webhooks from others are dropped.
+    """
+    check = {"repository": {"id": 7}, "check_run": {"head_sha": "a" * 40}}
+    comment = {"repository": {"id": 7}, "issue": {"number": 5}}
+    elsewhere = {"repository": {"id": 8}, "ref": "refs/heads/main"}
+    everything = relay_receiving(delivery(check, "check_run"),
+                                 delivery(comment, "issue_comment", form=True),
+                                 delivery(elsewhere, "push"))
+    heard = [hear(everything) for _ in range(4)]
+    ours = relay_receiving(delivery(elsewhere, "push"),
+                           delivery(check, "check_run"), repositories={7})
+    filtered = [hear(ours) for _ in range(2)]
+    end = "the webhook relay at relay:1 closed the connection"
+    problems = []
+    if heard != [("check_run", check), ("issue_comment", comment),
+                 ("push", elsewhere), end]:
+        problems.append(f"it heard {heard}")
+    if filtered != [("check_run", check), end]:
+        problems.append(f"with one repository named, it heard {filtered}")
+    return report("webhooks are read from the relay, and so is its end",
+                  problems, "")
+
+
+@case
+def a_relay_that_stops_making_sense_is_lost():
+    """Anything after a frame that cannot be read is unreadable too."""
+    good = delivery({"repository": {"id": 7}})
+    # A frame cut short is the last thing on its connection, and the others
+    # are followed by a webhook that could otherwise have been read.
+    endings = {
+        "a body that is not JSON":
+            ([b"\0\0\0\x05hello", good], "not a GitHub webhook"),
+        "a payload that is not an object":
+            ([delivery([1, 2]), good], "not a GitHub webhook"),
+        "a repository that is not an object":
+            ([delivery({"repository": 5}), good], "not a GitHub webhook"),
+        "a length no webhook has":
+            ([b"\xff\xff\xff\xff", good], "which no webhook has"),
+        "a frame cut short": ([good[:-3]], "partway through a webhook"),
+        "a length cut short": ([good[:2]], "partway through a webhook"),
+    }
+    problems = []
+    for name, (chunks, wanted) in endings.items():
+        relay = relay_receiving(good, *chunks)
+        first, then = hear(relay), hear(relay)
+        if first != ("ping", {"repository": {"id": 7}}):
+            problems.append(f"the webhook before {name} was heard as {first}")
+        if not isinstance(then, str) or wanted not in then:
+            problems.append(f"{name} was heard as {then!r}")
+    return report("a frame that cannot be read loses the relay", problems, "")
+
+
+def gh_comment(cid=1, body="hello", updated="2026-09-20T10:00:00Z",
+               path=None, reply_to=None):
+    """A comment as GitHub sends it, inline when it has a path."""
+    comment = {"id": cid, "user": {"login": "someone"}, "updated_at": updated,
+               "html_url": "u", "body": body}
+    if path:
+        comment.update(path=path, line=1, in_reply_to_id=reply_to)
+    return comment
+
+
+def gh_check(cid=9, status="completed", conclusion="failure", sha="a" * 40,
+             app="a-bot"):
+    return {"id": cid, "name": "Bot", "status": status,
+            "conclusion": conclusion, "html_url": "u", "app": {"slug": app},
+            "head_sha": sha}
+
+
+def webhook_for(repository=7, **fields):
+    return {"repository": {"id": repository}, **fields}
+
+
+def heard_by(watcher, event, payload):
+    """What a watcher says when it hears one webhook, and what it reads."""
+    out = io.StringIO()
+    with redirect_stdout(out):
+        reads = watcher.hear(event, payload)
+    return out.getvalue(), reads
+
+
+@case
+def a_webhook_says_what_a_read_would():
+    """Each kind of webhook is reported as the read it stands in for."""
+    on_it = {"number": 1}
+    cases = [
+        ("a comment", "issue_comment",
+         webhook_for(issue=on_it, action="created", comment=gh_comment()),
+         "COMMENT", set()),
+        ("a comment on another pull request", "issue_comment",
+         webhook_for(issue={"number": 2}, action="created",
+                     comment=gh_comment()), None, set()),
+        ("a comment on the same number elsewhere", "issue_comment",
+         webhook_for(8, issue=on_it, action="created", comment=gh_comment()),
+         None, set()),
+        ("an inline comment that opens a thread",
+         "pull_request_review_comment",
+         webhook_for(pull_request=on_it, action="created",
+                     comment=gh_comment(2, path="f.py")),
+         "INLINE", {"threads"}),
+        ("a reply to an inline comment", "pull_request_review_comment",
+         webhook_for(pull_request=on_it, action="created",
+                     comment=gh_comment(3, path="f.py", reply_to=2)),
+         "INLINE", set()),
+        ("a review", "pull_request_review",
+         webhook_for(pull_request=on_it, action="submitted",
+                     review={"id": 5, "user": {"login": "r"},
+                             "state": "approved", "commit_id": "a" * 40,
+                             "html_url": "u", "body": "ship it"}),
+         "r APPROVED", set()),
+        ("a thread resolved", "pull_request_review_thread",
+         webhook_for(pull_request=on_it, action="resolved",
+                     thread={"node_id": "t1"}), None, {"threads"}),
+        ("a check failing on the head", "check_run",
+         webhook_for(action="completed", check_run=gh_check()), "FAIL",
+         set()),
+        ("a check not seen before, perhaps one run again", "check_run",
+         webhook_for(action="created", check_run=gh_check(
+             cid=10, status="queued", conclusion=None)), None, {"checks"}),
+        ("a check failing on another commit", "check_run",
+         webhook_for(action="completed", check_run=gh_check(sha="b" * 40)),
+         None, set()),
+        ("a workflow run finishing", "workflow_run",
+         webhook_for(action="completed",
+                     workflow_run={"id": 1, "name": "CI", "status": "completed",
+                                   "conclusion": "failure", "html_url": "u",
+                                   "run_attempt": 1, "head_sha": "a" * 40}),
+         "RUN", set()),
+        ("a commit status failing", "status",
+         webhook_for(sha="a" * 40, context="ext", state="failure",
+                     target_url="u", updated_at="2026-09-20T10:00:00Z"),
+         "FAIL", set()),
+        ("the pull request merging", "pull_request",
+         webhook_for(pull_request={**pull(state="closed", merged=True)},
+                     action="closed"), "MERGED", set()),
+        ("a push to the branch it merges into", "push",
+         webhook_for(ref="refs/heads/main"), None, {"pull"}),
+        ("a push to its own branch", "push",
+         webhook_for(ref="refs/heads/feature"), None, {"pull"}),
+        ("a push to another branch", "push",
+         webhook_for(ref="refs/heads/other"), None, set()),
+        ("a push to a branch of the same name elsewhere", "push",
+         webhook_for(8, ref="refs/heads/feature"), None, set()),
+    ]
+    problems = []
+    for name, event, payload, tag, reads in cases:
+        watcher = quiet_watcher(Options())
+        watcher.known["threads"] = thread()
+        watcher.known["checks"]["9"] = prwatch.check_item(
+            gh_check(status="in_progress", conclusion=None))
+        said, asked = heard_by(watcher, event, payload)
+        if tag and tag not in said or not tag and said:
+            problems.append(f"{name} said {said.strip()!r}")
+        if asked != reads:
+            problems.append(f"{name} asked to read {asked}")
+    return report("a webhook says what a read would, and only about this one",
+                  problems, "")
+
+
+@case
+def a_webhook_that_was_overtaken_is_read_for():
+    """An older word about an item never replaces a newer one.
+
+    An item GitHub stamped as changed earlier than the one held is passed
+    over. An item ordered only by how far along it is, such as a check, is
+    read for, since only a read can say whether the webhook was overtaken or
+    the item went back. A deleted comment stays deleted.
+    """
+    watcher = quiet_watcher(Options())
+    watcher.known["issue_comments"] = {"1": prwatch.comment_item(
+        gh_comment(updated="2026-09-20T11:00:00Z", body="second thoughts"))}
+    watcher.known["checks"]["9"] = prwatch.check_item(
+        gh_check(status="in_progress", conclusion=None))
+    old_edit, old_reads = heard_by(watcher, "issue_comment", webhook_for(
+        issue={"number": 1}, action="edited",
+        comment=gh_comment(updated="2026-09-20T10:00:00Z", body="first")))
+    new_edit, _ = heard_by(watcher, "issue_comment", webhook_for(
+        issue={"number": 1}, action="edited",
+        comment=gh_comment(updated="2026-09-20T12:00:00Z", body="third")))
+    heard_by(watcher, "check_run", webhook_for(check_run=gh_check(
+        status="completed", conclusion="success")))
+    late, late_reads = heard_by(watcher, "check_run", webhook_for(
+        check_run=gh_check(status="in_progress", conclusion=None)))
+    gone, _ = heard_by(watcher, "issue_comment", webhook_for(
+        issue={"number": 1}, action="deleted", comment=gh_comment()))
+    back, _ = heard_by(watcher, "issue_comment", webhook_for(
+        issue={"number": 1}, action="edited",
+        comment=gh_comment(updated="2026-09-20T13:00:00Z", body="fourth")))
+    watcher.known["pull"] = {**pull(), "updated_at": "2026-09-20T12:00:00Z"}
+    stale_merge, stale_reads = heard_by(watcher, "pull_request", webhook_for(
+        action="closed", pull_request={**pull(state="closed", merged=True),
+                                       "updated_at": "2026-09-20T11:00:00Z"}))
+    merge, _ = heard_by(watcher, "pull_request", webhook_for(
+        action="closed", pull_request={**pull(state="closed", merged=True),
+                                       "updated_at": "2026-09-20T13:00:00Z"}))
+    problems = []
+    if old_edit or old_reads:
+        problems.append(f"an overtaken edit said {old_edit.strip()!r} and "
+                        f"read {old_reads}")
+    if "edited" not in new_edit:
+        problems.append(f"a newer edit said {new_edit.strip()!r}")
+    if late or late_reads != {"checks"} or \
+            watcher.known["checks"]["9"]["status"] != "completed":
+        problems.append(f"a late start said {late.strip()!r}, read "
+                        f"{late_reads}, and left the check "
+                        f"{watcher.known['checks']['9']['status']}")
+    if gone or back or "1" in watcher.known["issue_comments"]:
+        problems.append("a deleted comment came back")
+    if stale_merge or stale_reads or "MERGED" not in merge:
+        problems.append(f"an overtaken pull request said "
+                        f"{stale_merge.strip()!r}, and a newer one said "
+                        f"{merge.strip()!r}")
+    return report("a webhook that was overtaken is read for", problems, "")
+
+
+@case
+def a_read_that_goes_back_on_a_webhook_is_read_twice():
+    """A read can answer from before a change already heard of."""
+    watcher = quiet_watcher(Options())
+    watcher.relay = object()
+    newer = prwatch.comment_item(gh_comment(updated="2026-09-20T12:00:00Z",
+                                            body="newer"))
+    older = prwatch.comment_item(gh_comment(updated="2026-09-20T11:00:00Z",
+                                            body="older"))
+    watcher.known["issue_comments"] = {"1": newer}
+    watcher.known["pull"] = {**pull(state="closed", merged=True),
+                             "updated_at": "2026-09-20T12:00:00Z"}
+    watcher.gone.add(("review_comments", "7"))
+    watcher.known["review_comments"] = {}
+
+    def lagging():
+        snap = prwatch.Snapshot()
+        snap.issue_comments = {"1": older}
+        snap.pull = {**pull(), "updated_at": "2026-09-20T11:00:00Z"}
+        snap.review_comments = {"7": older}
+        return snap
+
+    first = lagging()
+    watcher.doubt(first)
+    doubted = (first.issue_comments["1"]["body"], first.pull["state"],
+               sorted(first.review_comments), sorted(watcher.wanted))
+    second = lagging()
+    watcher.doubt(second)
+    believed = (second.issue_comments["1"]["body"], second.pull["state"],
+                sorted(second.review_comments), sorted(watcher.doubted))
+    problems = []
+    if doubted != ("newer", "closed", [], ["issue_comments", "pull",
+                                           "review_comments"]):
+        problems.append(f"the first read was taken as {doubted}")
+    if believed != ("older", "open", ["7"], []):
+        problems.append(f"the second read was taken as {believed}")
+    return report("a read that goes back on a webhook is believed when read "
+                  "twice", problems, "")
+
+
+@case
+def a_read_that_misses_what_a_webhook_announced_is_read_again():
+    """A thread resolved, or a check first heard of, that a read has not
+    caught up with, is read for again rather than lost."""
+    watcher = quiet_watcher(Options())
+    watcher.relay = object()
+    watcher.known["threads"] = thread()
+    heard_by(watcher, "pull_request_review_thread", webhook_for(
+        pull_request={"number": 1}, action="resolved",
+        thread={"node_id": "t1"}))
+    heard_by(watcher, "check_run", webhook_for(check_run=gh_check(
+        cid=10, status="queued", conclusion=None)))
+
+    def lagging():
+        snap = prwatch.Snapshot()
+        snap.threads = thread()
+        snap.checks = dict(watcher.known["checks"])
+        return snap
+
+    first = lagging()
+    watcher.doubt(first)
+    doubted = sorted(watcher.wanted & {"threads", "checks"})
+    caught_up = prwatch.Snapshot()
+    caught_up.threads = thread(resolved=True)
+    caught_up.checks = {**watcher.known["checks"], "10": prwatch.check_item(
+        gh_check(cid=10, status="queued", conclusion=None))}
+    watcher.wanted.clear()
+    watcher.doubt(caught_up)
+    problems = []
+    if doubted != ["checks", "threads"]:
+        problems.append(f"a read that missed both was doubted for {doubted}")
+    if watcher.announced or watcher.doubted or watcher.wanted:
+        problems.append(f"a read that caught up left {watcher.announced}, "
+                        f"{watcher.doubted} and {watcher.wanted}")
+    return report("a read that misses what a webhook announced is read again",
+                  problems, "")
+
+
+@case
+def what_a_webhook_cannot_describe_is_read():
+    """A new head, a facet never read, and checks only counted are read for."""
+    moved = quiet_watcher(Options())
+    said, moved_reads = heard_by(moved, "pull_request", webhook_for(
+        action="synchronize", pull_request=pull(head="b" * 40)))
+    after_push = moved.needs_reading() | moved_reads
+    unread = quiet_watcher(Options())
+    unread.known["reviews"] = None
+    _, review_reads = heard_by(unread, "pull_request_review", webhook_for(
+        pull_request={"number": 1}, action="submitted",
+        review={"id": 5, "user": {"login": "r"}, "state": "APPROVED",
+                "commit_id": "a" * 40, "html_url": "u", "body": ""}))
+    counted = quiet_watcher(Options())
+    counted.limited["checks"] = "only counted"
+    gh_job = {"id": 4, "name": "Test", "status": "in_progress",
+              "conclusion": None, "html_url": "u", "head_sha": "a" * 40}
+    counted.known["checks"]["job-4"] = prwatch.job_item(gh_job)
+    job, _ = heard_by(counted, "workflow_job", webhook_for(workflow_job={
+        **gh_job, "status": "completed", "conclusion": "failure"}))
+    _, new_job_reads = heard_by(counted, "workflow_job", webhook_for(
+        workflow_job={**gh_job, "id": 5}))
+    _, actions_reads = heard_by(counted, "check_run", webhook_for(
+        check_run=gh_check(app="github-actions")))
+    _, bot_reads = heard_by(counted, "check_run", webhook_for(
+        check_run=gh_check()))
+    quiet = quiet_watcher(Options())
+    failed = quiet_watcher(Options())
+    failed.failures["threads"] = 1
+    refused = quiet_watcher(Options())
+    refused.failures["threads"] = 1
+    refused.refused.add("threads")
+    unmerged = quiet_watcher(Options())
+    unmerged.known["pull"] = pull(mergeable="unknown")
+    problems = []
+    if "RETARGET" not in said or after_push != {
+            "checks", "runs", "statuses", "review_comments", "threads"}:
+        problems.append(f"a new head said {said.strip()!r} and read "
+                        f"{after_push}")
+    if review_reads != {"reviews"}:
+        problems.append(f"a review with none read before read {review_reads}")
+    if "FAIL" not in job or new_job_reads != {"checks"} or actions_reads \
+            or bot_reads != {"checks"}:
+        problems.append(f"with the checks only counted, a job said "
+                        f"{job.strip()!r}, a new job read {new_job_reads}, "
+                        f"an Actions check read {actions_reads}, and a "
+                        f"bot's read {bot_reads}")
+    readings = [w.needs_reading() for w in (quiet, failed, refused, unmerged)]
+    if readings != [set(), {"threads"}, set(), {"pull"}]:
+        problems.append(f"quiet, failed, refused and unmerged read {readings}")
+    return report("what a webhook cannot describe is read", problems, "")
+
+
+class FakeRelay:
+    """Webhooks that arrive at set times on a Clock, until `horizon`.
+
+    A webhook that is None is the relay being lost.
+    """
+
+    def __init__(self, clock, webhooks, horizon):
+        self.clock = clock
+        self.webhooks = sorted(webhooks, key=lambda webhook: webhook[0])
+        self.horizon = horizon
+        self.address = "r:1"
+        self.repositories = None
+        self.lost = None
+        self.ready = threading.Event()
+        self.ready.set()
+
+    closed = []
+
+    def close(self):
+        FakeRelay.closed.append(self)
+
+    def next(self, until):
+        if self.webhooks and self.webhooks[0][0] <= until:
+            at, heard = self.webhooks.pop(0)
+            self.clock.now = max(self.clock.now, at)
+            if heard is None:
+                raise prwatch.RelayLost("the webhook relay at r:1 closed the "
+                                        "connection")
+            return heard
+        if until > self.horizon:
+            raise RanOut()
+        self.clock.now = max(self.clock.now, until)
+        return None
+
+
+def relayed(readings, webhooks, horizon=20000, local=None, reconnect=None,
+            **options):
+    """One --follow watch through a relay, run until `horizon` seconds in.
+
+    `readings` gives the keyword arguments for reading() for a poll made a
+    given number of seconds into the watch, and `webhooks` is a list of the
+    times webhooks arrive at and what each is. `local` gives the commit
+    checked out in the working tree at a given time, and `reconnect` the
+    relay a connection made at a given time reaches. Returns what the watch
+    printed, the time and facets of each read, and how it ended.
+    """
+    clock = Clock(now=0.0)
+    real = (prwatch.time, prwatch.Relay)
+    prwatch.time = clock
+    polls = []
+    ended = "still watching"
+    if reconnect:
+        prwatch.Relay = lambda address: reconnect(clock)
+    try:
+        with tempfile.TemporaryDirectory() as directory:
+            watcher = prwatch.Watcher(
+                prwatch.GitHub("github.com"), "o", "r", 1,
+                Options(follow=True, detail=False,
+                        state=str(Path(directory) / "state.json"), **options),
+                FakeRelay(clock, webhooks, horizon))
+
+            def poll(facets=prwatch.Snapshot.FACETS):
+                # A watch that lost its relay ends the case here instead.
+                if clock.now > horizon:
+                    raise RanOut()
+                whole = facets == prwatch.Snapshot.FACETS
+                polls.append(round(clock.now) if whole
+                             else (round(clock.now), set(facets)))
+                snap = reading(**readings(clock.now))
+                for facet in prwatch.Snapshot.FACETS:
+                    if facet not in facets:
+                        setattr(snap, facet, None)
+                snap.read = set(facets)
+                return snap
+
+            watcher.poll = poll
+            if local:
+                watcher.local_commit = lambda: local(clock.now)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                try:
+                    watcher.run()
+                except RanOut:
+                    pass
+                except prwatch.TimeUp:
+                    ended = f"time up after {clock.now:.0f}s"
+    finally:
+        prwatch.time, prwatch.Relay = real
+    return out.getvalue(), polls, ended
+
+
+def report(name, problems, output):
+    if problems:
+        print(f"FAIL {name}")
+        for problem in problems:
+            print(f"       {problem}")
+        for line in output.splitlines():
+            print(f"       {line}")
+        return False
+    print(f"ok   {name}")
+    return True
+
+
+@case
+def a_read_of_some_facets_leaves_the_others_alone():
+    """Reading only the pull request keeps what is known of everything else.
+
+    The answers GitHub gave for the facets left unread are kept, so that it
+    can still answer "not modified" for them, and a facet whose reads were
+    failing is not said to be read again by a read that never asked for it.
+    """
+    gh = prwatch.GitHub("github.com")
+    gh.answers = {"comments": ("e1", "[]")}
+    gh.reading = {"pull": ("e2", "{}")}
+    gh.keep_read()
+    kept = sorted(gh.answers)
+    watcher = quiet_watcher(Options())
+    watcher.failures["threads"] = 3
+    watcher.warned.add("threads")
+    partial = prwatch.Snapshot()
+    partial.read = {"pull"}
+    partial.pull = pull()
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.report_errors(partial)
+    still_failing = watcher.failures["threads"]
+    whole = prwatch.Snapshot()
+    with redirect_stdout(out):
+        watcher.report_errors(whole)
+    calls = []
+
+    class Recorder:
+        hostname = "github.com"
+
+        def forget_unread(self):
+            calls.append("forget")
+
+        def keep_read(self):
+            calls.append("keep")
+
+    real = prwatch.read_snapshot
+    prwatch.read_snapshot = lambda *args: prwatch.Snapshot()
+    try:
+        watcher.gh = Recorder()
+        watcher.poll(("pull",))
+        watcher.poll()
+    finally:
+        prwatch.read_snapshot = real
+    problems = []
+    if kept != ["comments", "pull"]:
+        problems.append(f"after a read of some paths, it kept {kept}")
+    if still_failing != 3 or out.getvalue().count("reading again") != 1:
+        problems.append(f"a read of the pull request alone left the threads "
+                        f"at {still_failing} failures and said "
+                        f"{out.getvalue().strip()!r}")
+    if calls != ["keep", "forget"]:
+        problems.append(f"the answers were kept and forgotten as {calls}")
+    return report("a read of some facets leaves the others alone", problems,
+                  "")
+
+
+@case
+def a_relayed_watch_reads_only_what_webhooks_cannot_say():
+    """One read to start, and then the webhooks are the news.
+
+    The verdict waits out --stability as quiet minutes rather than reads, a
+    webhook about another pull request says nothing, and a comment and a
+    merge are reported from their webhooks alone.
+    """
+    output, polls, _ = relayed(lambda now: {}, [
+        (1000, ("issue_comment", webhook_for(
+            issue={"number": 2}, action="created", comment=gh_comment()))),
+        (1500, ("issue_comment", webhook_for(
+            issue={"number": 1}, action="created", comment=gh_comment()))),
+        (2500, ("pull_request", webhook_for(
+            action="closed", pull_request=pull(state="closed",
+                                               merged=True)))),
+    ], horizon=3000)
+    said = tags(output)
+    problems = []
+    if polls != [0]:
+        problems.append(f"it read at {polls}")
+    if said.count("COMMENT") != 1 or "MERGED" not in said or \
+            said.count("WAITING") != 3:
+        problems.append(f"it said {said}")
+    return report("a relayed watch reads only what webhooks cannot say",
+                  problems, output)
+
+
+@case
+def a_verdict_waits_for_quiet_minutes_not_webhooks():
+    """Webhooks in quick succession are not the minutes --stability waits."""
+    output, polls, _ = relayed(lambda now: {}, [
+        (at, ("issue_comment", webhook_for(
+            issue={"number": 1}, action="created",
+            comment=gh_comment(cid=at, updated=f"2026-09-20T10:00:{at:02}Z"))))
+        for at in (10, 20, 90)], horizon=1000)
+    said = tags(output)
+    comments = [i for i, tag in enumerate(said) if tag == "COMMENT"]
+    problems = []
+    if len(comments) != 3 or said.index("WAITING") < comments[-1]:
+        problems.append(f"it said {said}")
+    if polls != [0]:
+        problems.append(f"it read {polls}")
+    return report("a verdict waits for quiet minutes, not for webhooks",
+                  problems, output)
+
+
+@case
+def a_read_from_before_a_merge_does_not_reopen_it():
+    """A read GitHub answers from before a merge it has announced is doubted."""
+    merged = {**pull(state="closed", merged=True),
+              "updated_at": "2026-09-20T12:00:00Z"}
+    output, polls, _ = relayed(
+        lambda now: {"state": "closed", "merged": True} if now >= 1060 else {},
+        [(1000, ("pull_request", webhook_for(action="closed",
+                                             pull_request=merged))),
+         (1000, ("push", webhook_for(ref="refs/heads/main")))], horizon=1500)
+    problems = []
+    if polls != [0, (1000, {"pull"}), (1060, {"pull"})]:
+        problems.append(f"it read {polls}")
+    if "now open" in output or tags(output).count("MERGED") != 1:
+        problems.append(f"it said {tags(output)}")
+    return report("a read from before a merge does not reopen it", problems,
+                  output)
+
+
+@case
+def a_push_reads_the_pull_request_until_github_says():
+    """GitHub says nothing when it has worked out whether a branch merges."""
+    def readings(now):
+        if now < 1000:
+            return {}
+        return {"mergeable": "unknown" if now < 1100 else "dirty"}
+
+    output, polls, _ = relayed(readings, [
+        (1000, ("push", webhook_for(ref="refs/heads/main")))], horizon=2000)
+    problems = []
+    if polls != [0, (1000, {"pull"}), (1060, {"pull"}), (1120, {"pull"})]:
+        problems.append(f"it read {polls}")
+    if "CONFLICT" not in tags(output):
+        problems.append("the conflict was never announced")
+    return report("a push reads the pull request until GitHub says",
+                  problems, output)
+
+
+@case
+def a_new_head_reads_its_commit():
+    """The checks of a new head can come before the webhook that moved it."""
+    output, polls, _ = relayed(
+        lambda now: {"head": "b" * 40} if now >= 1000 else {}, [
+            (1000, ("pull_request", webhook_for(
+                action="synchronize", pull_request=pull(head="b" * 40))))],
+        horizon=2000)
+    problems = []
+    if polls != [0, (1000, {"checks", "runs", "statuses", "review_comments",
+                             "threads"})]:
+        problems.append(f"it read {polls}")
+    if "RETARGET" not in tags(output):
+        problems.append(f"it said {tags(output)}")
+    return report("a new head reads the facets of its commit, once",
+                  problems, output)
+
+
+@case
+def a_commit_in_the_working_tree_is_looked_for():
+    """Nothing announces a commit, so --expect HEAD looks without reading."""
+    output, polls, _ = relayed(
+        lambda now: {}, [], horizon=3500, expect="HEAD",
+        local=lambda now: "b" * 40 if now >= 3000 else "a" * 40)
+    problems = []
+    if polls != [0]:
+        problems.append(f"it read at {polls}")
+    if "MISMATCH" not in tags(output):
+        problems.append(f"it said {tags(output)}")
+    return report("a commit in the working tree is looked for, unread",
+                  problems, output)
+
+
+@case
+def a_lost_relay_reads_everything_and_polls_until_it_answers():
+    """Webhooks sent while the relay was lost are lost with it.
+
+    Each poll after the loss tries to connect again, and the poll after an
+    attempt that succeeded takes it up, reading everything once more.
+    """
+    answers = []
+
+    class Down:
+        lost = "the webhook relay at r:1 cannot be connected to"
+        ready = FakeRelay(None, [], 0).ready
+
+    def reconnect(clock):
+        answers.append(round(clock.now))
+        return Down() if clock.now < 1300 else FakeRelay(clock, [], 3000)
+
+    output, polls, _ = relayed(lambda now: {}, [(1000, None)], horizon=3000,
+                               reconnect=reconnect,
+                               github_webhook_relay="r:1")
+    problems = []
+    if polls[:2] != [0, 1000] or answers != polls[1:-1] or \
+            answers[-1] < 1300 or answers[-2] >= 1300:
+        problems.append(f"it read {polls} and connected at {answers}")
+    for wanted in ("closed the connection; polling until",
+                   "can be reached again; listening"):
+        if wanted not in output:
+            problems.append(f"it never said {wanted!r}")
+    return report("a lost relay is read past, and connected to again",
+                  problems, output)
+
+
+@case
+def for_ends_a_relayed_watch():
+    output, polls, ended = relayed(lambda now: {}, [], for_seconds=2500)
+    problems = [] if ended == "time up after 2500s" else [ended]
+    if polls != [0]:
+        problems.append(f"it read at {polls}")
+    return report("--for ends a watch that is waiting for a webhook",
+                  problems, output)
+
+
+@case
+def a_webhook_that_cannot_be_read_loses_the_relay():
+    """The relay is let go of, so its connection ends, and is read past."""
+    closed = len(FakeRelay.closed)
+    output, polls, _ = relayed(lambda now: {}, [
+        (1000, ("issue_comment", webhook_for(issue={"number": 1},
+                                             comment=5)))], horizon=1500)
+    problems = []
+    if len(FakeRelay.closed) != closed + 1:
+        problems.append("the relay it gave up on was left connected")
+    if polls[:2] != [0, 1000]:
+        problems.append(f"it read {polls}")
+    if "issue_comment webhook that does not read as one" not in output:
+        problems.append("the webhook was not reported")
+    return report("a webhook that cannot be read loses the relay", problems,
+                  output)
+
+
+@case
+def a_relay_is_connected_to_and_kept_alive():
+    """A watch connects over TCP, and asks the kernel to notice a dead peer.
+
+    The relay here listens on the loopback address of this machine.
+    """
+    server = socket.create_server(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+    relay = prwatch.Relay(f"127.0.0.1:{port}")
+    theirs, _ = server.accept()
+    theirs.sendall(delivery({"repository": {"id": 7}}, "push"))
+    theirs.close()
+    server.close()
+    heard = hear(relay)
+    keepalive = relay.connection.getsockopt(socket.SOL_SOCKET,
+                                            socket.SO_KEEPALIVE)
+    nobody = prwatch.Relay(f"127.0.0.1:{port}")
+    nobody.ready.wait()
+    problems = []
+    if heard != ("push", {"repository": {"id": 7}}):
+        problems.append(f"it heard {heard!r}")
+    if not keepalive:
+        problems.append("the connection is not kept alive")
+    if "cannot be connected to" not in (nobody.lost or ""):
+        problems.append(f"a relay nobody listens for: {nobody.lost}")
+    try:
+        prwatch.Relay("no-port-here")
+        problems.append("an address with no port was accepted")
+    except SystemExit as complaint:
+        if "HOST:PORT" not in str(complaint):
+            problems.append(f"an address with no port: {complaint}")
+    return report("a relay is connected to over TCP and kept alive",
+                  problems, "")
+
+
+@case
+def status_does_not_connect_to_the_relay():
+    """A single reading has nothing to listen for; a watch connects first,
+    and one that cannot connect says so and does not start."""
+    connected = []
+    real = (prwatch.resolve_target, prwatch.Relay, prwatch.Watcher.run)
+
+    def connect(address):
+        connected.append(address)
+        relay = FakeRelay(None, [], 0)
+        if address == "down:1":
+            relay.lost = "the webhook relay at down:1 cannot be connected to"
+        return relay
+
+    prwatch.resolve_target = lambda pr, repo: ("github.com", "o", "r", 1)
+    prwatch.Relay = connect
+    prwatch.Watcher.run = lambda self: connected.append(
+        isinstance(self.relay, FakeRelay))
+    try:
+        prwatch.main(["1", "--status", "--github-webhook-relay", "h:1"])
+        prwatch.main(["1", "--once", "--github-webhook-relay", "h:1"])
+        try:
+            prwatch.main(["1", "--once", "--github-webhook-relay", "down:1"])
+            down = "started"
+        except SystemExit as complaint:
+            down = str(complaint)
+    finally:
+        prwatch.resolve_target, prwatch.Relay, prwatch.Watcher.run = real
+    problems = []
+    if connected != [False, "h:1", True, "down:1"]:
+        problems.append(f"it went {connected}")
+    if "webhook relay at down:1 cannot be connected to" not in down:
+        problems.append(f"a relay that is down: {down}")
+    return report("--status does not connect to the relay, and a watch does",
+                  problems, "")
 
 
 def main():
