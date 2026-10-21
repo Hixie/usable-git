@@ -299,9 +299,12 @@ LISTENING FOR WEBHOOKS
     - a check an app registered, where the token may not read the checks
       and they are counted rather than named;
     - a facet whose last read failed.
-  The --stability a verdict waits for is measured in quiet --intervals
-  rather than in reads. Nothing announces a commit in the working tree,
-  so when --expect names a revision, the working tree is looked at every
+  The --stability a verdict waits for is measured in quiet steps of 10
+  seconds, or of --interval if that is shorter but never under 5, rather
+  than in reads. A step does not count while a webhook has announced
+  something only a read can describe, so a verdict never comes before that
+  read has been made. Nothing announces a commit in the working tree, so
+  when --expect names a revision, the working tree is looked at every
   --interval. Otherwise nothing is read at all while the relay is
   connected, and --interval-growth and --interval-max have nothing to do.
 
@@ -309,10 +312,11 @@ LISTENING FOR WEBHOOKS
   nothing for one that is not, so the watch connects before its first
   read. A connection that ends, that goes quiet because its far end has
   gone, or that carries something that is not a webhook, is reported with
-  a WARN line. Webhooks may have been missed, so the watch reads everything
-  at once and polls as it does without a relay. It tries to connect again
-  in the background, and at the poll after an attempt succeeds it listens
-  again, reading everything once more.
+  a WARN line. Webhooks may have been missed, so the watch reads
+  everything at once, starts the quiet a verdict waits for over, and polls
+  as it does without a relay. It tries to connect again in the background,
+  and at the poll after an attempt succeeds it listens again, reading
+  everything once more.
 
   The relay is only as complete as the GitHub webhook that feeds it, which
   needs to send these events: pull requests, pull request reviews, review
@@ -1605,7 +1609,7 @@ class Watcher:
         self.stall_interval = options.stall
         self.poll_interval = options.interval
         self.last_read = time.time()
-        self.last_tick = time.time()    # the last read --stability counted
+        self.last_tick = time.time()    # the last step --stability counted
         self.last_look = time.time()    # the last look at --expect's revision
         self.wanted = set()             # facets a webhook could not describe
         self.gone = set()               # (facet, key) of items deleted
@@ -2528,11 +2532,12 @@ class Watcher:
 
         Without a webhook relay, that is a poll after the wait between
         polls. With one, see listen(). A relay that is lost may have dropped
-        any number of webhooks, so everything is read at once, and the
-        watch polls until the relay can be connected to again.
+        any number of webhooks, so everything is read at once, the quiet
+        it had counted towards --stability starts over, and the watch polls
+        until the relay can be connected to again.
 
         True when the step counts towards the --stability a verdict waits
-        for: a poll, or a quiet --interval.
+        for: a poll, or a quiet step while listening.
         """
         if self.relay is not None:
             try:
@@ -2542,6 +2547,7 @@ class Watcher:
                 self.relay = None
                 self.doubted.clear()
                 self.announced.clear()
+                self.settled_polls = 0
                 self.emit("WARN", f"{lost}; polling until it can be "
                                   "reached again")
                 self.reconnect()
@@ -2635,18 +2641,21 @@ class Watcher:
         them nothing is read except what no webhook can describe; see
         needs_reading(). That is read every --interval until it has been
         read. The --stability a verdict waits for is measured in quiet
-        --intervals rather than in reads, and with --expect naming a
-        revision, the working tree is looked at every --interval, since
-        nothing announces a commit made there.
+        steps of up to 10 seconds rather than in reads, and a step does not
+        count while a read a webhook asked for is outstanding. With --expect
+        naming a revision, the working tree is looked at every --interval,
+        since nothing announces a commit made there.
         """
         interval = max(5.0, self.options.interval)
+        step = min(10.0, interval)
         now = time.time()
-        ticking = settled and self.settled_polls < self.options.stability
+        ticking = settled and not self.wanted and \
+            self.settled_polls < self.options.stability
         times = [self.last_stall + self.stall_interval]
         if self.needs_reading():
             times.append(self.last_read + interval)
         if ticking:
-            times.append(self.last_tick + interval)
+            times.append(self.last_tick + step)
         if self.expect_revision:
             times.append(self.last_look + interval)
         grace = self.head_since + self.options.no_ci_grace
@@ -2673,7 +2682,7 @@ class Watcher:
         facets = self.needs_reading()
         if facets and now >= self.last_read + interval:
             self.read(tuple(f for f in Snapshot.FACETS if f in facets))
-        return ticking and now >= self.last_tick + interval
+        return ticking and not self.wanted and now >= self.last_tick + step
 
     def needs_reading(self):
         """The facets only a read can bring up to date.
@@ -3006,7 +3015,9 @@ def main(argv):
                              "between STALL reports (default 86400)")
     parser.add_argument("--stability", type=int, default=3, metavar="POLLS",
                         help="consecutive quiet polls before calling it "
-                             "settled (default 3)")
+                             "settled, or quiet steps of up to 10 seconds "
+                             "while listening to a webhook relay (default "
+                             "3)")
     parser.add_argument("--min-checks", type=int, default=0, metavar="N",
                         help="refuse to call it settled until at least N "
                              "checks have registered")

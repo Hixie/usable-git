@@ -3087,7 +3087,7 @@ def a_read_of_some_facets_leaves_the_others_alone():
 def a_relayed_watch_reads_only_what_webhooks_cannot_say():
     """One read to start, and then the webhooks are the news.
 
-    The verdict waits out --stability as quiet minutes rather than reads, a
+    The verdict waits out --stability as quiet steps rather than reads, a
     webhook about another pull request says nothing, and a comment and a
     merge are reported from their webhooks alone.
     """
@@ -3112,13 +3112,13 @@ def a_relayed_watch_reads_only_what_webhooks_cannot_say():
 
 
 @case
-def a_verdict_waits_for_quiet_minutes_not_webhooks():
-    """Webhooks in quick succession are not the minutes --stability waits."""
+def a_verdict_waits_for_quiet_steps_not_webhooks():
+    """Webhooks in quick succession are not the steps --stability waits."""
     output, polls, _ = relayed(lambda now: {}, [
         (at, ("issue_comment", webhook_for(
             issue={"number": 1}, action="created",
             comment=gh_comment(cid=at, updated=f"2026-09-20T10:00:{at:02}Z"))))
-        for at in (10, 20, 90)], horizon=1000)
+        for at in (2, 4, 15)], horizon=1000)
     said = tags(output)
     comments = [i for i, tag in enumerate(said) if tag == "COMMENT"]
     problems = []
@@ -3126,8 +3126,55 @@ def a_verdict_waits_for_quiet_minutes_not_webhooks():
         problems.append(f"it said {said}")
     if polls != [0]:
         problems.append(f"it read {polls}")
-    return report("a verdict waits for quiet minutes, not for webhooks",
+    return report("a verdict waits for quiet steps, not for webhooks",
                   problems, output)
+
+
+@case
+def a_relayed_verdict_waits_for_the_reads_webhooks_ask_for():
+    """Quiet steps are 10 seconds, or --interval when shorter, down to 5.
+
+    A step does not count while a read a webhook asked for is outstanding,
+    including the second read that a read going back on a webhook needs,
+    and those reads, like the polls after the relay is lost, keep to
+    --interval. A relay that is lost starts the quiet over.
+    """
+    def comment(at):
+        return (at, ("issue_comment", webhook_for(
+            issue={"number": 1}, action="created",
+            comment=gh_comment(cid=at, updated=f"2026-09-20T10:00:{at:02}Z"))))
+
+    # A check the watch does not hold, which a read then leaves out, so
+    # the read is doubted and made again.
+    rerun = (20, ("check_run", webhook_for(check_run=gh_check(
+        cid=9, status="queued", conclusion=None))))
+    lost = (200, None)
+    # Each case says whether the verdict comes before the comment, or
+    # None when no verdict comes at all.
+    problems = []
+    for name, webhooks, options, horizon, early, reads in [
+            ("a quiet watch", [comment(25), lost], {}, 300, True,
+             [0, 200, 260]),
+            ("a 1-second --interval", [comment(7), lost], {"interval": 1},
+             300, False, [0, 200, 205]),
+            ("a check to read", [rerun, comment(90), lost], {}, 300, False,
+             [0, (60, {"checks"}), (120, {"checks"})]),
+            ("a relay lost while settling", [(15, None)], {}, 100, None,
+             [0, 15, 75])]:
+        output, polls, _ = relayed(lambda now: {}, webhooks, horizon=horizon,
+                                   **options)
+        said = tags(output)
+        if early is None:
+            wrong = "WAITING" in said
+        else:
+            wrong = "COMMENT" not in said or "WAITING" not in said or \
+                (said.index("WAITING") < said.index("COMMENT")) != early
+        if wrong:
+            problems.append(f"{name} said {said}")
+        if polls[:len(reads)] != reads:
+            problems.append(f"{name} read {polls}")
+    return report("a relayed verdict waits for the reads webhooks ask for",
+                  problems, "")
 
 
 @case
