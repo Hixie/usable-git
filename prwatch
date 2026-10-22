@@ -299,9 +299,11 @@ LISTENING FOR WEBHOOKS
     - a check an app registered, where the token may not read the checks
       and they are counted rather than named;
     - a facet whose last read failed.
-  The --stability a verdict waits for is measured in quiet steps of 10
+  No read is made until a throttle has been waited out, and a read a
+  throttle refused is still owed, so the verdict waits for it. The
+  --stability a verdict waits for is measured in quiet steps of 10
   seconds, or of --interval if that is shorter but never under 5, rather
-  than in reads. A step does not count while a webhook has announced
+  than in reads. No verdict is given while a webhook has announced
   something only a read can describe, so a verdict never comes before that
   read has been made. Nothing announces a commit in the working tree, so
   when --expect names a revision, the working tree is looked at every
@@ -313,10 +315,10 @@ LISTENING FOR WEBHOOKS
   read. A connection that ends, that goes quiet because its far end has
   gone, or that carries something that is not a webhook, is reported with
   a WARN line. Webhooks may have been missed, so the watch reads
-  everything at once, starts the quiet a verdict waits for over, and polls
-  as it does without a relay. It tries to connect again in the background,
-  and at the poll after an attempt succeeds it listens again, reading
-  everything once more.
+  everything as soon as any throttle has been waited out, starts the quiet
+  a verdict waits for over, and polls as it does without a relay. It tries
+  to connect again in the background, and at the poll after an attempt
+  succeeds it listens again, reading everything once more.
 
   The relay is only as complete as the GitHub webhook that feeds it, which
   needs to send these events: pull requests, pull request reviews, review
@@ -1616,6 +1618,7 @@ class Watcher:
         self.doubted = set()            # facets a read went back on
         self.announced = {}             # (facet, key) -> what a webhook said
         self.connecting = None          # a Relay being connected to
+        self.throttle_told = 0.0        # the throttle a WARN line named
         self.last_digest = None
         self.merge_state = None
         self.state_path = options.state and Path(options.state)
@@ -2468,7 +2471,10 @@ class Watcher:
                 if fresh or not self.settled_polls:
                     self.settled_polls += 1
                     self.last_tick = time.time()
-                if self.settled_polls >= self.options.stability:
+                # A read a webhook asked for may change the picture, so no
+                # verdict is given until it has been made.
+                if self.settled_polls >= self.options.stability and \
+                        not self.wanted:
                     verdict = self.overall()
                     if self.options.once:
                         # A pull request that is over has nothing left to
@@ -2507,6 +2513,18 @@ class Watcher:
         left = 1.0 if self.gh.quota_left is None else self.gh.quota_left
         return max(self.options.interval, 30 + 270 * (1 - left))
 
+    def throttle_lifts(self):
+        """Five seconds after the throttle GitHub put on the token lifts."""
+        return self.gh.rate_limited_until + 5
+
+    def report_throttle(self):
+        """Say that a throttle is holding up a read, once for each one."""
+        throttle = self.gh.rate_limited_until
+        if throttle > max(time.time(), self.throttle_told):
+            self.throttle_told = throttle
+            self.emit("WARN", f"rate limited; waiting "
+                              f"{duration(throttle - time.time())}")
+
     def sleep(self, delay=None):
         """Wait until the next poll, and past a throttle when there is one.
 
@@ -2518,10 +2536,8 @@ class Watcher:
         """
         delay = max(5.0, self.poll_interval) if delay is None else \
             max(0.0, delay)
-        wait_out = self.gh.rate_limited_until - time.time()
-        if wait_out > 0:
-            self.emit("WARN", f"rate limited; waiting {duration(wait_out)}")
-            delay = max(delay, wait_out + 5)
+        self.report_throttle()
+        delay = max(delay, self.throttle_lifts() - time.time())
         if self.ends_at is not None and time.time() + delay >= self.ends_at:
             time.sleep(max(0.0, self.ends_at - time.time()))
             raise TimeUp()
@@ -2532,9 +2548,10 @@ class Watcher:
 
         Without a webhook relay, that is a poll after the wait between
         polls. With one, see listen(). A relay that is lost may have dropped
-        any number of webhooks, so everything is read at once, the quiet
-        it had counted towards --stability starts over, and the watch polls
-        until the relay can be connected to again.
+        any number of webhooks, so everything is read as soon as any
+        throttle has been waited out, the quiet it had counted towards
+        --stability starts over, and the watch polls until the relay can be
+        connected to again.
 
         True when the step counts towards the --stability a verdict waits
         for: a poll, or a quiet step while listening.
@@ -2550,6 +2567,7 @@ class Watcher:
                 self.settled_polls = 0
                 self.emit("WARN", f"{lost}; polling until it can be "
                                   "reached again")
+                self.sleep(0)
                 self.reconnect()
         else:
             self.sleep()
@@ -2582,6 +2600,10 @@ class Watcher:
         self.wanted -= set(facets)
         snap = self.poll(facets)
         if self.relay is not None:
+            # A throttle lifts, so whatever a read it refused did not read
+            # is still owed, including what it could not attempt at all.
+            if any(rate_limited(error) for error in snap.errors.values()):
+                self.wanted |= set(facets) - (snap.read - snap.errors.keys())
             self.doubt(snap)
         self.absorb(snap)
         self.save_state()
@@ -2640,20 +2662,21 @@ class Watcher:
         Webhooks are not dropped while the relay is connected, so between
         them nothing is read except what no webhook can describe; see
         needs_reading(). That is read every --interval until it has been
-        read. The --stability a verdict waits for is measured in quiet
-        steps of up to 10 seconds rather than in reads, and a step does not
-        count while a read a webhook asked for is outstanding. With --expect
-        naming a revision, the working tree is looked at every --interval,
-        since nothing announces a commit made there.
+        read, and not before a throttle has been waited out. The --stability
+        a verdict waits for is measured in quiet steps of up to 10 seconds
+        rather than in reads. With --expect naming a revision, the working
+        tree is looked at every --interval, since nothing announces a commit
+        made there.
         """
         interval = max(5.0, self.options.interval)
         step = min(10.0, interval)
         now = time.time()
-        ticking = settled and not self.wanted and \
-            self.settled_polls < self.options.stability
+        ticking = settled and self.settled_polls < self.options.stability
+        due = max(self.last_read + interval, self.throttle_lifts())
         times = [self.last_stall + self.stall_interval]
         if self.needs_reading():
-            times.append(self.last_read + interval)
+            self.report_throttle()
+            times.append(due)
         if ticking:
             times.append(self.last_tick + step)
         if self.expect_revision:
@@ -2680,9 +2703,9 @@ class Watcher:
             self.last_look = now
             self.check_expectation(announce=True)
         facets = self.needs_reading()
-        if facets and now >= self.last_read + interval:
+        if facets and now >= due:
             self.read(tuple(f for f in Snapshot.FACETS if f in facets))
-        return ticking and not self.wanted and now >= self.last_tick + step
+        return ticking and now >= self.last_tick + step
 
     def needs_reading(self):
         """The facets only a read can bring up to date.

@@ -2962,7 +2962,8 @@ def relayed(readings, webhooks, horizon=20000, local=None, reconnect=None,
     """One --follow watch through a relay, run until `horizon` seconds in.
 
     `readings` gives the keyword arguments for reading() for a poll made a
-    given number of seconds into the watch, and `webhooks` is a list of the
+    given number of seconds into the watch, or `throttled_until` for a poll
+    GitHub refuses until then, and `webhooks` is a list of the
     times webhooks arrive at and what each is. `local` gives the commit
     checked out in the working tree at a given time, and `reconnect` the
     relay a connection made at a given time reaches. Returns what the watch
@@ -2990,11 +2991,24 @@ def relayed(readings, webhooks, horizon=20000, local=None, reconnect=None,
                 whole = facets == prwatch.Snapshot.FACETS
                 polls.append(round(clock.now) if whole
                              else (round(clock.now), set(facets)))
-                snap = reading(**readings(clock.now))
-                for facet in prwatch.Snapshot.FACETS:
-                    if facet not in facets:
-                        setattr(snap, facet, None)
+                given = readings(clock.now)
+                until = given.pop("throttled_until", None)
+                snap = reading(**given)
                 snap.read = set(facets)
+                if until:
+                    # As read_snapshot() does, a pull request that could
+                    # not be read leaves no commit to read the checks of.
+                    if "pull" in facets:
+                        snap.read -= {"runs", "checks", "statuses"}
+                    for facet in snap.read:
+                        snap.errors[facet] = prwatch.GitHubError(
+                            "gh: API rate limit exceeded (HTTP 403)", 403)
+                    watcher.gh.rate_limited_until = max(
+                        watcher.gh.rate_limited_until, until)
+                for facet in prwatch.Snapshot.FACETS:
+                    if facet not in snap.read or until:
+                        setattr(snap, facet, None)
+                watcher.report_errors(snap)
                 return snap
 
             watcher.poll = poll
@@ -3134,7 +3148,7 @@ def a_verdict_waits_for_quiet_steps_not_webhooks():
 def a_relayed_verdict_waits_for_the_reads_webhooks_ask_for():
     """Quiet steps are 10 seconds, or --interval when shorter, down to 5.
 
-    A step does not count while a read a webhook asked for is outstanding,
+    No verdict is given while a read a webhook asked for is outstanding,
     including the second read that a read going back on a webhook needs,
     and those reads, like the polls after the relay is lost, keep to
     --interval. A relay that is lost starts the quiet over.
@@ -3175,6 +3189,51 @@ def a_relayed_verdict_waits_for_the_reads_webhooks_ask_for():
             problems.append(f"{name} read {polls}")
     return report("a relayed verdict waits for the reads webhooks ask for",
                   problems, "")
+
+
+@case
+def a_relayed_watch_waits_out_a_throttle():
+    """A read GitHub refuses as throttled is not made again until the
+    throttle has been waited out, whether the relay is still there or is
+    lost during the wait. The wait is reported once, and the verdict waits
+    for the read."""
+    def readings(now):
+        if 100 <= now < 400:
+            return {"throttled_until": 400}
+        return {"mergeable": "dirty"} if now >= 400 else {}
+
+    push = (100, ("push", webhook_for(ref="refs/heads/main")))
+    comment = (150, ("issue_comment", webhook_for(
+        issue={"number": 1}, action="created", comment=gh_comment())))
+    problems = []
+    # A check not held, whose read waits on the pull request's, so a
+    # throttle on the pull request leaves it unread too.
+    rerun = (100, ("check_run", webhook_for(check_run=gh_check(
+        cid=9, status="queued", conclusion=None))))
+    # A watch that has lost its relay polls on, so only its first reads
+    # are known; a listening watch stops reading once it has its answers.
+    for name, webhooks, reads, polling in [
+            ("listening", [push, comment], [0, (100, {"pull"}),
+                                            (405, {"pull"})], False),
+            ("with a check to read too", [push, rerun, comment],
+             [0, (100, {"pull", "checks"}), (405, {"pull", "checks"}),
+              (465, {"checks"})], False),
+            ("with the relay lost", [push, comment, (200, None)],
+             [0, (100, {"pull"}), 405], True)]:
+        output, polls, _ = relayed(readings, webhooks, horizon=1000)
+        said = tags(output)
+        if (polls[:len(reads)] if polling else polls) != reads:
+            problems.append(f"{name}, it read {polls}")
+        if output.count("rate limited; waiting") != 1 or \
+                "rate limited; waiting 5m" not in output:
+            problems.append(f"{name}, the wait was not reported once, as "
+                            "five minutes")
+        if "COMMENT" not in said or "CONFLICT" not in said or \
+                "WAITING" in said[said.index("COMMENT"):
+                                  said.index("CONFLICT")] or \
+                "WAITING" not in said[said.index("CONFLICT"):]:
+            problems.append(f"{name}, it said {said}")
+    return report("a relayed watch waits out a throttle", problems, "")
 
 
 @case
