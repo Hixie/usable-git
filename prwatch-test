@@ -281,7 +281,6 @@ def expectation_met_is_announced():
     options = Options(expect=None)
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1, options)
     watcher.expect = "b" * 40
-    watcher.expect_met = False
     watcher.head = "a" * 40
     snap = prwatch.Snapshot()
     snap.pull = pull(head="b" * 40)
@@ -1330,7 +1329,6 @@ def expect_follows_the_working_tree():
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1, options)
     watcher.expect_revision = True
     watcher.expect = "5" * 40          # what HEAD pointed at when it started
-    watcher.expect_met = False
     watcher.head = "5" * 40
     watcher.local_commit = lambda: "8" * 40   # a fix has been committed since
     snap = prwatch.Snapshot()
@@ -1351,7 +1349,6 @@ def expect_a_commit_id_stays_put():
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1, options)
     watcher.expect_revision = False
     watcher.expect = "a" * 40
-    watcher.expect_met = True
     watcher.head = "a" * 40
     watcher.local_commit = lambda: "8" * 40
     snap = prwatch.Snapshot()
@@ -1663,12 +1660,13 @@ def reading(head="a" * 40, run="completed", conclusion="success",
     return snap
 
 
-def process(state, readings, **options):
+def process(state, readings, local="a" * 40, **options):
     """One prwatch process on the state file `state`, run to its end.
 
-    Each entry of `readings` is the keyword arguments for one poll. Returns
-    what the process printed, how many polls it made, and the verdict it
-    ended on, which is None when it was still watching after the last one.
+    Each entry of `readings` is the keyword arguments for one poll, and
+    `local` is the commit checked out in the working tree. Returns what the
+    process printed, how many polls it made, and the verdict it ended on,
+    which is None when it was still watching after the last one.
     """
     clock = Clock()
     started = clock.now
@@ -1677,7 +1675,7 @@ def process(state, readings, **options):
     polls = []
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
                               Options(fresh=False, state=state, **options))
-    watcher.local_commit = lambda: "a" * 40
+    watcher.local_commit = lambda: local
 
     def poll(facets=prwatch.Snapshot.FACETS):
         if len(polls) == len(readings):
@@ -1744,6 +1742,64 @@ def once_waits_for_news_and_then_stops():
         return False
     print("ok   --once waits for news and then stops")
     return True
+
+
+@case
+def once_hears_of_a_mismatch_once():
+    """A commit made while the head is behind the working tree is not news.
+
+    The first run finds the head behind and says so. The second finds a
+    later commit in the working tree with the head still behind, which the
+    first run already said, and waits; a run without --expect between the
+    two does not make it forget. The third finds that the commit
+    before it has landed, which is not the commit now checked out, and says
+    so. The fourth finds the head has caught up.
+    """
+    quiet = [{}] * 6
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        first = process(state, quiet, local="b" * 40, once=True,
+                        expect="HEAD")
+        process(state, quiet, once=True)
+        second = process(state, quiet, local="c" * 40, once=True,
+                         expect="HEAD")
+        third = process(state, [{"head": "b" * 40}] * 6, local="c" * 40,
+                        once=True, expect="HEAD")
+        fourth = process(state, [{"head": "c" * 40}] * 6, local="c" * 40,
+                         once=True, expect="HEAD")
+    problems = []
+    if "MISMATCH" not in tags(first[0]):
+        problems.append(f"the first run said {tags(first[0])}")
+    if second[2] is not None or "MISMATCH" in tags(second[0]):
+        problems.append(f"the second run gave {second[1:]} and said "
+                        f"{tags(second[0])}")
+    if not {"RETARGET", "MISMATCH"} <= set(tags(third[0])) or \
+            "HEAD is ccccccccc" not in third[0]:
+        problems.append(f"the third run said {tags(third[0])}")
+    if not {"RETARGET", "MATCH"} <= set(tags(fourth[0])):
+        problems.append(f"the fourth run said {tags(fourth[0])}")
+    return report("--once hears of a mismatch once", problems,
+                  first[0] + second[0] + third[0] + fourth[0])
+
+
+@case
+def a_different_commit_id_is_news():
+    """A run given another commit than the run before it says so."""
+    problems = []
+    for given, wanted in (("b" * 40, False), ("b" * 7, False),
+                          ("c" * 40, True)):
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options(expect=given))
+        watcher.expect = given[0] * 40
+        watcher.reported_expectation = ["b" * 40, "a" * 40, False]
+        snap = prwatch.Snapshot()
+        snap.pull = pull(head="a" * 40)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            watcher.absorb(snap, announce=True)
+        if ("MISMATCH" in out.getvalue()) != wanted:
+            problems.append(f"given {given[:9]}, it said {out.getvalue()!r}")
+    return report("a different commit id is news", problems, "")
 
 
 @case
@@ -3305,6 +3361,20 @@ def a_commit_in_the_working_tree_is_looked_for():
         problems.append(f"it said {tags(output)}")
     return report("a commit in the working tree is looked for, unread",
                   problems, output)
+
+
+@case
+def a_mismatch_is_announced_once():
+    """Committing again while the head is behind changes nothing reported."""
+    output, _, _ = relayed(
+        lambda now: {}, [], horizon=9500, expect="HEAD",
+        local=lambda now: "a" * 40 if now < 3000
+        else "b" * 40 if now < 6000 else "c" * 40)
+    problems = []
+    if tags(output).count("MISMATCH") != 1 or \
+            "HEAD is bbbbbbbbb" not in output:
+        problems.append(f"it said {tags(output)}")
+    return report("a mismatch is announced once", problems, output)
 
 
 @case
