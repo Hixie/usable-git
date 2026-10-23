@@ -47,7 +47,8 @@ class Options:
                         no_ci_grace=900, warn_after=3, max_lines=12,
                         detail=True, fresh=True, state=None, exit_code=False,
                         require_review=None, excerpt=300,
-                        for_seconds=None, github_webhook_relay=None)
+                        for_seconds=None, github_webhook_relay=None,
+                        landed=False)
         defaults.update(overrides)
         self.__dict__.update(defaults)
 
@@ -84,18 +85,26 @@ def run_check(fn, expected, forbidden=()):
     return True
 
 
-def pull(head="a" * 40, state="open", merged=False, mergeable="clean"):
+MERGE = "m" * 40
+
+
+def pull(head="a" * 40, state="open", merged=False, mergeable="clean",
+         merged_at="1970-01-01T00:16:40Z"):
     """One reading of a pull request, as the REST API gives it.
 
     GitHub works out whether a branch merges only for an open pull request,
     and only once it has got to it. Every other reading gives a merge state
     of "unknown" and a null mergeable field, so that pairing is made here
-    rather than named at each call.
+    rather than named at each call. A merged pull request was merged as
+    MERGE, by default at 1000 seconds into the epoch, where a Clock starts.
     """
     if state != "open":
         mergeable = "unknown"
     answered = None if mergeable == "unknown" else mergeable != "dirty"
-    return {"head": {"sha": head, "ref": "feature", "repo": {"id": 7}},
+    merge = {"merge_commit_sha": MERGE, "merged_at": merged_at} \
+        if merged else {}
+    return {**merge,
+            "head": {"sha": head, "ref": "feature", "repo": {"id": 7}},
             "state": state, "merged": merged,
             "mergeable_state": mergeable, "title": "t", "draft": False,
             "mergeable": answered, "number": 1,
@@ -111,6 +120,19 @@ def check_run(name, status="completed", conclusion="success", cid=None):
 def workflow(name="CI", status="completed", conclusion="success", rid="1"):
     return {rid: {"name": name, "status": status, "conclusion": conclusion,
                   "url": "u", "attempt": 1, "event": "pull_request"}}
+
+
+def base_run(rid, commit=MERGE, name="Tests", workflow=1,
+             status="completed", conclusion="success", failed=None):
+    """One run a push to main started, as read_base_runs() gives it."""
+    run = {rid: {"name": name, "status": status, "conclusion": conclusion,
+                 "url": f"u{rid}", "attempt": 1, "event": "push",
+                 "workflow": workflow, "commit": commit,
+                 "created": f"2026-10-23T00:{int(rid):02d}:00Z"}}
+    if failed:
+        run[rid]["failed"] = [{"name": job, "conclusion": "failure",
+                               "url": f"j-{job}"} for job in failed]
+    return run
 
 
 def review(user="cubic-dev-ai[bot]", commit="a" * 40, rid="1", state="COMMENTED"):
@@ -1637,10 +1659,11 @@ class RanOut(Exception):
 
 def reading(head="a" * 40, run="completed", conclusion="success",
             comments=None, state="open", merged=False, lint=None,
-            mergeable="clean"):
+            mergeable="clean", base_runs=None):
     """One poll of a pull request with one workflow run and one check.
 
     A `lint` of "queued" or "success" adds a second check in that state.
+    `base_runs` are the runs on the branch it merged into, unread if None.
     """
     finished = conclusion if run == "completed" else None
     snap = prwatch.Snapshot()
@@ -1657,6 +1680,7 @@ def reading(head="a" * 40, run="completed", conclusion="success",
     snap.review_comments = {}
     snap.reviews = {}
     snap.threads = {}
+    snap.base_runs = base_runs
     return snap
 
 
@@ -1681,7 +1705,10 @@ def process(state, readings, local="a" * 40, **options):
         if len(polls) == len(readings):
             raise RanOut()
         polls.append(clock.now)
-        return reading(**readings[len(polls) - 1])
+        snap = reading(**readings[len(polls) - 1])
+        if "base_runs" not in watcher.readable(facets):
+            snap.base_runs = None
+        return snap
 
     watcher.poll = poll
     out = io.StringIO()
@@ -1931,6 +1958,401 @@ def once_does_not_outlive_the_pull_request():
     good = first[1:] == (3, "MERGED") and again[1:] == (3, "MERGED")
     print("ok   --once does not outlive the pull request" if good
           else f"FAIL --once after a merge gave {first[1:]} then {again[1:]}")
+    return good
+
+
+@case
+def the_run_that_decides_follows_the_cancelled_ones():
+    """A run cancelled by a newer push gives way to the next that contains
+    the merge.
+
+    The runs are the ones a busy main gave a merge: "Tests" let one run
+    wait at a time, so its runs for the merge and the next two commits were
+    each cancelled, and the first to finish was on the fourth. "Rapids" was
+    decided by the run on the third commit, and "Cache" by the run on the
+    merge itself. Runs started after the one that decides are left out,
+    and so is a workflow that did not run for the merge.
+    """
+    runs = {}
+    for rid, commit, name, workflow, conclusion in (
+            ("10", "m", "Cache", 3, "success"),
+            ("11", "m", "Rapids", 2, "cancelled"),
+            ("12", "m", "Tests", 1, "cancelled"),
+            ("20", "b", "Tests", 1, "cancelled"),
+            ("21", "b", "Rapids", 2, "cancelled"),
+            ("22", "b", "Cache", 3, "success"),
+            ("30", "c", "Tests", 1, "cancelled"),
+            ("31", "c", "Rapids", 2, "success"),
+            ("32", "c", "Docs", 4, "success"),
+            ("40", "d", "Tests", 1, "failure"),
+            ("50", "e", "Tests", 1, "success")):
+        runs.update(base_run(rid, commit * 40, name, workflow,
+                             conclusion=conclusion))
+    kept = prwatch.landing_runs(runs)
+    deciding = {run["name"]: run["commit"][0] for run in
+                prwatch.deciding_runs(kept).values()}
+    problems = []
+    if sorted(kept, key=int) != ["10", "11", "12", "20", "21", "30", "31",
+                                 "40"]:
+        problems.append(f"it kept {sorted(kept, key=int)}")
+    if deciding != {"Cache": "m", "Rapids": "c", "Tests": "d"}:
+        problems.append(f"the runs that decide are on {deciding}")
+    if prwatch.landing_runs({}) != {}:
+        problems.append("no runs gave some")
+    return report("the run that decides follows the cancelled ones",
+                  problems, "")
+
+
+@case
+def the_runs_on_main_are_those_that_contain_the_merge():
+    """Only a commit that contains the merge counts, GitHub is asked about
+    each commit once, and the list ends at the runs that decide.
+
+    The jobs are read of a run that decides and has not passed, whether it
+    has finished or not. Once every run that decides has finished, the list
+    is cut off after the last of them to start, and a list cut off that way
+    that finds one of them cancelled since is listed again without the end.
+    """
+
+    def run(rid, sha, conclusion, status="completed"):
+        return {"id": rid, "name": "Tests", "workflow_id": 1,
+                "head_sha": sha * 40, "status": status,
+                "conclusion": conclusion, "html_url": "u",
+                "run_attempt": 1, "event": "push",
+                "created_at": f"2026-10-23T00:{rid:02d}:00Z"}
+
+    class Main:
+        """A stand-in for GitHub with runs on main and a merge commit."""
+
+        def __init__(self, runs):
+            self.runs = runs
+            self.asked = []
+
+        def paged(self, path, key=None, per_page=100):
+            self.asked.append(path)
+            if path.endswith("/jobs"):
+                return [{"name": "unit", "conclusion": "failure",
+                         "html_url": "j"},
+                        {"name": "lint", "conclusion": None,
+                         "html_url": "k"}]
+            until = path.partition("..")[2]
+            return [given for given in self.runs
+                    if not until or given["created_at"] <= until]
+
+        def get(self, path):
+            self.asked.append(path)
+            sha = path.split("...")[1][0]
+            return {"status": {"a": "behind", "m": "identical"}.get(sha,
+                                                                    "ahead")}
+
+    def read(runs, held=None):
+        gh = Main(runs)
+        kept = prwatch.read_base_runs(gh, "repos/o/r", merged, contains, held)
+        return kept, gh.asked
+
+    contains = {}
+    merged = pull(state="closed", merged=True,
+                  merged_at="2026-10-23T00:19:29Z")
+    merged["base"]["ref"] = "release/1"
+    history = [run(5, "d", "success"), run(4, "c", "failure"),
+               run(3, "b", "cancelled"), run(2, "m", "cancelled"),
+               run(1, "a", "success")]
+    first, asked_first = read(history)
+    going, _ = read([run(4, "c", None, "in_progress")] + history[2:])
+    again, asked_again = read(history, first)
+    rerun = [history[0], run(4, "c", "cancelled")] + history[2:]
+    after, asked_after = read(rerun, first)
+    problems = []
+    if sorted(first, key=int) != ["2", "3", "4"] or first != again:
+        problems.append(f"it read {sorted(first)} and then {sorted(again)}")
+    jobs = {rid: kept.get("failed") for rid, kept in first.items()}
+    failed = [{"name": "unit", "conclusion": "failure", "url": "j"}]
+    if jobs != {"2": None, "3": None, "4": failed} or \
+            going["4"].get("failed") != failed:
+        problems.append(f"it gave the jobs {jobs}, and while the run went, "
+                        f"{going['4'].get('failed')}")
+    listing = ("repos/o/r/actions/runs?branch=release%2F1&event=push"
+               "&created=")
+    open_ended = listing + "%3E%3D2026-10-23T00:09:29Z"
+    cut = listing + "2026-10-23T00:09:29Z..2026-10-23T00:04:00Z"
+    if asked_first[0] != open_ended or \
+            sum("/compare/" + MERGE in path for path in asked_first) != 5:
+        problems.append(f"the first read asked {asked_first}")
+    if asked_again[0] != cut or \
+            any("/compare/" in path for path in asked_again):
+        problems.append(f"a read after every run decided asked "
+                        f"{asked_again}")
+    if asked_after[:2] != [cut, open_ended] or \
+            sorted(after, key=int) != ["2", "3", "4", "5"]:
+        problems.append(f"a read after the run that decided was cancelled "
+                        f"asked {asked_after} and kept {sorted(after)}")
+    return report("the runs on main are those that contain the merge",
+                  problems, "")
+
+
+@case
+def landed_watches_main_until_a_run_finishes_behind_the_merge():
+    """--landed carries a watch past the merge, through cancelled runs on
+    main, to the first run that finishes on a commit that contains it.
+
+    Each --once run exits at the first thing no earlier run reported: the
+    merge, then the cancelled run for the merge commit, then the verdict on
+    the run that took its place. A failure names the workflow, the job and
+    the commit, and RED waits for news, such as the run being run again,
+    while LANDED is over, so every --once run gives it at once.
+    """
+    later = "b" * 40
+    merged = {"state": "closed", "merged": True}
+    waiting = base_run("1", status="queued", conclusion=None)
+    cancelled = base_run("1", conclusion="cancelled")
+    replaced = {**cancelled, **base_run("2", later, status="in_progress",
+                                        conclusion=None)}
+    failed = {**cancelled, **base_run("2", later, conclusion="failure",
+                                      failed=["unit"])}
+    passed = {**cancelled, **base_run("2", later)}
+    outcomes = {}
+    with tempfile.TemporaryDirectory() as directory:
+        for ending, runs in (("failed", failed), ("passed", passed)):
+            state = str(Path(directory) / f"{ending}.json")
+            process(state, [{}], once=True, landed=True)
+            outcomes[ending] = [process(state, readings, once=True,
+                                        landed=True) for readings in (
+                [dict(merged, base_runs=waiting)] * 4,
+                [dict(merged, base_runs=replaced)] * 4,
+                [dict(merged, base_runs=runs)] * 6,
+                [dict(merged, base_runs=runs)] * 6,
+                [dict(merged, base_runs={**cancelled, **base_run(
+                    "2", later, status="queued", conclusion=None)})] * 4)]
+    merge, cancel, verdict, again, rerun = outcomes["failed"]
+    problems = []
+    if merge[1:] != (1, "PENDING") or "MERGED" not in tags(merge[0]) or \
+            "merged as mmmmmmmmm; watching main" not in merge[0] or \
+            "Tests started on main at mmmmmmmmm  u1" not in merge[0] or \
+            "never read" in merge[0]:
+        problems.append(f"the merge gave {merge[1:]}:\n{merge[0]}")
+    if cancel[1:] != (1, "PENDING") or \
+            not {"CANCEL", "RUN"} <= set(tags(cancel[0])) or \
+            "Tests on main at mmmmmmmmm was cancelled" not in cancel[0] or \
+            "Tests started on main at bbbbbbbbb, which contains " \
+            "mmmmmmmmm" not in cancel[0]:
+        problems.append(f"the cancelled run gave {cancel[1:]}:\n{cancel[0]}")
+    if verdict[1:] != (3, "RED") or \
+            "FAIL     Tests / unit — failure on main at bbbbbbbbb" \
+            not in verdict[0] or \
+            "failing job: Tests / unit (failure)  j-unit" not in verdict[0] \
+            or "failing on main at bbbbbbbbb, which contains mmmmmmmmm: " \
+            "Tests (failure)  u2" not in verdict[0]:
+        problems.append(f"the failure gave {verdict[1:]}:\n{verdict[0]}")
+    if again[2] is not None:
+        problems.append(f"a --once after RED gave {again[1:]}:\n{again[0]}")
+    if rerun[1:] != (1, "PENDING") or "RERUN" not in tags(rerun[0]) or \
+            "Tests on main at bbbbbbbbb, which contains mmmmmmmmm went back" \
+            not in rerun[0]:
+        problems.append(f"running it again gave {rerun[1:]}:\n{rerun[0]}")
+    passed = outcomes["passed"]
+    if passed[2][1:] != (3, "LANDED") or "FAIL" in tags(passed[2][0]) or \
+            passed[3][1:] != (3, "LANDED"):
+        problems.append(f"a pass gave {passed[2][1:]} then {passed[3][1:]}:"
+                        f"\n{passed[2][0]}{passed[3][0]}")
+    return report("--landed watches main until a run finishes behind the "
+                  "merge", problems, "".join(
+                      output for output, _, _ in outcomes["failed"]))
+
+
+@case
+def a_workflow_whose_every_run_was_cancelled_is_waited_for():
+    """A workflow every run of which was cancelled has not passed.
+
+    The watch waits, saying why, for the next push to start a run of it,
+    while a workflow decided by a run that passed holds nothing up.
+    """
+    runs = {**base_run("1", conclusion="cancelled"),
+            **base_run("2", "b" * 40, conclusion="cancelled"),
+            **base_run("3", name="Cache", workflow=2)}
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        output, polls, verdict = process(
+            state, [{"state": "closed", "merged": True,
+                     "base_runs": runs}] * 40, landed=True)
+    good = verdict is None and polls == 40 and \
+        "WAITING" not in tags(output) and "nothing has changed for 30m — " \
+        "every run so far of Tests on main was cancelled; " in output
+    print("ok   a workflow whose every run was cancelled is waited for"
+          if good else f"FAIL a workflow whose every run was cancelled "
+                       f"gave {verdict} after {polls} polls:\n{output}")
+    return good
+
+
+@case
+def a_job_that_fails_on_main_is_reported_before_its_run_ends():
+    """A failed job in a run that decides is reported when it is found,
+    whether or not the run has ended, and only once."""
+    later = "b" * 40
+    merged = {"state": "closed", "merged": True}
+    going = base_run("1", status="in_progress", conclusion=None,
+                     failed=["unit"])
+    ended = base_run("1", conclusion="failure", failed=["unit", "lint"])
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}], once=True, landed=True)
+        process(state, [dict(merged, base_runs=base_run(
+            "1", status="in_progress", conclusion=None))] * 4, once=True,
+            landed=True)
+        early = process(state, [dict(merged, base_runs=going)] * 4,
+                        once=True, landed=True)
+        late = process(state, [dict(merged, base_runs=ended)] * 4,
+                       once=True, landed=True)
+    fails = [line for line in late[0].splitlines() if " FAIL " in line]
+    good = early[1:] == (1, "PENDING") and \
+        "FAIL     Tests / unit — failure on main at mmmmmmmmm  j-unit" \
+        in early[0] and late[2] == "RED" and len(fails) == 1 and \
+        "Tests / lint" in fails[0] and later not in late[0]
+    print("ok   a job that fails on main is reported before its run ends"
+          if good else f"FAIL a job failing on main gave:\n{early[0]}"
+                       f"{late[0]}")
+    return good
+
+
+class Merged:
+    """A stand-in for GitHub with a merged pull request, nothing on its
+    head commit, and the runs on main it is given."""
+
+    def __init__(self, runs):
+        self.hostname = "github.com"
+        self.quota_left = None
+        self.rate_limited_until = 0.0
+        self.runs = runs
+        self.asked = []
+
+    def get(self, path, params=None):
+        self.asked.append(path)
+        if "/compare/" in path:
+            return {"status": "ahead"}
+        if path.endswith("/status"):
+            return {"statuses": []}
+        return {**pull(state="closed", merged=True),
+                "base": {"ref": "main", "repo": {"id": 7,
+                                                 "full_name": "o/r"}}}
+
+    def paged(self, path, key=None, per_page=100):
+        self.asked.append(path)
+        return self.runs if "branch=main" in path else []
+
+    def graphql(self, query, **variables):
+        return {"repository": {"pullRequest": {"reviewThreads": {
+            "pageInfo": {"hasNextPage": False}, "nodes": []}}}}
+
+    def forget_unread(self):
+        pass
+
+    def keep_read(self):
+        pass
+
+
+@case
+def whether_a_commit_has_the_merge_is_asked_once_per_state_file():
+    """A second process on the same state file asks GitHub nothing it was
+    told before about which commits contain the merge."""
+    runs = [{"id": 1, "name": "Tests", "workflow_id": 1, "head_sha": MERGE,
+             "status": "in_progress", "conclusion": None, "html_url": "u",
+             "run_attempt": 1, "event": "push",
+             "created_at": "1970-01-01T00:17:00Z"}]
+    compares = []
+    verdicts = []
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        for fresh in (False, False, True):
+            gh = Merged(runs)
+            watcher = prwatch.Watcher(gh, "o", "r", 1, Options(
+                status=True, landed=True, fresh=fresh, state=state))
+            with redirect_stdout(io.StringIO()):
+                verdicts.append(watcher.run())
+            compares.append(sum("/compare/" in path for path in gh.asked))
+    good = compares == [1, 0, 1] and verdicts == ["PENDING"] * 3
+    print("ok   whether a commit has the merge is asked once per state file"
+          if good else f"FAIL asking which commits have the merge: "
+                       f"{compares} compares, verdicts {verdicts}")
+    return good
+
+
+@case
+def main_that_may_not_be_read_is_unknown():
+    """A token refused the runs on main settles the watch, as UNKNOWN."""
+    watcher = quiet_watcher(Options(landed=True))
+    watcher.known["pull"] = pull(state="closed", merged=True)
+    watcher.known["base_runs"] = None
+    watcher.refused.add("base_runs")
+    settled, reason = watcher.is_settled()
+    out = io.StringIO()
+    with redirect_stdout(out):
+        verdict = watcher.final_report(reason)
+    good = settled and verdict == "UNKNOWN" and \
+        "never read successfully: base_runs" in out.getvalue()
+    print("ok   main that may not be read is UNKNOWN" if good
+          else f"FAIL main that may not be read gave {settled}, "
+               f"{verdict}:\n{out.getvalue()}")
+    return good
+
+
+@case
+def exit_code_counts_landed_as_done():
+    """--exit-code gives 0 for LANDED, and 1 for RED."""
+    saved = (prwatch.resolve_target, prwatch.app_from_environment,
+             prwatch.Watcher.run,
+             {n: signal.getsignal(n) for n in (signal.SIGTERM, signal.SIGHUP)})
+    prwatch.resolve_target = lambda pr, repo: ("github.com", "o", "r", 1)
+    prwatch.app_from_environment = lambda: None
+    statuses = []
+    try:
+        for verdict in ("LANDED", "RED"):
+            prwatch.Watcher.run = lambda self, given=verdict: given
+            statuses.append(prwatch.main(["--landed", "--exit-code",
+                                          "--fresh"]))
+    finally:
+        (prwatch.resolve_target, prwatch.app_from_environment,
+         prwatch.Watcher.run, handlers) = saved
+        for number, handler in handlers.items():
+            signal.signal(number, handler)
+    good = statuses == [0, 1]
+    print("ok   --exit-code counts LANDED as done" if good
+          else f"FAIL --exit-code gave {statuses} for LANDED and RED")
+    return good
+
+
+@case
+def without_landed_a_merge_is_the_end():
+    """A merged pull request is MERGED, whatever is running on main, and
+    the verdict names the option that would have watched on."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}], once=True)
+        output, polls, verdict = process(
+            state, [{"state": "closed", "merged": True,
+                     "base_runs": base_run("1", status="queued",
+                                           conclusion=None)}] * 4,
+            once=True)
+    good = (polls, verdict) == (3, "MERGED") and \
+        "--landed watches main from here" in output and \
+        "main runs" not in output and "Tests" not in output
+    print("ok   without --landed, a merge is the end" if good
+          else f"FAIL without --landed, a merge gave {verdict}:\n{output}")
+    return good
+
+
+@case
+def no_run_on_main_is_no_ci_after_the_grace_period():
+    """A merge no workflow ran for is NO-CI, but only after --no-ci-grace."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        output, polls, verdict = process(
+            state, [{"state": "closed", "merged": True, "base_runs": {}}] * 30,
+            landed=True)
+    good = verdict == "NO-CI" and polls >= 900 // 60 and \
+        "no workflow ran for a push to main that contains mmmmmmmmm" \
+        in output
+    print("ok   no run on main is NO-CI after the grace period" if good
+          else f"FAIL no run on main gave {verdict} after {polls} polls:\n"
+               f"{output}")
     return good
 
 
@@ -2520,7 +2942,7 @@ def reads_go_to_the_name_the_repository_has_now():
     """
     asked = []
 
-    def read_snapshot(gh, owner, repo, number, head, runs, facets):
+    def read_snapshot(gh, owner, repo, number, *held):
         asked.append(f"{owner}/{repo}")
         snap = prwatch.Snapshot()
         if len(asked) != 3:
@@ -2978,6 +3400,102 @@ def what_a_webhook_cannot_describe_is_read():
     return report("what a webhook cannot describe is read", problems, "")
 
 
+def gh_base_run(rid, sha=MERGE, status="completed", conclusion="success",
+                branch="main", event="push", workflow=1):
+    return {"id": rid, "name": "Tests", "workflow_id": workflow,
+            "head_sha": sha, "head_branch": branch, "event": event,
+            "status": status, "conclusion": conclusion, "html_url": "u",
+            "run_attempt": 1}
+
+
+@case
+def a_run_on_main_is_read_for_while_it_may_count():
+    """After a merge, --landed reads for a run on main that may count.
+
+    That is a run held, whose webhook is kept for the read to be held to,
+    a run of a workflow whose every run so far was cancelled, a run on the
+    commit whose workflows count, and any run before one is held, as well
+    as a job that failed in a run held. A later run of a workflow that is
+    decided is not read for, and nor is a run of a workflow that did not
+    run for that commit, a run on another branch, a run no push started,
+    a job that passed, or anything without --landed, before the merge, or
+    once the verdict is LANDED.
+    """
+    def watcher(landed=True, merged=True, verdict=None, decided=True):
+        watching = quiet_watcher(Options(landed=landed))
+        if merged:
+            watching.known["pull"] = pull(state="closed", merged=True)
+        watching.known["base_runs"] = base_run("1", conclusion="cancelled")
+        if decided:
+            watching.known["base_runs"].update(base_run(
+                "2", "b" * 40, status="in_progress", conclusion=None))
+        watching.verdict = verdict
+        return watching
+
+    def job(conclusion, run_id=2):
+        return webhook_for(workflow_job={
+            "id": 9, "run_id": run_id, "name": "unit", "status": "completed",
+            "conclusion": conclusion, "html_url": "j", "head_sha": "b" * 40})
+
+    later = "c" * 40
+    finished = webhook_for(workflow_run=gh_base_run(2, "b" * 40))
+    empty = watcher()
+    empty.known["base_runs"] = {}
+    cases = [
+        ("a run held finishing", watcher(), finished, {"base_runs"}),
+        ("a run held, as it is held", watcher(), webhook_for(
+            workflow_run=gh_base_run(2, "b" * 40, "in_progress", None)),
+         set()),
+        ("a run of a workflow every run of which was cancelled",
+         watcher(decided=False), webhook_for(workflow_run=gh_base_run(
+             5, later, "queued", None)), {"base_runs"}),
+        ("a run on the commit whose workflows count", watcher(),
+         webhook_for(workflow_run=gh_base_run(5, MERGE, "queued", None,
+                                              workflow=2)), {"base_runs"}),
+        ("a run before any is held", empty, webhook_for(
+            workflow_run=gh_base_run(5, later, workflow=2)), {"base_runs"}),
+        ("a later run of a decided workflow", watcher(), webhook_for(
+            workflow_run=gh_base_run(5, later, "queued", None)), set()),
+        ("a run of a workflow that did not run for the merge", watcher(),
+         webhook_for(workflow_run=gh_base_run(5, later, "queued", None,
+                                              workflow=2)), set()),
+        ("a run on another branch", watcher(), webhook_for(
+            workflow_run=gh_base_run(5, branch="other", workflow=2)),
+         set()),
+        ("a run no push started", watcher(), webhook_for(
+            workflow_run=gh_base_run(5, event="schedule", workflow=2)),
+         set()),
+        ("a job that failed in a run held", watcher(), job("failure"),
+         {"base_runs"}),
+        ("a job that passed in a run held", watcher(), job("success"),
+         set()),
+        ("a run without --landed", watcher(landed=False), finished, set()),
+        ("a run before the merge", watcher(merged=False), finished, set()),
+        ("a run after LANDED", watcher(verdict="LANDED"), finished, set()),
+    ]
+    problems = []
+    for name, watching, payload, reads in cases:
+        event = "workflow_job" if "workflow_job" in payload \
+            else "workflow_run"
+        said, asked = heard_by(watching, event, payload)
+        if said or asked != reads:
+            problems.append(f"{name} said {said.strip()!r} and read {asked}")
+    held = cases[0][1].announced
+    if held != {("base_runs", "2"): {"status": "completed",
+                                     "conclusion": "success", "attempt": 1}}:
+        problems.append(f"a run held finishing was kept as {held}")
+    merged, opened = watcher(), watcher(merged=False)
+    if merged.readable() != ("pull", "issue_comments", "review_comments",
+                             "reviews", "threads", "base_runs") or \
+            "checks" not in opened.readable() or \
+            "base_runs" in opened.needs_reading():
+        problems.append(f"after the merge it reads {merged.readable()}, and "
+                        f"before, {opened.readable()} and needs "
+                        f"{opened.needs_reading()}")
+    return report("a run on main is read for while it may count", problems,
+                  "")
+
+
 class FakeRelay:
     """Webhooks that arrive at set times on a Clock, until `horizon`.
 
@@ -3309,6 +3827,74 @@ def a_read_from_before_a_merge_does_not_reopen_it():
         problems.append(f"it said {tags(output)}")
     return report("a read from before a merge does not reopen it", problems,
                   output)
+
+
+@case
+def a_relayed_watch_reads_main_when_its_runs_move():
+    """A relayed --landed watch reads main's runs when the merge and each
+    run that may count are heard of, and at no other time.
+
+    The run for the merge is cancelled and the run after it passes, which
+    makes the verdict LANDED. Nothing heard of after that is read for.
+    """
+    merged = {**pull(state="closed", merged=True, merged_at=
+                     "1970-01-01T00:16:40Z"),
+              "updated_at": "2026-09-20T12:00:00Z"}
+    later = "b" * 40
+
+    def readings(now):
+        if now < 1000:
+            return {}
+        runs = base_run("1", status="queued", conclusion=None)
+        if now >= 2000:
+            runs = {**base_run("1", conclusion="cancelled"),
+                    **base_run("2", later, status="in_progress",
+                               conclusion=None)}
+        if now >= 3000:
+            runs["2"] = base_run("2", later)["2"]
+        return {"state": "closed", "merged": True, "base_runs": runs}
+
+    output, polls, _ = relayed(readings, [
+        (1000, ("pull_request", webhook_for(action="closed",
+                                            pull_request=merged))),
+        (2000, ("workflow_run", webhook_for(workflow_run=gh_base_run(
+            1, conclusion="cancelled")))),
+        (2001, ("workflow_run", webhook_for(workflow_run=gh_base_run(
+            2, later, "in_progress", None)))),
+        (3000, ("workflow_run", webhook_for(workflow_run=gh_base_run(
+            2, later)))),
+        (4000, ("workflow_run", webhook_for(workflow_run=gh_base_run(
+            3, "c" * 40, "queued", None))))], horizon=5000, landed=True)
+    problems = []
+    if polls != [0, (1000, {"base_runs"}), (2000, {"base_runs"}),
+                 (3000, {"base_runs"})]:
+        problems.append(f"it read {polls}")
+    said = [tag for tag in tags(output) if tag not in ("PROGRESS", "STALL")]
+    if said[3:] != ["MERGED", "RUN", "CANCEL", "RUN", "RUN", "WAITING"] or \
+            "WAITING  LANDED" not in output:
+        problems.append(f"it said {said}")
+    return report("a relayed --landed watch reads main when its runs move",
+                  problems, output)
+
+
+@case
+def a_relayed_watch_wakes_for_the_end_of_the_wait_on_main():
+    """A relayed --landed watch that hears of no run on main gives NO-CI
+    when --no-ci-grace after the merge is up, not at its next STALL."""
+    merged = {**pull(state="closed", merged=True,
+                     merged_at="1970-01-01T00:16:40Z"),
+              "updated_at": "2026-09-20T12:00:00Z"}
+    output, polls, _ = relayed(
+        lambda now: {"state": "closed", "merged": True, "base_runs": {}}
+        if now >= 1000 else {},
+        [(1000, ("pull_request", webhook_for(action="closed",
+                                             pull_request=merged)))],
+        horizon=2100, landed=True)
+    good = "WAITING  NO-CI — no workflow ran for a push to main" in output \
+        and polls == [0, (1000, {"base_runs"})]
+    print("ok   a relayed watch wakes for the end of the wait on main"
+          if good else f"FAIL a relayed wait on main read {polls}:\n{output}")
+    return good
 
 
 @case

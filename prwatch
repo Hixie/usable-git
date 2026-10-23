@@ -25,7 +25,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 GUIDE = """
@@ -72,10 +72,14 @@ EVENTS
   MISMATCH   the head is not the commit --expect named
   MATCH      the head has become the commit --expect named
   RETARGET   the head moved; check state starts over on the new commit
-  FAIL       a check or a commit status concluded badly
-  CANCEL     a check was cancelled, by a superseding push or by hand
-  RERUN      a check went back to pending
-  RUN        a workflow run started or finished
+  FAIL       a check or a commit status concluded badly, or with --landed,
+             a job of a run on the branch the pull request merged into
+  CANCEL     a check was cancelled, by a superseding push or by hand, or
+             with --landed, a run on the branch it merged into was
+  RERUN      a check, or with --landed a run on the branch the pull
+             request merged into, went back to pending
+  RUN        a workflow run started or finished, on the pull request or,
+             with --landed, on the branch it merged into
   CONFLICT   the branch stopped merging cleanly, or started again
   COMMENT    an issue comment, new or edited
   INLINE     an inline review comment, new or edited
@@ -101,18 +105,26 @@ VERDICTS
   FEEDBACK   the checks passed, but something is outstanding: an unresolved
              review thread, a branch that no longer merges cleanly, or a
              review --require-review asked for that has not arrived
-  RED        a check or a workflow run ended badly
+  RED        a check or a workflow run ended badly; with --landed and a
+             merged pull request, the run that decides a workflow on the
+             branch it merged into ended badly
   MERGED     it was merged
+  LANDED     it was merged, and with --landed, the run that decides each
+             workflow on the branch it merged into passed or was skipped;
+             AFTER THE MERGE says which runs those are
   CLOSED     it was closed without merging
-  NO-CI      no check ever appeared for the head commit
+  NO-CI      no check ever appeared for the head commit; with --landed and
+             a merged pull request, no workflow ran for a push to the branch
+             it merged into that contains the merge
   PENDING    --status or --once ended before it settled
   UNKNOWN    nothing was found wrong, but some part of the picture was never
              read successfully, so the verdict does not cover it
 
-  Only GREEN and MERGED mean there is nothing left to do. FEEDBACK is not a
-  green result: an unresolved review thread is feedback nobody has answered
-  yet, and it counts against landing the pull request the same way a failing
-  check does. The lines after a verdict name every outstanding item.
+  Only GREEN, MERGED and LANDED mean there is nothing left to do. FEEDBACK
+  is not a green result: an unresolved review thread is feedback nobody has
+  answered yet, and it counts against landing the pull request the same way
+  a failing check does. The lines after a verdict name every outstanding
+  item.
 
 READING THE NUMBERS
 
@@ -207,7 +219,9 @@ RUNNING IT FROM AN AGENT
   request stands. When the pull request is unsettled, that is at once, with
   a PENDING line. Otherwise it is when the pull request settles, with a
   verdict. A pull request that has been merged or closed has nothing left to
-  wait for, so every --once run gives it its verdict and exits. A --follow
+  wait for, so every --once run gives it its verdict and exits. With
+  --landed, a merged pull request has something left to wait for until its
+  verdict is LANDED: the workflow runs on the branch it merged into. A --follow
   run stopped before it gave its verdict, as a harness's time limit can stop
   one, leaves the last verdict reported as it was. The --once run after it
   then gives the verdict at once when it differs from that one, even though
@@ -250,6 +264,53 @@ RUNNING IT FROM AN AGENT
 
   It reads and never writes. It posts no comments, pushes nothing, and
   merges nothing, so a read-only token is enough.
+
+AFTER THE MERGE
+
+  A merge is not finished until the branch it merged into is green behind
+  it. Without --landed, the watch ends at MERGED. With --landed, a watch
+  that sees the merge carries on, and watches the workflow runs that pushes
+  to that branch start, until it can say how CI ended for the merged change.
+  The MERGED line names the merge commit.
+
+  The run for the merge commit is often the wrong run to wait for. A
+  workflow can let only one of its runs wait at a time, and then each push
+  to the branch cancels the run that was waiting before it. On a busy
+  branch, the run for the merge commit and the runs for the next few
+  commits can all be cancelled, and the first run that finishes is for a
+  commit several pushes later. That run tests the merged change too, since
+  its commit contains the merge.
+
+  So the watch takes every run that a push to the branch started on a
+  commit that contains the merge. The workflows that count are the ones
+  that ran for the first such commit, which is the merge commit itself
+  unless no workflow ran for it. For each of those workflows, the run that
+  decides is the first one started that was not cancelled. Each cancelled
+  run before it is reported with a CANCEL line, and is not a test result.
+  A run started after the one that decides is not reported. When every
+  run of a workflow so far was cancelled, the watch waits for the next
+  push to start another.
+
+  The verdict is LANDED when the run that decides each workflow passed or
+  was skipped, and RED when one of them failed. A FAIL line names each
+  job that fails in a run that decides, as soon as the job is found to
+  have failed, with the commit the run is on. A RED verdict names the
+  workflow, the commit and each failed job again, each with its link.
+  Somebody may run the failed run again, so with --once a RED verdict
+  waits for news like any other, such as a RERUN line. When no workflow
+  has run on a commit that contains the merge --no-ci-grace after the
+  merge, the verdict is NO-CI.
+
+  Once the merge is seen, the checks, runs and statuses of the pull
+  request's head commit decide nothing, and are not read again. Once the
+  verdict is LANDED, the branch is not read again either: nothing that
+  happens on it afterwards is about the merge. Once every run that
+  decides has finished, runs are listed only up to the last of them to
+  start. GitHub lists at most 1,000 runs at a time when they are chosen
+  by branch, so the runs for the merge would otherwise drop out of the
+  list as the branch gets busier. Whether a commit contains the merge is
+  asked of GitHub once per commit, and the answer is kept in the state
+  file.
 
 WHOSE TOKEN IT READS WITH
 
@@ -302,7 +363,14 @@ LISTENING FOR WEBHOOKS
       attempt of one that is, since a read gives only the latest attempt;
     - a check an app registered, where the token may not read the checks
       and they are counted rather than named;
-    - a facet whose last read failed.
+    - a facet whose last read failed;
+    - with --landed, a workflow run on the branch the pull request merged
+      into, since only a read says whether its commit contains the merge,
+      when it may count: a run the watch holds, a run of a workflow whose
+      every run so far was cancelled, a run on the commit whose workflows
+      are the ones that count, or any run before the watch holds one;
+    - with --landed, a job that failed in a run the watch holds, since
+      only a read gives the jobs of a run.
   No read is made until a throttle has been waited out, and a read a
   throttle refused is still owed, so the verdict waits for it. The
   --stability a verdict waits for is measured in quiet steps of 10
@@ -335,7 +403,8 @@ WHEN IT STOPS
   It never gives up on its own. There is no deadline, so a run that takes
   six hours is watched for six hours, and a run that stops making progress
   produces a STALL line rather than an exit. It exits when the pull request
-  settles: merged or closed, or else a workflow run has appeared and
+  settles: merged (and with --landed, the runs after the merge have
+  ended) or closed, or else a workflow run has appeared and
   completed, every check has concluded, and the picture has held still for a
   few polls. Waiting for the run to appear is the part that matters. A push
   whose workflow has not spawned its jobs yet carries only the check a
@@ -423,7 +492,8 @@ WHEN IT STOPS
 
   Exit status is 0 whenever the watch itself worked, so that a red pull
   request is not confused with a broken script. Pass --exit-code to have the
-  verdict decide instead: 0 for GREEN and MERGED, 1 for anything else.
+  verdict decide instead: 0 for GREEN, MERGED and LANDED, 1 for anything
+  else.
 """
 
 # ---------------------------------------------------------------------------
@@ -1162,6 +1232,11 @@ def run_item(run):
             "attempt": run.get("run_attempt", 1), "event": run.get("event")}
 
 
+def base_run_item(run):
+    return {**run_item(run), "workflow": run["workflow_id"],
+            "commit": run["head_sha"], "created": run["created_at"]}
+
+
 def check_item(run):
     return {"name": run["name"], "status": run["status"],
             "conclusion": run.get("conclusion"), "url": run.get("html_url"),
@@ -1227,7 +1302,7 @@ def progress(item):
 
 class Snapshot:
     FACETS = ("pull", "checks", "runs", "statuses", "issue_comments",
-              "review_comments", "reviews", "threads")
+              "review_comments", "reviews", "threads", "base_runs")
 
     def __init__(self):
         for facet in self.FACETS:
@@ -1241,12 +1316,17 @@ class Snapshot:
 
 
 def read_snapshot(gh, owner, repo, number, head=None, runs=None,
-                  facets=Snapshot.FACETS):
+                  facets=Snapshot.FACETS, pull=None, contains=None,
+                  base_runs=None):
     """Read `facets` of the pull request, recording each failure.
 
     The checks are read with the runs, since they can be made from them.
     The facets that belong to the head commit are read for the commit the
     pull request names when it is read, and for `head` when it is not.
+    The runs on the branch it merged into are read once the pull request,
+    as read or else as `pull`, says it was merged; `contains` and
+    `base_runs`, the runs an earlier read gave, are passed on to
+    read_base_runs().
 
     `runs` are the workflow runs an earlier read listed for the commit
     `head`. GitHub now and then answers the list of a commit's runs with
@@ -1315,7 +1395,110 @@ def read_snapshot(gh, owner, repo, number, head=None, runs=None,
         for r in gh.paged(f"{base}/pulls/{number}/reviews")
     })
     attempt("threads", lambda: read_threads(gh, owner, repo, number))
+    merged = snap.pull or pull
+    if merged and merged.get("merged"):
+        attempt("base_runs", lambda: read_base_runs(
+            gh, base, merged, {} if contains is None else contains,
+            base_runs))
     return snap
+
+
+def read_base_runs(gh, base, pull, contains, held=None):
+    """The workflow runs that say whether the branch a pull request merged
+    into is green behind the merge; see landing_runs().
+
+    Runs are listed from ten minutes before the merge, since a run and the
+    merge are stamped by different parts of GitHub. Once every run that
+    decides a workflow in `held`, the runs an earlier read gave, has
+    finished, they are listed only up to the last of those to start. GitHub
+    lists at most 1,000 runs for a list filtered this way, newest first, so
+    an open-ended list on a busy branch would in time leave out the runs
+    for the merge. A list cut short that way that finds a run that decided
+    has since been cancelled, which a run started again can be, is listed
+    again without the end.
+
+    Whether a commit contains the merge is asked of GitHub, and the answer
+    is kept in `contains`, by commit, for every later read. The jobs that
+    failed are read for each run that decides and has not passed.
+    """
+    merge = pull["merge_commit_sha"]
+    since = datetime.fromtimestamp(merged_at(pull) - 600, timezone.utc)
+    since = since.strftime("%Y-%m-%dT%H:%M:%SZ")
+    branch = urllib.parse.quote(pull["base"]["ref"], safe="")
+
+    def listed(until):
+        window = f"{since}..{until}" if until else f"%3E%3D{since}"
+        runs = {}
+        for run in gh.paged(f"{base}/actions/runs?branch={branch}&event=push"
+                            f"&created={window}", key="workflow_runs"):
+            sha = run["head_sha"]
+            if sha not in contains:
+                compared = gh.get(f"{base}/compare/{merge}...{sha}"
+                                  "?per_page=1")
+                contains[sha] = compared["status"] in ("ahead", "identical")
+            if contains[sha]:
+                runs[str(run["id"])] = base_run_item(run)
+        return landing_runs(runs)
+
+    until = None
+    if held and not undecided(held) and all(
+            run["status"] == "completed"
+            for run in deciding_runs(held).values()):
+        until = max(run["created"] for run in held.values())
+    kept = listed(until)
+    if until and undecided(kept):
+        kept = listed(None)
+    for rid, run in kept.items():
+        # The runs not cancelled are the ones that decide.
+        if verdict(run["conclusion"]) in ("bad", "pending"):
+            run["failed"] = [
+                {"name": job["name"], "conclusion": job["conclusion"],
+                 "url": job.get("html_url")}
+                for job in gh.paged(f"{base}/actions/runs/{rid}/jobs",
+                                    key="jobs")
+                if verdict(job.get("conclusion")) == "bad"]
+    return kept
+
+
+def landing_runs(runs):
+    """The runs, of `runs`, that say how CI ended for a merged change.
+
+    `runs` are the runs that pushes to a branch started on commits that
+    contain a merge. The workflows that count are the ones that ran for the
+    first of those commits. For each, the runs are taken in the order they
+    started, up to and including the first that was not cancelled, which
+    is the run that decides the workflow. A workflow that lets one run wait
+    at a time cancels the waiting run whenever another push arrives, so the
+    run that decides can be on a commit several pushes after the merge.
+    """
+    order = sorted(runs, key=int)
+    if not order:
+        return {}
+    first = runs[order[0]]["commit"]
+    workflows = {runs[rid]["workflow"] for rid in order
+                 if runs[rid]["commit"] == first}
+    kept = {}
+    for rid in order:
+        run = runs[rid]
+        if run["workflow"] in workflows:
+            kept[rid] = run
+            if verdict(run["conclusion"]) != "cancelled":
+                workflows.discard(run["workflow"])
+    return kept
+
+
+def deciding_runs(runs):
+    """Workflow -> the run that decides it, of the runs landing_runs() kept,
+    for each workflow that has one."""
+    return {run["workflow"]: run for run in (runs or {}).values()
+            if verdict(run["conclusion"]) != "cancelled"}
+
+
+def undecided(runs):
+    """The workflows, of the runs landing_runs() kept, whose every run so
+    far was cancelled."""
+    return {run["workflow"] for run in runs.values()} - \
+        deciding_runs(runs).keys()
 
 
 def read_checks(gh, owner, repo, sha, snap):
@@ -1554,6 +1737,14 @@ def failing_statuses(statuses):
                   if status["state"] in ("failure", "error"))
 
 
+def failing_base_runs(runs):
+    """The runs that decide a workflow on the branch a pull request merged
+    into, and failed."""
+    return sorted((run for run in deciding_runs(runs).values()
+                   if verdict(run["conclusion"]) == "bad"),
+                  key=lambda run: run["name"])
+
+
 def reviews_on(reviews, head):
     """The reviews written against this exact commit.
 
@@ -1564,6 +1755,12 @@ def reviews_on(reviews, head):
     """
     return [review for review in (reviews or {}).values()
             if head and review["commit"] and head.startswith(review["commit"])]
+
+
+def merged_at(pull):
+    """When the pull request was merged, as a time.time() value."""
+    return datetime.fromisoformat(
+        pull["merged_at"].replace("Z", "+00:00")).timestamp()
 
 
 def unresolved_threads(threads):
@@ -1624,6 +1821,7 @@ class Watcher:
         self.throttle_told = 0.0        # the throttle a WARN line named
         self.last_digest = None
         self.merge_state = None
+        self.contains = {}              # commit -> whether it has the merge
         self.state_path = options.state and Path(options.state)
 
     def name(self, number):
@@ -1680,6 +1878,8 @@ class Watcher:
         The last verdict reported is read back, and so is the last thing
         said about the commit --expect named. Each was reported already, so
         --once does not count either as news when it finds it again.
+        Whether each commit read so far contains the merge is read back as
+        well, since GitHub answers that the same way every time.
 
         The pace of the polling and the count of quiet polls a verdict
         rests on are not read back. They say how much watching has been
@@ -1703,6 +1903,7 @@ class Watcher:
             self.merge_state = saved.get("merge_state")
             self.verdict = saved.get("verdict")
             self.reported_expectation = saved.get("expectation")
+            self.contains = dict(saved.get("contains", {}))
             since = saved.get("head_since")
             if since is not None:
                 self.head_since = min(since, time.time())
@@ -1719,6 +1920,7 @@ class Watcher:
                                         "verdict": self.verdict,
                                         "expectation":
                                             self.reported_expectation,
+                                        "contains": self.contains,
                                         "known": self.known}))
         except OSError:
             pass
@@ -1739,7 +1941,9 @@ class Watcher:
         # failed read of the runs, the list is taken as it stands.
         runs = None if self.failures.get("runs") else self.known.get("runs")
         snap = read_snapshot(self.gh, *self.location, self.number, self.head,
-                             runs, facets)
+                             runs, self.readable(facets),
+                             self.known.get("pull"), self.contains,
+                             self.known.get("base_runs"))
         if facets == Snapshot.FACETS:
             self.gh.forget_unread()
         else:
@@ -1752,6 +1956,44 @@ class Watcher:
                     for side in (snap.pull["base"], snap.pull["head"])}
         self.report_errors(snap)
         return snap
+
+    def readable(self, facets=Snapshot.FACETS):
+        """The facets of `facets` there may be anything to read for.
+
+        The runs on the branch the pull request merged into are read only
+        with --landed, and only until the verdict is LANDED: nothing that
+        happens on that branch afterwards is about the merge. They are read
+        in the poll that finds the merge, since read_snapshot() reads them
+        whenever the pull request it reads was merged. Once they are being
+        watched, the checks, runs and statuses of the pull request's head
+        commit decide nothing, and are not read either.
+        """
+        later = self.options.landed and self.verdict != "LANDED"
+        head = ("checks", "runs", "statuses") if self.landing() else ()
+        return tuple(facet for facet in facets if facet not in head and
+                     (facet != "base_runs" or later))
+
+    def watching_base(self):
+        """Whether the runs on the branch the pull request merged into are
+        being watched: with --landed, from the merge until LANDED."""
+        return self.landing() and "base_runs" in self.readable()
+
+    def landing(self):
+        """Whether --landed was given and the pull request was merged."""
+        return bool(self.options.landed and
+                    (self.known.get("pull") or {}).get("merged"))
+
+    def merge(self):
+        """The merge commit, and the branch it was pushed to."""
+        pull = self.known.get("pull") or {}
+        return pull.get("merge_commit_sha") or "", pull["base"]["ref"]
+
+    def on_base(self, run):
+        """Where a run on the branch the pull request merged into ran."""
+        merge, branch = self.merge()
+        where = f"on {branch} at {run['commit'][:9]}"
+        return where if run["commit"] == merge else \
+            f"{where}, which contains {merge[:9]}"
 
     def report_errors(self, snap):
         """Say when GitHub stops answering, and say when it starts again.
@@ -1811,11 +2053,14 @@ class Watcher:
             self.check_head(snap, announce)
             self.check_pull_state(snap, announce)
             self.check_merge_state(snap, announce)
+            # What follows reads the pull request as it is now.
+            self.known["pull"] = snap.pull
         self.check_checks(snap, announce)
         self.check_runs(snap, announce)
         self.check_statuses(snap, announce)
         self.check_comments(snap, announce)
         self.check_threads(snap, announce)
+        self.check_base_runs(snap, announce)
         for facet in Snapshot.FACETS:
             value = getattr(snap, facet)
             if value is not None:
@@ -1854,7 +2099,13 @@ class Watcher:
         was = previous.get("state")
         if pull["state"] != was and was is not None:
             if pull.get("merged"):
-                self.emit("MERGED", f"{self.slug} was merged")
+                merge = pull.get("merge_commit_sha")
+                watching = (f"; watching {pull['base']['ref']} for CI on a "
+                            "commit that contains it") \
+                    if self.options.landed else ""
+                self.emit("MERGED", f"{self.slug} was merged"
+                                    + (f" as {merge[:9]}" if merge else "")
+                                    + watching)
             else:
                 self.emit("CLOSED", f"{self.slug} is now {pull['state']}")
 
@@ -2024,6 +2275,49 @@ class Watcher:
                 word = "resolved" if thread["resolved"] else "reopened"
                 self.emit("THREAD", f"{word} · {spot} · {thread['author']}")
 
+    def check_base_runs(self, snap, announce):
+        """Report the runs on the branch the pull request merged into.
+
+        A cancelled run is reported apart from a finished one, since it is
+        not a test result, and the run that decides its workflow is a later
+        one. Each job of a run that decides is reported when it is found to
+        have failed, and a run that is run again is reported when it goes
+        back to pending.
+        """
+        if snap.base_runs is None or not announce:
+            return
+        old = self.known.get("base_runs") or {}
+        for rid, run in sorted(snap.base_runs.items(),
+                               key=lambda item: int(item[0])):
+            before = old.get(rid) or {}
+            where = self.on_base(run)
+            outcome = verdict(run["conclusion"])
+            if before and all(before[key] == run[key] for key in
+                              ("status", "conclusion", "attempt")):
+                pass
+            elif run["status"] != "completed" or outcome == "pending":
+                if not before:
+                    self.emit("RUN", f"{run['name']} started {where}  "
+                                     f"{run['url']}")
+                elif concluded(before["conclusion"]):
+                    self.emit("RERUN", f"{run['name']} {where} went back to "
+                                       "pending")
+            elif outcome == "cancelled":
+                self.emit("CANCEL", f"{run['name']} {where} was cancelled — "
+                                    "a newer push or a manual cancel, not a "
+                                    "test result; a later run decides")
+            else:
+                attempt = f" (attempt {run['attempt']})" \
+                    if run["attempt"] > 1 else ""
+                self.emit("RUN", f"{run['name']}{attempt} completed "
+                                 f"{run['conclusion']} {where}  {run['url']}")
+            reported = [job["url"] for job in before.get("failed", [])]
+            for job in run.get("failed", []):
+                if job["url"] not in reported:
+                    self.emit("FAIL", f"{run['name']} / {job['name']} — "
+                                      f"{job['conclusion']} {where}  "
+                                      f"{job['url']}")
+
     # -- settling ----------------------------------------------------------
 
     def digest(self):
@@ -2063,6 +2357,9 @@ class Watcher:
                    for rid, r in (self.known.get("reviews") or {}).items()),
             sorted((tid, thread["resolved"])
                    for tid, thread in (self.known.get("threads") or {}).items()),
+            sorted((rid, r["status"], r["conclusion"] or "", r["attempt"],
+                    len(r.get("failed", [])))
+                   for rid, r in (self.known.get("base_runs") or {}).items()),
         ], sort_keys=True)
 
     def is_settled(self):
@@ -2087,6 +2384,8 @@ class Watcher:
         the watch settles without it and the verdict says it was never read.
         """
         pull = self.known.get("pull")
+        if self.landing():
+            return self.base_settled()
         if pull and pull.get("state") != "open":
             return True, ("it was merged" if pull.get("merged")
                           else "it was closed without merging")
@@ -2134,6 +2433,37 @@ class Watcher:
             return True, "everything this token can read has finished"
         return True, "everything registered has finished"
 
+    def base_settled(self):
+        """Whether CI on the branch the pull request merged into has ended
+        for the merge; see landing_runs() for which runs say so."""
+        merge, branch = self.merge()
+        runs = self.known.get("base_runs")
+        if runs is None:
+            if "base_runs" in self.refused:
+                return True, f"the workflow runs on {branch} may not be read"
+            return False, f"no reading of the workflow runs on {branch} yet"
+        if not runs:
+            waited = time.time() - merged_at(self.known["pull"])
+            if waited < self.options.no_ci_grace:
+                return False, (f"no workflow run on {branch} is on a commit "
+                               f"that contains {merge[:9]} yet")
+            return True, (f"no workflow ran for a push to {branch} that "
+                          f"contains {merge[:9]} in {duration(waited)}")
+        deciding = deciding_runs(runs)
+        going = sorted(run["name"] for run in deciding.values()
+                       if run["status"] != "completed" or
+                       verdict(run["conclusion"]) == "pending")
+        cancelled = sorted({run["name"] for run in runs.values()
+                            if run["workflow"] in undecided(runs)})
+        waiting = ([f"{', '.join(going)} still going on {branch}"]
+                   if going else []) + \
+            ([f"every run so far of {', '.join(cancelled)} on {branch} was "
+              "cancelled"] if cancelled else [])
+        if waiting:
+            return False, "; ".join(waiting)
+        return True, (f"the runs that decide each workflow on {branch}, on "
+                      f"commits that contain {merge[:9]}, have finished")
+
     # -- reporting ---------------------------------------------------------
 
     def announce_target(self, pull):
@@ -2166,7 +2496,8 @@ class Watcher:
         drawn from an outage.
         """
         return [facet for facet in Snapshot.FACETS
-                if self.known.get(facet) is None]
+                if self.known.get(facet) is None and
+                (facet != "base_runs" or self.landing())]
 
     def size(self, facet):
         value = self.known.get(facet)
@@ -2196,6 +2527,19 @@ class Watcher:
                                 + ([f"{bad_runs} failed"] if bad_runs else []))
             pieces.append(f"runs {len(runs)}"
                           + (f" ({trailer})" if trailer else ""))
+        if self.landing():
+            branch = self.merge()[1]
+            runs = self.known.get("base_runs")
+            if runs is None:
+                pieces.append(f"{branch} runs ?")
+            else:
+                counts = tally_checks(runs)
+                trailer = ", ".join(
+                    f"{counts[key]} {word}" for key, word in (
+                        ("pending", "going"), ("bad", "failed"),
+                        ("cancelled", "cancelled")) if counts[key])
+                pieces.append(f"{branch} runs {len(runs)}"
+                              + (f" ({trailer})" if trailer else ""))
         pieces.append(f"comments {self.size('issue_comments')} issue / "
                       f"{self.size('review_comments')} inline")
         reviews = self.known.get("reviews")
@@ -2219,6 +2563,13 @@ class Watcher:
     def outstanding_lines(self):
         """Everything a person would have to deal with before landing this."""
         lines = []
+        for run in failing_base_runs(self.known.get("base_runs")) \
+                if self.landing() else ():
+            lines.append(f"failing {self.on_base(run)}: {run['name']} "
+                         f"({run['conclusion']})  {run['url']}")
+            lines += [f"failing job: {run['name']} / {job['name']} "
+                      f"({job['conclusion']})  {job['url']}"
+                      for job in run.get("failed", [])]
         for name in failing_runs(self.known.get("runs")):
             lines.append(f"failing run: {name}")
         for name in failing_names(self.known.get("checks")):
@@ -2278,6 +2629,13 @@ class Watcher:
         blind = {"checks", "runs"} & set(unread)
         if not settled:
             return "PENDING"
+        if self.landing():
+            runs = self.known.get("base_runs")
+            if runs is None:
+                return "UNKNOWN"
+            if failing_base_runs(runs):
+                return "RED"
+            return "LANDED" if runs else "NO-CI"
         if pull.get("merged"):
             return "MERGED"
         if pull.get("state") not in (None, "open"):
@@ -2323,9 +2681,13 @@ class Watcher:
         self.note(url)
         ends = not (self.options.follow or self.options.status or
                     self.options.once)
-        if settled and ends and verdict not in ("MERGED", "CLOSED"):
+        if settled and ends and verdict not in ("MERGED", "CLOSED", "LANDED"):
             self.note("the watch ends here; --follow keeps it open for a "
                       "later review or push")
+        if verdict == "MERGED":
+            self.note(f"--landed watches {pull['base']['ref']} from here, "
+                      "until CI there ends on a commit that contains the "
+                      "merge")
         return verdict
 
     def heartbeat(self, settled_reason):
@@ -2483,7 +2845,7 @@ class Watcher:
                         # A pull request that is over has nothing left to
                         # wait for, so its verdict is always the answer.
                         due = verdict != self.verdict or \
-                            verdict in ("MERGED", "CLOSED")
+                            verdict in ("MERGED", "CLOSED", "LANDED")
                     else:
                         # A change reported since the last verdict is owed
                         # a fresh one, as it is under --once.
@@ -2687,6 +3049,10 @@ class Watcher:
         grace = self.head_since + self.options.no_ci_grace
         if not self.known.get("runs") and grace > now:
             times.append(grace)
+        if self.landing() and self.known.get("base_runs") == {}:
+            grace = merged_at(self.known["pull"]) + self.options.no_ci_grace
+            if grace > now:
+                times.append(grace)
         if self.ends_at is not None:
             times.append(self.ends_at)
         heard = self.relay.next(min(times))
@@ -2721,6 +3087,9 @@ class Watcher:
         facets = self.wanted | {
             facet for facet in Snapshot.FACETS if facet not in self.refused
             and (self.failures.get(facet) or self.known.get(facet) is None)}
+        facets &= set(self.readable())
+        if not self.landing():
+            facets.discard("base_runs")
         pull = self.known.get("pull") or {}
         if pull.get("state") == "open" and not merge_answered(pull):
             facets.add("pull")
@@ -2759,6 +3128,17 @@ class Watcher:
             return {"pull"} if pushed in (branch(base), branch(head)) else set()
         if field("repository", "id") != branch(base)[0]:
             return set()
+        run = payload.get("workflow_run") or {}
+        job = payload.get("workflow_job") or {}
+        if self.watching_base():
+            if run.get("event") == "push" and \
+                    run.get("head_branch") == base.get("ref"):
+                return self.hear_base_run(run)
+            # A job's webhook carries no word of whether its run counts, so
+            # a failing job of a run held is read for.
+            if str(job.get("run_id")) in (self.known.get("base_runs") or {}):
+                bad = verdict(job.get("conclusion")) == "bad"
+                return {"base_runs"} if bad else set()
         snap, reads = Snapshot(), set()
 
         def put(facet, key, item, new=True):
@@ -2840,6 +3220,37 @@ class Watcher:
                 put("checks", str(item["id"]), check_item(item), new=False)
         self.absorb(snap)
         return reads
+
+    def hear_base_run(self, run):
+        """The facets to read for a webhook about a run on the branch the
+        pull request merged into.
+
+        Only a read says whether the run's commit contains the merge, and
+        only a read gives the jobs of a run that failed, so a run that may
+        count is read for rather than put in place. Before any run is held,
+        that is any run. After, it is a run held, a run of a workflow whose
+        every held run was cancelled, and a run on the commit the first run
+        held is on, whose workflows are the ones that count. What the
+        webhook says of a run held is kept, for doubt() to hold the read to,
+        unless it is what the watch holds already.
+        """
+        held = self.known.get("base_runs")
+        key = str(run["id"])
+        if not held:
+            return {"base_runs"}
+        if key in held:
+            said = {"status": run["status"],
+                    "conclusion": run.get("conclusion"),
+                    "attempt": run.get("run_attempt", 1)}
+            if all(held[key][name] == value for name, value in said.items()):
+                return set()
+            self.announced["base_runs", key] = said
+            return {"base_runs"}
+        first = held[min(held, key=int)]["commit"]
+        if run.get("head_sha") == first or \
+                run.get("workflow_id") in undecided(held):
+            return {"base_runs"}
+        return set()
 
     def resolve_expectation(self):
         """Work out what --expect names, and prove GitHub has it.
@@ -3000,6 +3411,10 @@ def main(argv):
                              "current state and exit")
     ending.add_argument("--follow", action="store_true",
                         help="keep watching after it settles")
+    parser.add_argument("--landed", action="store_true",
+                        help="after a merge, watch the branch it merged into "
+                             "until CI there ends on a commit that contains "
+                             "the merge; see AFTER THE MERGE")
     parser.add_argument("--for", dest="for_seconds", type=float,
                         metavar="SECONDS",
                         help="end the watch at the first wait that would run "
@@ -3121,7 +3536,7 @@ def main(argv):
         die_by(stopped.number)
     except GitHubError as error:
         raise SystemExit(f"prwatch: {error}")
-    if options.exit_code and verdict not in ("GREEN", "MERGED"):
+    if options.exit_code and verdict not in ("GREEN", "MERGED", "LANDED"):
         return 1
     return 0
 

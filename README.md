@@ -236,7 +236,10 @@ git config --global rerere.enabled true
   commit; drop it if you want one verdict and an exit. Add
   `--require-review LOGIN` where a named reviewer has to sign off, and
   the agent will not be handed a green result on a commit that reviewer
-  never reached.
+  never reached. Add `--landed` where a merge is not done until the branch
+  it merged into is green behind it: the watch carries on past MERGED,
+  through runs that later pushes cancelled, to a verdict of LANDED, or RED
+  with the workflow, job and commit that failed.
 
   Add `--github-webhook-relay HOST:PORT` where a relay passes on GitHub's
   webhooks over the network, and the watch takes each change from the
