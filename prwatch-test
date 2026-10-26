@@ -37,10 +37,16 @@ spec.loader.exec_module(prwatch)
 
 
 class Options:
-    """The defaults, so each case names only what it cares about."""
+    """The defaults, so each case names only what it cares about.
+
+    Every line is printed, as with --verbose, so that a case about what is
+    found can see it. The cases about which lines call for a response pass
+    verbose=False, which is what prwatch does by default.
+    """
 
     def __init__(self, **overrides):
         defaults = dict(expect=None, status=False, once=False, follow=False,
+                        verbose=True,
                         interval=60, interval_growth=2, interval_max=240,
                         heartbeat=900, stall=1800, stall_growth=2,
                         stall_max=86400, stability=3, min_checks=0,
@@ -104,7 +110,8 @@ def pull(head="a" * 40, state="open", merged=False, mergeable="clean",
     merge = {"merge_commit_sha": MERGE, "merged_at": merged_at} \
         if merged else {}
     return {**merge,
-            "head": {"sha": head, "ref": "feature", "repo": {"id": 7}},
+            "head": {"sha": head, "ref": "feature",
+                     "repo": {"id": 7, "full_name": "o/r"}},
             "state": state, "merged": merged,
             "mergeable_state": mergeable, "title": "t", "draft": False,
             "mergeable": answered, "number": 1,
@@ -1373,6 +1380,7 @@ def expect_a_commit_id_stays_put():
     watcher.expect = "a" * 40
     watcher.head = "a" * 40
     watcher.local_commit = lambda: "8" * 40
+    watcher.astray = lambda commit, pull: "it is elsewhere"
     snap = prwatch.Snapshot()
     snap.pull = pull(head="b" * 40)
     out = io.StringIO()
@@ -1382,6 +1390,564 @@ def expect_a_commit_id_stays_put():
     print("ok   --expect with a commit id names that one commit" if good
           else f"FAIL expect fixed: {out.getvalue()}")
     return good
+
+
+# -- which lines call for a response ----------------------------------------
+
+CUBIC = "cubic-dev-ai[bot]"
+
+
+def said(snapshot_fields, known, **options):
+    """What one snapshot on top of `known` prints, by default and with
+    --verbose."""
+    return tuple(check("", snapshot_fields, known,
+                       Options(verbose=verbose, **options))[2]
+                 for verbose in (False, True))
+
+
+def comment(body, user="someone", cid="1"):
+    return {cid: {"user": user, "updated": "2026-09-20T10:00:00Z",
+                  "url": "u", "body": body}}
+
+
+def inline(body, user=CUBIC):
+    return {"1": {**comment(body, user)["1"], "path": "f.py", "line": 1,
+                  "reply_to": None}}
+
+
+def summary(body, user=CUBIC, state="COMMENTED"):
+    return {"1": {"user": user, "state": state, "commit": "a" * 40,
+                  "url": "u", "body": body}}
+
+
+@case
+def only_what_calls_for_a_response_is_printed():
+    """Without --verbose, an event is printed only when it calls for a
+    response, and with it, every event is.
+
+    Each case is a change and the words that must be printed for it, or
+    None for a change that is printed only with --verbose. The review bot's
+    summaries are the ones it writes: it reports a later commit by editing
+    its review in place, and marks an issue addressed by editing the inline
+    comment that raised it.
+    """
+    building = check_run("Test", status="in_progress", conclusion=None)
+    cases = [
+        ("a merge", {"pull": pull(state="closed", merged=True)},
+         {"pull": pull()}, "MERGED"),
+        ("a close", {"pull": pull(state="closed")}, {"pull": pull()},
+         "CLOSED"),
+        ("a new conflict", {"pull": pull(mergeable="dirty")},
+         {"pull": pull(), "_merge": "clean"}, "no longer merges cleanly"),
+        ("conflicts going away", {"pull": pull()},
+         {"pull": pull(mergeable="dirty"), "_merge": "dirty"}, None),
+        ("a push", {"pull": pull(head="b" * 40)}, {"pull": pull()}, None),
+        ("a failing check",
+         {"checks": check_run("Test", conclusion="failure")},
+         {"checks": building}, "FAIL"),
+        ("a cancelled check",
+         {"checks": check_run("Test", conclusion="cancelled")},
+         {"checks": building}, None),
+        ("a check run again",
+         {"checks": check_run("Test", status="queued", conclusion=None)},
+         {"checks": check_run("Test")}, None),
+        ("a run starting",
+         {"runs": workflow(status="in_progress", conclusion=None)},
+         {"runs": {}}, None),
+        ("a run passing", {"runs": workflow()},
+         {"runs": workflow(status="in_progress", conclusion=None)}, None),
+        ("a failing commit status",
+         {"statuses": {"ci": {"state": "failure", "url": "u",
+                              "updated": ""}}},
+         {"statuses": {}}, "FAIL"),
+        ("a comment", {"issue_comments": comment("please rename it")},
+         {"issue_comments": {}}, "please rename it"),
+        ("a comment edited by a person",
+         {"issue_comments": comment("please rename it to x")},
+         {"issue_comments": comment("please rename it")}, "edited"),
+        ("an inline comment from a bot",
+         {"review_comments": inline("this leaks a handle")},
+         {"review_comments": {}}, "this leaks a handle"),
+        ("an inline comment a bot marked addressed",
+         {"review_comments": inline("this leaks a handle ✅ Addressed in "
+                                    "1a2b3c4")},
+         {"review_comments": inline("this leaks a handle")}, None),
+        ("a review from a person", {"reviews": summary("No issues found",
+                                                       user="someone")},
+         {"reviews": {}}, "No issues found"),
+        ("a bot review that found nothing",
+         {"reviews": summary("**No issues found** across 9 files")},
+         {"reviews": {}}, None),
+        ("a bot review that found only issues it had found",
+         {"reviews": summary("**1 existing issue remains and no new issues "
+                             "found** across 25 files")},
+         {"reviews": {}}, None),
+        ("a bot review without a count that finds issues",
+         {"reviews": summary("**3 issues found** across 6 files")},
+         {"reviews": summary("")}, "3 issues found"),
+        ("a bot review without a count that finds none",
+         {"reviews": summary("**No issues found** across 6 files")},
+         {"reviews": summary("")}, None),
+        ("a bot review that found new issues among many",
+         {"reviews": summary("**2 existing issues remain and 1 new issue "
+                             "found** across 16 files")},
+         {"reviews": summary("**3 issues found** across 6 files")},
+         "1 new issue found"),
+        ("a bot review that found only issues it had found, in the plural",
+         {"reviews": summary("**2 existing issues remain and no new issues "
+                             "found** across 25 files")},
+         {"reviews": {}}, None),
+        ("a bot review that found an issue",
+         {"reviews": summary("**1 issue found** across 6 files")},
+         {"reviews": {}}, "1 issue found"),
+        ("a bot review that found a new issue on a later commit",
+         {"reviews": summary("**1 existing issue remains and 1 new issue "
+                             "found** across 16 files")},
+         {"reviews": summary("**1 issue found** across 6 files")},
+         "1 new issue found"),
+        ("a bot review that found a new issue and lost an old one",
+         {"reviews": summary("**1 existing issue remains and 1 new issue "
+                             "found** across 16 files")},
+         {"reviews": summary("**2 issues found** across 6 files")},
+         "1 new issue found"),
+        ("a bot review that counts more issues",
+         {"reviews": summary("**4 issues found** across 6 files")},
+         {"reviews": summary("**3 issues found** across 6 files")},
+         "4 issues found"),
+        ("a bot review that counts fewer issues",
+         {"reviews": summary("**5 issues found** across 58 files")},
+         {"reviews": summary("**8 issues found** across 58 files")}, None),
+        ("a bot review whose issues were addressed",
+         {"reviews": summary("**All reported issues were addressed** across "
+                             "9 files")},
+         {"reviews": summary("**1 issue found** across 9 files")}, None),
+        ("a bot review that found no new issue",
+         {"reviews": summary("**1 existing issue remains and no new issues "
+                             "found** across 25 files")},
+         {"reviews": summary("**1 existing issue remains and 1 new issue "
+                             "found** across 25 files")}, None),
+        ("a bot review edited below its count",
+         {"reviews": summary("**1 existing issue remains and 1 new issue "
+                             "found** f.py: leak. Addressed in 1a2b3c4")},
+         {"reviews": summary("**1 existing issue remains and 1 new issue "
+                             "found** f.py: leak.")}, None),
+        ("a review dismissed",
+         {"reviews": summary("fix it", user="someone", state="DISMISSED")},
+         {"reviews": summary("fix it", user="someone",
+                             state="CHANGES_REQUESTED")}, None),
+        ("a thread", {"threads": thread()}, {"threads": {}}, "THREAD"),
+        ("a thread resolved", {"threads": thread(resolved=True)},
+         {"threads": thread()}, None),
+        ("a thread reopened", {"threads": thread()},
+         {"threads": thread(resolved=True)}, "reopened"),
+    ]
+    problems = []
+    for name, fields, known, wanted in cases:
+        quiet, verbose = said(fields, known)
+        if not verbose:
+            problems.append(f"{name}: nothing was found")
+        elif wanted is None and quiet:
+            problems.append(f"{name}: printed {quiet!r}")
+        elif wanted is not None and wanted not in quiet:
+            problems.append(f"{name}: printed {quiet!r}, not {wanted!r}")
+    return report("only what calls for a response is printed", problems, "")
+
+
+@case
+def status_prints_every_line():
+    """--status is a reading on demand, so it prints what a watch would
+    keep to itself."""
+    output = said({"pull": pull(head="b" * 40)}, {"pull": pull()},
+                  status=True)[0]
+    return report("--status prints every line",
+                  [] if "RETARGET" in output else ["no RETARGET line"], output)
+
+
+@case
+def an_unreadable_pull_request_calls_for_a_response():
+    """A watch that cannot read the pull request cannot see a merge, a
+    conflict or a push, so that is printed. A part of the picture that
+    stays unread is named below the verdict instead. Reading it again
+    calls for nothing."""
+    problems = []
+    for facet, wanted in (("pull", True), ("threads", False),
+                          ("checks", False)):
+        for error in (prwatch.GitHubError("HTTP 502", 502),
+                      prwatch.GitHubError("HTTP 403", 403)):
+            watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r",
+                                      1, Options(verbose=False, warn_after=1))
+            snap = prwatch.Snapshot()
+            snap.errors = {facet: error}
+            out = io.StringIO()
+            with redirect_stdout(out):
+                watcher.report_errors(snap)
+            if ("WARN" in out.getvalue()) != wanted:
+                problems.append(f"{facet} failing with {error}: "
+                                f"{out.getvalue()!r}")
+            snap.errors = {}
+            out = io.StringIO()
+            with redirect_stdout(out):
+                watcher.report_errors(snap)
+            if out.getvalue():
+                problems.append(f"{facet} read again: {out.getvalue()!r}")
+    return report("an unreadable pull request calls for a response",
+                  problems, "")
+
+
+@case
+def a_mismatch_calls_for_a_response_only_when_no_push_fixes_it():
+    """A commit not pushed yet contains the head, and pushing it fixes the
+    mismatch, so that is not printed. A checkout of another branch, or a
+    push to the wrong place, is, and so is a checkout of another branch
+    after a commit that was not printed. A push that then puts it right,
+    and the MATCH when the head reaches the commit, are not printed, and
+    nothing is said about --expect once the pull request is merged."""
+    problems = []
+    for expect, revision in (("HEAD", True), ("c" * 40, False)):
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options(expect=expect, verbose=False))
+        watcher.expect_revision = revision
+        watcher.expect = "c" * 40
+        watcher.local_commit = lambda: "c" * 40
+        printed = []
+        for why, head in ((None, "a" * 40), ("no push will do", "a" * 40),
+                          ("no push will do", "a" * 40), (None, "a" * 40),
+                          (None, "c" * 40)):
+            watcher.astray = lambda commit, pull: why
+            snap = prwatch.Snapshot()
+            snap.pull = pull(head=head)
+            out = io.StringIO()
+            with redirect_stdout(out):
+                watcher.absorb(snap, announce=True)
+            printed.append(out.getvalue())
+        if printed[0] or printed[2] or printed[3] or printed[4] or \
+                "MISMATCH" not in printed[1] or \
+                "no push will do" not in printed[1]:
+            problems.append(f"--expect {expect[:9]} printed {printed}")
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(expect="HEAD", verbose=False))
+    watcher.expect_revision = True
+    watcher.expect = "c" * 40
+    watcher.local_commit = lambda: "c" * 40
+    watcher.astray = lambda commit, pull: "no push will do"
+    snap = prwatch.Snapshot()
+    snap.pull = pull(state="closed", merged=True)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        watcher.absorb(snap, announce=True)
+        watcher.final_report("it was merged")
+    if "MISMATCH" in out.getvalue() or "HEAD is" in out.getvalue():
+        problems.append(f"after a merge it printed {out.getvalue()!r}")
+    return report("a mismatch calls for a response only when no push fixes "
+                  "it", problems, "")
+
+
+@case
+def where_a_commit_has_been_pushed_is_asked_of_git():
+    """A commit is on its way when it was pushed to the pull request's
+    branch, when it is on top of the head and pushed nowhere, and when it
+    was rebased on the pull request's branch and not pushed yet. It is
+    astray when it was pushed only to another remote or branch, when it is
+    on another branch, when the head has commits it lacks, and when the
+    head is not in the checkout. When no remote names the pull request's
+    repository, as after a rename, any remote's branch of that name will
+    do. A branch of another name that tracks the pull request's branch is
+    that branch."""
+    def git(directory, *args):
+        return subprocess.run(["git", "-C", directory, "-c", "user.name=t",
+                               "-c", "user.email=t@t", *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def commit(directory, message):
+        git(directory, "commit", "-q", "--allow-empty", "-m", message)
+        return git(directory, "rev-parse", "HEAD")
+
+    with tempfile.TemporaryDirectory() as directory:
+        git(directory, "init", "-q")
+        base = commit(directory, "base")
+        head = commit(directory, "head")
+        ahead = commit(directory, "ahead")
+        git(directory, "checkout", "-q", "-b", "rebased", base)
+        rebased = commit(directory, "rebased")
+        git(directory, "checkout", "-q", "--orphan", "other")
+        other = commit(directory, "other")
+        git(directory, "remote", "add", "origin", "https://github.com/O/R")
+        git(directory, "remote", "add", "fork", "git@github.com:me/r.git")
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options(expect="HEAD"))
+        watcher.expect_revision = True
+        saved = prwatch.git
+        prwatch.git = lambda *args: saved(*args, cwd=directory)
+        answers = []
+        try:
+            for watched, local, branch, refs, repo in (
+                    (head, ahead, "feature", {"origin/feature": head}, "o/r"),
+                    (head, ahead, "feature", {"origin/feature": ahead}, "o/r"),
+                    (head, rebased, "feature", {"origin/feature": head},
+                     "o/r"),
+                    (head, rebased, "feature",
+                     {"origin/feature": rebased}, "o/r"),
+                    (head, ahead, "feature", {"origin/feature": ahead},
+                     "o/renamed"),
+                    (head, ahead, "feature",
+                     {"fork/feature": ahead, "origin/HEAD": ahead}, "o/r"),
+                    (head, ahead, "feature", {"origin/other": ahead}, "o/r"),
+                    (head, other, "other", {}, "o/r"),
+                    (head, rebased, "rebased", {}, "o/r"),
+                    (ahead, head, "feature", {"origin/feature": ahead},
+                     "o/r"),
+                    ("f" * 40, ahead, "feature", {}, "o/r")):
+                git(directory, "checkout", "-q", "-B", branch, local)
+                for ref in ("origin/feature", "origin/other", "fork/feature",
+                            "origin/HEAD"):
+                    git(directory, "update-ref", "-d", f"refs/remotes/{ref}")
+                for ref, target in refs.items():
+                    git(directory, "update-ref", f"refs/remotes/{ref}", target)
+                watcher.head = watched
+                fetched = pull()
+                fetched["head"]["repo"]["full_name"] = repo
+                answers.append(watcher.astray(local, fetched))
+            watcher.head = head
+            git(directory, "update-ref", "refs/remotes/origin/feature", head)
+            git(directory, "update-ref", "refs/remotes/origin/HEAD", rebased)
+            git(directory, "checkout", "-q", "-B", "work", rebased)
+            git(directory, "branch", "-q", "--set-upstream-to",
+                "origin/feature")
+            answers.append(watcher.astray(rebased, pull()))
+            git(directory, "checkout", "-q", "-B", "trunk", rebased)
+            answers.append(watcher.astray(rebased, pull()))
+            git(directory, "checkout", "-q", "-B", "feature", rebased)
+            git(directory, "update-ref", "-d", "refs/remotes/origin/HEAD")
+            missing = watcher.astray("e" * 40, pull())
+            watcher.expect_revision = False
+            by_id = watcher.astray(rebased, pull())
+            watcher.expect_revision = True
+            git(directory, "update-ref", "refs/remotes/origin/feature", head)
+            watcher.head = head
+            fetched = watcher.astray(rebased, pull())
+        finally:
+            prwatch.git = saved
+    tracking, elsewhere = answers[-2:]
+    answers = answers[:-2]
+    problems = []
+    if "has not got eeeeeeeee" not in (missing or ""):
+        problems.append(f"a commit the checkout has not got gave {missing!r}")
+    if "does not contain" not in (by_id or ""):
+        problems.append(f"a commit id off the head gave {by_id!r}")
+    if fetched is not None:
+        problems.append(f"a rebase of the pull request's branch, read the "
+                        f"same as one fetched from somebody else, gave "
+                        f"{fetched!r}")
+    if tracking is not None:
+        problems.append(f"a branch tracking the pull request's was astray: "
+                        f"{tracking!r}")
+    if "does not contain" not in (elsewhere or ""):
+        problems.append(f"another branch, pushed only as origin/HEAD, gave "
+                        f"{elsewhere!r}")
+    if answers[:5] != [None] * 5:
+        problems.append(f"a commit on its way was astray: {answers[:5]}")
+    for answer, words in zip(answers[5:], ("pushed to fork/feature, but",
+                                           "pushed to origin/other",
+                                           "does not contain",
+                                           "does not contain",
+                                           "somebody else pushed",
+                                           "somebody else pushed")):
+        if words not in (answer or ""):
+            problems.append(f"{answer!r} does not say {words!r}")
+    return report("where a commit has been pushed is asked of git", problems,
+                  "")
+
+
+@case
+def a_verdict_is_printed_once_for_each_head():
+    """A verdict is printed the first time it is reached for a head commit,
+    and again only when it changes, across processes as well as within one.
+
+    A --follow watch that sees the build go back to pending and pass again
+    has nothing to print. A failure changes the verdict, and so it is
+    printed, with the failing check named below it and nowhere else. A
+    --once run after it waits. A push whose build fails the same way gets a
+    verdict of its own, printed by the --once run that sees the failure,
+    and the run after that waits.
+    """
+    pushed = {"head": "b" * 40, "conclusion": "failure"}
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        runs = [process(state, readings, verbose=False, **mode) for readings,
+                mode in (
+                    ([{}] * 3, {"once": True}),
+                    ([{"lint": "queued"}] * 2 + [{"lint": "success"}] * 4,
+                     {"follow": True}),
+                    ([{"conclusion": "failure"}] * 4, {"follow": True}),
+                    ([{"conclusion": "failure"}] * 4, {"once": True}),
+                    ([pushed] * 4, {"once": True}),
+                    ([pushed] * 4, {"once": True}))]
+    printed = [tags(output) for output, _, _ in runs]
+    wanted = [["WAITING"], [], ["FAIL", "WAITING"], [], ["FAIL", "WAITING"],
+              []]
+    problems = [] if printed == wanted else [f"it printed {printed}"]
+    if "RED" not in runs[4][0]:
+        problems.append("the push was not given RED")
+    if runs[2][0].count("failing: Test (failure)") != 1:
+        problems.append("the failing check was not named once, below the "
+                        "verdict")
+    return report("a verdict is printed once for each head", problems,
+                  "".join(output for output, _, _ in runs))
+
+
+@case
+def a_rebase_in_progress_is_on_its_way():
+    """A rebase stopped at a conflict leaves the checkout on a commit that
+    does not contain the head and on no branch, which is not a checkout of
+    another branch. Once the rebase is given up, the same commit checked
+    out on another branch is."""
+    def git(directory, *args, check=True):
+        return subprocess.run(["git", "-C", directory, "-c", "user.name=t",
+                               "-c", "user.email=t@t", *args], check=check,
+                              capture_output=True, text=True).stdout.strip()
+
+    def commit(directory, text):
+        (Path(directory) / "f").write_text(text)
+        git(directory, "add", "f")
+        git(directory, "commit", "-q", "-m", text)
+        return git(directory, "rev-parse", "HEAD")
+
+    with tempfile.TemporaryDirectory() as directory:
+        git(directory, "init", "-q")
+        base = commit(directory, "base")
+        git(directory, "checkout", "-q", "-b", "feature")
+        head = commit(directory, "head")
+        git(directory, "checkout", "-q", "-b", "trunk", base)
+        trunk = commit(directory, "trunk")
+        git(directory, "checkout", "-q", "feature")
+        git(directory, "rebase", "trunk", check=False)
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options(expect="HEAD"))
+        watcher.expect_revision = True
+        watcher.head = head
+        saved = prwatch.git
+        prwatch.git = lambda *args: saved(*args, cwd=directory)
+        try:
+            during = (git(directory, "rev-parse", "HEAD"),
+                      watcher.astray(git(directory, "rev-parse", "HEAD"),
+                                     pull()))
+            git(directory, "rebase", "--abort")
+            git(directory, "checkout", "-q", "trunk")
+            after = watcher.astray(trunk, pull())
+        finally:
+            prwatch.git = saved
+    problems = []
+    if during != (trunk, None):
+        problems.append(f"during the rebase it said {during}")
+    if "does not contain" not in (after or ""):
+        problems.append(f"on another branch it said {after!r}")
+    return report("a rebase in progress is on its way", problems, "")
+
+
+@case
+def a_verdict_says_when_the_checkout_differs():
+    """A verdict given while the commit --expect names is not the head says
+    which commit it is for, and one given when they are the same does
+    not."""
+    problems = []
+    for local in ("a" * 40, "c" * 40):
+        with tempfile.TemporaryDirectory() as directory:
+            output = process(str(Path(directory) / "state.json"), [{}] * 3,
+                             local=local, ahead=True, once=True,
+                             expect="HEAD", verbose=False)[0]
+        said = "HEAD is ccccccccc, but this verdict is for the head, " \
+            "aaaaaaaaa" in output
+        if said != (local != "a" * 40) or "WAITING" not in output:
+            problems.append(f"with {local[:9]} checked out it printed "
+                            f"{output!r}")
+    return report("a verdict says when the checkout differs", problems, "")
+
+
+@case
+def what_is_kept_quiet_stays_quiet():
+    """Without --verbose, a quiet pull request prints nothing until --for
+    ends the watch, however many STALL and PROGRESS lines it would have
+    printed, and GitHub asking the watch to wait prints nothing either.
+    A plain watch prints its verdict every time, since it ends there. A
+    verdict --status printed is not printed again by --once."""
+    problems = []
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}] * 3, once=True)
+        quiet = process(state, [{}] * 200, once=True, for_seconds=20000,
+                        stall=600, verbose=False)
+        if quiet[0] or quiet[2] != "time up after 20000s":
+            problems.append(f"a quiet watch gave {quiet[1:]}: {quiet[0]!r}")
+        plain = [tags(process(state, [{}] * 3, verbose=False)[0])
+                 for _ in range(2)]
+        if plain != [["WAITING"]] * 2:
+            problems.append(f"plain watches printed {plain}")
+        other = str(Path(directory) / "other.json")
+        process(other, [{"head": "b" * 40}], status=True)
+        once = process(other, [{"head": "b" * 40}] * 4, once=True,
+                       verbose=False)
+        if once[1:] != (4, None) or once[0]:
+            problems.append(f"--once after --status gave {once}")
+    clock = Clock()
+    real = prwatch.time
+    prwatch.time = clock
+    try:
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options(verbose=False))
+        watcher.gh.rate_limited_until = clock.now + 300
+        out = io.StringIO()
+        with redirect_stdout(out):
+            watcher.report_throttle()
+    finally:
+        prwatch.time = real
+    if out.getvalue() or watcher.throttle_told != clock.now + 300:
+        problems.append(f"a throttle printed {out.getvalue()!r}")
+    return report("what is kept quiet stays quiet", problems, "")
+
+
+@case
+def the_verdict_names_what_is_failing_to_read():
+    """A part of the picture that was read once and is now failing is named
+    below the verdict, which rests on the last reading of it that worked,
+    and a part that reads is not."""
+    problems = []
+    for warned in (set(), {"threads"}):
+        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                                  Options(verbose=False, follow=True))
+        for facet in prwatch.Snapshot.FACETS:
+            watcher.known[facet] = {}
+        watcher.known["pull"] = pull()
+        watcher.known.update(checks=check_run("Test"), runs=workflow())
+        watcher.head = "a" * 40
+        watcher.warned = set(warned)
+        out = io.StringIO()
+        with redirect_stdout(out):
+            watcher.final_report("everything registered has finished")
+        named = "failing to read: threads — this verdict rests on the last " \
+            "reading that worked" in out.getvalue()
+        if named != bool(warned) or "WAITING  GREEN" not in out.getvalue():
+            problems.append(f"with {warned or 'nothing'} failing it printed "
+                            f"{out.getvalue()!r}")
+    return report("the verdict names what is failing to read", problems, "")
+
+
+@case
+def once_exits_at_the_first_line_it_prints():
+    """--once prints nothing for a check that registers and passes, and
+    exits at the comment after it, having printed that and nothing else."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}] * 3, once=True)
+        output, polls, verdict = process(
+            state, [{"lint": "queued"}] * 2 + [{"lint": "success"}] * 3
+            + [{"lint": "success", "comments": comment("one more thing")}] * 3,
+            once=True, verbose=False)
+    lines = output.splitlines()
+    good = (polls, verdict) == (6, "GREEN") and len(lines) == 1 and \
+        "COMMENT  someone · one more thing" in lines[0]
+    return report("--once exits at the first line it prints",
+                  [] if good else [f"it made {polls} polls and ended on "
+                                   f"{verdict}"], output)
 
 
 @case
@@ -1395,8 +1961,7 @@ def every_event_line_carries_the_number():
                                       number, Options())
             out = io.StringIO()
             with redirect_stdout(out):
-                watcher.emit("FAIL", "Test — failure")
-                watcher.note("a continuation")
+                watcher.emit("FAIL", "Test — failure", ["a continuation"])
             return out.getvalue().splitlines()
 
         event, continuation = lines(6922)
@@ -1684,13 +2249,14 @@ def reading(head="a" * 40, run="completed", conclusion="success",
     return snap
 
 
-def process(state, readings, local="a" * 40, **options):
+def process(state, readings, local="a" * 40, ahead=False, **options):
     """One prwatch process on the state file `state`, run to its end.
 
     Each entry of `readings` is the keyword arguments for one poll, and
-    `local` is the commit checked out in the working tree. Returns what the
-    process printed, how many polls it made, and the verdict it ended on,
-    which is None when it was still watching after the last one.
+    `local` is the commit checked out in the working tree, which contains
+    the head when `ahead` is true. Returns what the process printed, how
+    many polls it made, and the verdict it ended on, which is None when it
+    was still watching after the last one.
     """
     clock = Clock()
     started = clock.now
@@ -1700,6 +2266,7 @@ def process(state, readings, local="a" * 40, **options):
     watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
                               Options(fresh=False, state=state, **options))
     watcher.local_commit = lambda: local
+    watcher.astray = lambda commit, pull: None if ahead else "it is elsewhere"
 
     def poll(facets=prwatch.Snapshot.FACETS):
         if len(polls) == len(readings):
@@ -1733,13 +2300,16 @@ def tags(output):
 
 @case
 def once_waits_for_news_and_then_stops():
-    """--once exits at the first thing no earlier run reported, and no sooner.
+    """--once exits at the first line that calls for a response, and no
+    sooner.
 
-    The first run has nothing to compare with, so it answers the way
-    --status does. The second finds the same verdict and the same commit it
-    was told to expect, neither of which is news, and waits until somebody
-    comments. The third has heard of that comment, and waits on, through a
-    check that registers and passes without a line being printed about it.
+    The first run has given no verdict for the head, so it gives one once
+    the pull request has settled. The second finds the same verdict and the
+    same commit it was told to expect, neither of which is news, and waits
+    until somebody comments. It exits at the comment, without the verdict
+    the first run gave. The third has heard of that comment, and waits on,
+    through a check that registers and passes without a line being printed
+    about it.
     """
     comment = {"1": {"user": "someone", "updated": "2026-09-20T10:00:00Z",
                      "url": "u", "body": "one more thing"}}
@@ -1753,11 +2323,10 @@ def once_waits_for_news_and_then_stops():
                         + [{"comments": comment, "lint": "success"}] * 4,
                         once=True, expect="HEAD")
     problems = []
-    if first[1:] != (1, "GREEN") or "WAITING" not in tags(first[0]):
+    if first[1:] != (3, "GREEN") or "WAITING" not in tags(first[0]):
         problems.append(f"the first run gave {first[1:]}:\n{first[0]}")
-    if second[1:] != (6, "GREEN") or \
-            tags(second[0])[-2:] != ["COMMENT", "WAITING"] or \
-            "MATCH" in tags(second[0]):
+    if second[1:] != (6, "GREEN") or tags(second[0])[-1] != "COMMENT" or \
+            {"MATCH", "WAITING"} & set(tags(second[0])):
         problems.append(f"the second run gave {second[1:]}:\n{second[0]}")
     if third[1:] != (6, None) or \
             {"COMMENT", "WAITING"} & set(tags(third[0])):
@@ -1818,7 +2387,9 @@ def a_different_commit_id_is_news():
         watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
                                   Options(expect=given))
         watcher.expect = given[0] * 40
-        watcher.reported_expectation = ["b" * 40, "a" * 40, False]
+        watcher.astray = lambda commit, pull: "it is elsewhere"
+        watcher.reported_expectation = ["b" * 40, "a" * 40, False,
+                                        False]
         snap = prwatch.Snapshot()
         snap.pull = pull(head="a" * 40)
         out = io.StringIO()
@@ -1831,13 +2402,12 @@ def a_different_commit_id_is_news():
 
 @case
 def once_ends_on_a_change_while_the_build_runs():
-    """A push is news at once, and so is the failure that follows it.
+    """A push is not news, but the failure that follows it is.
 
-    While the pull request is unsettled there is no verdict to wait for, so
-    a change ends the run with a PENDING line. A failure that finishes the
-    build ends it with the verdict, once the board has held still for
-    --stability polls. The verdict for the commit before the push is not
-    the verdict for the one after it, even when the two read the same.
+    A failure that finishes the build is printed with the verdict it makes
+    due, once the board has held still for --stability polls, and the run
+    after it waits. The verdict for the commit before the push is not the
+    verdict for the one after it, even when the two read the same.
     """
     pushed = {"head": "b" * 40}
     building = dict(pushed, run="in_progress")
@@ -1845,15 +2415,19 @@ def once_ends_on_a_change_while_the_build_runs():
     fixed = {"head": "c" * 40}
     with tempfile.TemporaryDirectory() as directory:
         state = str(Path(directory) / "state.json")
-        process(state, [{}], once=True)
+        process(state, [{}] * 3, once=True)
         push = process(state, [building] * 4, once=True)
         failure = process(state, [building] * 2 + [failed] * 4, once=True)
+        red = process(state, [failed] * 4, once=True)
         fix = process(state, [fixed] * 4, once=True)
     problems = []
-    if push[1:] != (1, "PENDING") or "RETARGET" not in tags(push[0]):
+    if push[1:] != (4, None) or "RETARGET" not in tags(push[0]):
         problems.append(f"the push gave {push[1:]}:\n{push[0]}")
-    if failure[1:] != (5, "RED") or "FAIL" not in tags(failure[0]):
+    if failure[1:] != (5, "RED") or \
+            not {"FAIL", "WAITING"} <= set(tags(failure[0])):
         problems.append(f"the failure gave {failure[1:]}:\n{failure[0]}")
+    if red[1:] != (4, None):
+        problems.append(f"the run after it gave {red[1:]}:\n{red[0]}")
     if fix[1:] != (3, "GREEN"):
         problems.append(f"the fix gave {fix[1:]}:\n{fix[0]}")
     if problems:
@@ -1878,7 +2452,7 @@ def for_ends_a_quiet_watch_and_the_next_one_carries_on():
                      "url": "u", "body": "one more thing"}}
     with tempfile.TemporaryDirectory() as directory:
         state = str(Path(directory) / "state.json")
-        process(state, [{}], once=True)
+        process(state, [{}] * 3, once=True)
         quiet = process(state, [{}] * 200, once=True, for_seconds=7000)
         news = process(state, [{"comments": comment}] * 4, once=True,
                        for_seconds=7000)
@@ -1886,9 +2460,9 @@ def for_ends_a_quiet_watch_and_the_next_one_carries_on():
     if quiet[2] != "time up after 7000s" or quiet[1] == 200 or \
             set(tags(quiet[0])) - {"WATCHING", "STATUS", "STALL"}:
         problems.append(f"the quiet run gave {quiet[1:]}:\n{quiet[0]}")
-    if news[1:] != (3, "GREEN") or \
+    if news[1:] != (1, "GREEN") or \
             [t for t in tags(news[0]) if t not in ("WATCHING", "STATUS")] \
-            != ["COMMENT", "WAITING"]:
+            != ["COMMENT"]:
         problems.append(f"the next run gave {news[1:]}:\n{news[0]}")
     if problems:
         print("FAIL --for ends a quiet watch and the next one carries on")
@@ -1943,21 +2517,25 @@ def the_end_of_for_is_announced():
 
 @case
 def once_does_not_outlive_the_pull_request():
-    """A merged pull request gets its verdict from every --once, at once.
+    """A merged pull request gets its verdict from every --once.
 
     Nothing that happens to it afterwards changes the verdict, so a --once
     that waited for news would wait for ever, polling a pull request that
-    nobody is working on.
+    nobody is working on. The run that sees the merge prints the line that
+    says so with the verdict.
     """
     merged = {"state": "closed", "merged": True}
     with tempfile.TemporaryDirectory() as directory:
         state = str(Path(directory) / "state.json")
         process(state, [{}], once=True)
-        first = process(state, [merged] * 4, once=True)
-        again = process(state, [merged] * 4, once=True)
-    good = first[1:] == (3, "MERGED") and again[1:] == (3, "MERGED")
+        runs = [process(state, [merged] * 4, once=True, verbose=False)
+                for _ in range(3)]
+    said = [tags(output) for output, _, _ in runs]
+    good = [run[1:] for run in runs] == [(3, "MERGED")] * 3 and \
+        said == [["MERGED", "WAITING"], ["WAITING"], ["WAITING"]]
     print("ok   --once does not outlive the pull request" if good
-          else f"FAIL --once after a merge gave {first[1:]} then {again[1:]}")
+          else f"FAIL --once after a merge gave {[r[1:] for r in runs]} and "
+               f"said {said}")
     return good
 
 
@@ -2095,11 +2673,12 @@ def landed_watches_main_until_a_run_finishes_behind_the_merge():
     """--landed carries a watch past the merge, through cancelled runs on
     main, to the first run that finishes on a commit that contains it.
 
-    Each --once run exits at the first thing no earlier run reported: the
-    merge, then the cancelled run for the merge commit, then the verdict on
-    the run that took its place. A failure names the workflow, the job and
-    the commit, and RED waits for news, such as the run being run again,
-    while LANDED is over, so every --once run gives it at once.
+    Each --once run exits at the first line that calls for a response: the
+    merge, then the job that failed in the run that took the place of the
+    cancelled one, which comes with the verdict. A run cancelled or run
+    again calls for none, and is printed only with --verbose. A failure
+    names the workflow, the job and the commit, and RED is given once,
+    while LANDED is over, so every --once run gives it.
     """
     later = "b" * 40
     merged = {"state": "closed", "merged": True}
@@ -2112,43 +2691,49 @@ def landed_watches_main_until_a_run_finishes_behind_the_merge():
     passed = {**cancelled, **base_run("2", later)}
     outcomes = {}
     with tempfile.TemporaryDirectory() as directory:
-        for ending, runs in (("failed", failed), ("passed", passed)):
+        for ending, runs, verbose in (("failed", failed, True),
+                                      ("passed", passed, True),
+                                      ("quiet", failed, False)):
             state = str(Path(directory) / f"{ending}.json")
             process(state, [{}], once=True, landed=True)
             outcomes[ending] = [process(state, readings, once=True,
-                                        landed=True) for readings in (
+                                        landed=True, verbose=verbose)
+                                for readings in (
                 [dict(merged, base_runs=waiting)] * 4,
                 [dict(merged, base_runs=replaced)] * 4,
                 [dict(merged, base_runs=runs)] * 6,
                 [dict(merged, base_runs=runs)] * 6,
                 [dict(merged, base_runs={**cancelled, **base_run(
                     "2", later, status="queued", conclusion=None)})] * 4)]
-    merge, cancel, verdict, again, rerun = outcomes["failed"]
+    merge, cancel, failure, again, rerun = outcomes["failed"]
     problems = []
     if merge[1:] != (1, "PENDING") or "MERGED" not in tags(merge[0]) or \
             "merged as mmmmmmmmm; watching main" not in merge[0] or \
             "Tests started on main at mmmmmmmmm  u1" not in merge[0] or \
             "never read" in merge[0]:
         problems.append(f"the merge gave {merge[1:]}:\n{merge[0]}")
-    if cancel[1:] != (1, "PENDING") or \
+    if cancel[1:] != (4, None) or \
             not {"CANCEL", "RUN"} <= set(tags(cancel[0])) or \
             "Tests on main at mmmmmmmmm was cancelled" not in cancel[0] or \
             "Tests started on main at bbbbbbbbb, which contains " \
             "mmmmmmmmm" not in cancel[0]:
         problems.append(f"the cancelled run gave {cancel[1:]}:\n{cancel[0]}")
-    if verdict[1:] != (3, "RED") or \
+    if failure[1:] != (3, "RED") or \
             "FAIL     Tests / unit — failure on main at bbbbbbbbb" \
-            not in verdict[0] or \
-            "failing job: Tests / unit (failure)  j-unit" not in verdict[0] \
+            not in failure[0] or \
+            "failing job: Tests / unit (failure)  j-unit" not in failure[0] \
             or "failing on main at bbbbbbbbb, which contains mmmmmmmmm: " \
-            "Tests (failure)  u2" not in verdict[0]:
-        problems.append(f"the failure gave {verdict[1:]}:\n{verdict[0]}")
-    if again[2] is not None:
+            "Tests (failure)  u2" not in failure[0]:
+        problems.append(f"the failure gave {failure[1:]}:\n{failure[0]}")
+    if again[1:] != (6, None):
         problems.append(f"a --once after RED gave {again[1:]}:\n{again[0]}")
-    if rerun[1:] != (1, "PENDING") or "RERUN" not in tags(rerun[0]) or \
+    if rerun[1:] != (4, None) or "RERUN" not in tags(rerun[0]) or \
             "Tests on main at bbbbbbbbb, which contains mmmmmmmmm went back" \
             not in rerun[0]:
         problems.append(f"running it again gave {rerun[1:]}:\n{rerun[0]}")
+    quiet = [tags(output) for output, _, _ in outcomes["quiet"]]
+    if quiet != [["MERGED"], [], ["FAIL", "WAITING"], [], []]:
+        problems.append(f"without --verbose it printed {quiet}")
     passed = outcomes["passed"]
     if passed[2][1:] != (3, "LANDED") or "FAIL" in tags(passed[2][0]) or \
             passed[3][1:] != (3, "LANDED"):
@@ -2377,9 +2962,9 @@ def a_new_head_gets_a_verdict_of_its_own():
 def once_waits_after_a_follow_that_saw_news():
     """A --once that takes over from --follow waits, after news too.
 
-    The --follow watch gives a verdict, then reports a comment, and gives
-    the verdict again for the pull request with the comment on it. The
-    --once run after it has nothing new to say, so it waits.
+    The --follow watch gives a verdict, then reports a comment, and does
+    not give the same verdict for the same head again. The --once run after
+    it has nothing new to say, so it waits.
     """
     comment = {"1": {"user": "someone", "updated": "2026-09-20T10:00:00Z",
                      "url": "u", "body": "one more thing"}}
@@ -2389,8 +2974,8 @@ def once_waits_after_a_follow_that_saw_news():
                          follow=True)
         once = process(state, [{"comments": comment}] * 6, once=True)
     problems = []
-    if tags(follow[0])[-2:] != ["COMMENT", "WAITING"] or \
-            tags(follow[0]).count("WAITING") != 2:
+    if tags(follow[0])[-1] != "COMMENT" or \
+            tags(follow[0]).count("WAITING") != 1:
         problems.append(f"the --follow watch gave:\n{follow[0]}")
     if once[1:] != (6, None):
         problems.append(f"the --once run gave {once[1:]}:\n{once[0]}")
@@ -3677,7 +4262,8 @@ def a_relayed_watch_reads_only_what_webhooks_cannot_say():
 
     The verdict waits out --stability as quiet steps rather than reads, a
     webhook about another pull request says nothing, and a comment and a
-    merge are reported from their webhooks alone.
+    merge are reported from their webhooks alone. The comment leaves the
+    verdict as it was, so only the merge brings a second one.
     """
     output, polls, _ = relayed(lambda now: {}, [
         (1000, ("issue_comment", webhook_for(
@@ -3693,7 +4279,7 @@ def a_relayed_watch_reads_only_what_webhooks_cannot_say():
     if polls != [0]:
         problems.append(f"it read at {polls}")
     if said.count("COMMENT") != 1 or "MERGED" not in said or \
-            said.count("WAITING") != 3:
+            said.count("WAITING") != 2:
         problems.append(f"it said {said}")
     return report("a relayed watch reads only what webhooks cannot say",
                   problems, output)
