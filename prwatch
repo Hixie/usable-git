@@ -89,8 +89,9 @@ EVENTS
              request merged into, went back to pending
   RUN      * a workflow run started or finished, on the pull request or,
              with --landed, on the branch it merged into
-  CONFLICT   the branch stopped merging cleanly, or (only with --verbose)
-             started again
+  CONFLICT   the branch stopped merging cleanly, or a head commit pushed
+             to it does not merge cleanly, or (only with --verbose) the
+             base branch moved and it merges cleanly again
   COMMENT    an issue comment, new or edited
   INLINE     an inline review comment, new or edited
   REVIEW     a review summary, new or edited
@@ -217,7 +218,7 @@ READING THE NUMBERS
   anything at all lands, and neither of those lines is about a change to
   this pull request. The merge state in a summary line, and the rebase named
   among the outstanding items, are the last state GitHub gave an answer for
-  rather than the last read.
+  on the head commit rather than the last read.
 
 RUNNING IT FROM AN AGENT
 
@@ -2205,6 +2206,7 @@ class Watcher:
             # every one of them as new.
             for facet in ("checks", "runs", "statuses"):
                 self.known[facet] = None
+            self.merge_state = "unknown"
             self.settled_polls = 0
             self.reported_settled = False
             self.head_since = time.time()
@@ -2250,6 +2252,13 @@ class Watcher:
         in two fields at once, and both are checked: the documented one is
         the null mergeable field, and the merge state is the one the rest of
         this reads.
+
+        The answer is for one head commit. check_head() sets it to
+        "unknown" when the head moves, so a conflict is reported once for
+        each head commit, and again when it comes back. GitHub runs no
+        workflow for a head that does not merge, so for a push that does not
+        merge, this is the only line printed before the wait for a first
+        workflow run ends.
         """
         pull = snap.pull
         if pull.get("state") != "open":
@@ -2265,7 +2274,8 @@ class Watcher:
         if was is None or state == was or not announce:
             return
         if state == "dirty":
-            self.emit("CONFLICT", "the branch no longer merges cleanly")
+            self.emit("CONFLICT", "the branch does not merge cleanly at "
+                                  f"{self.head[:9]}")
         elif was == "dirty":
             self.emit("CONFLICT", "conflicts are gone; merge state is "
                                   f"{state}", wake=False)

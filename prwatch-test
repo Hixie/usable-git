@@ -229,7 +229,7 @@ def conflict_is_announced():
             "a branch that starts conflicting is announced",
             {"pull": pull(mergeable="dirty")},
             {"pull": pull(mergeable="clean"), "_merge": "clean"}),
-        expected=["CONFLICT", "no longer merges cleanly"])
+        expected=["CONFLICT", "does not merge cleanly at aaaaaaaaa"])
 
 
 @case
@@ -299,7 +299,7 @@ def a_merged_pull_request_owes_no_rebase():
 def conflicts_going_away_is_announced():
     return run_check(
         lambda: check(
-            "a rebase that clears the conflicts is announced",
+            "a base branch that clears the conflicts is announced",
             {"pull": pull(mergeable="blocked")},
             {"pull": pull(mergeable="dirty"), "_merge": "dirty"}),
         expected=["CONFLICT", "conflicts are gone", "blocked"])
@@ -1438,7 +1438,7 @@ def only_what_calls_for_a_response_is_printed():
         ("a close", {"pull": pull(state="closed")}, {"pull": pull()},
          "CLOSED"),
         ("a new conflict", {"pull": pull(mergeable="dirty")},
-         {"pull": pull(), "_merge": "clean"}, "no longer merges cleanly"),
+         {"pull": pull(), "_merge": "clean"}, "does not merge cleanly"),
         ("conflicts going away", {"pull": pull()},
          {"pull": pull(mergeable="dirty"), "_merge": "dirty"}, None),
         ("a push", {"pull": pull(head="b" * 40)}, {"pull": pull()}, None),
@@ -2228,18 +2228,20 @@ def reading(head="a" * 40, run="completed", conclusion="success",
     """One poll of a pull request with one workflow run and one check.
 
     A `lint` of "queued" or "success" adds a second check in that state.
+    A `run` of None is a head no workflow has run for, with no check.
     `base_runs` are the runs on the branch it merged into, unread if None.
     """
     finished = conclusion if run == "completed" else None
     snap = prwatch.Snapshot()
     snap.pull = pull(head=head, state=state, merged=merged,
                      mergeable=mergeable)
-    snap.checks = check_run("Test", status=run, conclusion=finished)
+    snap.checks = check_run("Test", status=run, conclusion=finished) \
+        if run else {}
     if lint:
         snap.checks.update(check_run(
             "Lint", status="completed" if lint == "success" else lint,
             conclusion=lint if lint == "success" else None))
-    snap.runs = workflow(status=run, conclusion=finished)
+    snap.runs = workflow(status=run, conclusion=finished) if run else {}
     snap.statuses = {}
     snap.issue_comments = comments or {}
     snap.review_comments = {}
@@ -2437,6 +2439,38 @@ def once_ends_on_a_change_while_the_build_runs():
         return False
     print("ok   --once ends on a change while the build runs")
     return True
+
+
+@case
+def a_push_that_does_not_merge_is_news():
+    """A branch that does not merge is told once for each head commit.
+
+    A rebase pushed to a pull request that does not merge can still not
+    merge, when the base branch moved while the rebase was being made.
+    GitHub runs no workflow for that head, so nothing else about it is
+    printed until the wait for a first workflow run ends. The run after the
+    push says it does not merge, past a reading GitHub has no answer for
+    yet. The run after that, on the same head, does not say it again.
+    """
+    pushed = {"head": "b" * 40, "run": None}
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}] * 3, once=True)
+        conflict = process(state, [{"mergeable": "dirty"}] * 3, once=True,
+                           verbose=False)
+        push = process(state, [dict(pushed, mergeable="unknown")]
+                       + [dict(pushed, mergeable="dirty")] * 3, once=True,
+                       verbose=False)
+        again = process(state, [dict(pushed, mergeable="dirty")] * 3,
+                        once=True, verbose=False)
+    problems = []
+    if "CONFLICT" not in tags(conflict[0]):
+        problems.append(f"the conflict gave {conflict[1:]}:\n{conflict[0]}")
+    if push[1] != 2 or tags(push[0]) != ["CONFLICT"]:
+        problems.append(f"the push gave {push[1:]}:\n{push[0]}")
+    if again[1:] != (3, None) or tags(again[0]):
+        problems.append(f"the run after it gave {again[1:]}:\n{again[0]}")
+    return report("a push that does not merge is news", problems, "")
 
 
 @case
