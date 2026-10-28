@@ -110,8 +110,9 @@ EVENTS
   MERGED     the pull request was merged
   CLOSED     the pull request was closed
   PENDING  * --status found it unsettled; the reason follows
-  WAITING    the pull request settled; the verdict follows, and the watch
-             ends unless --follow was given
+  VERDICT    the pull request settled, and nothing more is to be waited for;
+             the verdict follows, and the watch ends unless --follow was
+             given
   STOPPED    something ended the watch before it was done: Ctrl-C, a
              signal from whatever started it, or the end of --for
 
@@ -216,9 +217,21 @@ READING THE NUMBERS
   leaves the state alone rather than replacing it: counted as a state of its
   own, "unknown" makes a conflict disappear and then come back every time
   anything at all lands, and neither of those lines is about a change to
-  this pull request. The merge state in a summary line, and the rebase named
-  among the outstanding items, are the last state GitHub gave an answer for
-  on the head commit rather than the last read.
+  this pull request. The rebase named among the outstanding items comes from
+  the last state GitHub gave an answer for on the head commit rather than
+  the last read.
+
+  A conflict is the only merge state reported. GitHub's others describe the
+  repository's rules for merging rather than this branch: "blocked" says
+  that something those rules require, most often an approval, has not
+  happened; "unstable" says that a check the rules do not require has
+  failed or not finished; and "behind" says that the rules want the branch
+  to contain the latest commit on its base, and it does not. None of them is
+  a reason to keep waiting. A failing check already makes the verdict RED,
+  and an unresolved thread makes it FEEDBACK. An approval is for a person to
+  give. Every commit that lands on the base branch makes the branch behind
+  again, so the time to bring it up to date is when it is about to merge,
+  or when GitHub refuses the merge because it is behind.
 
 RUNNING IT FROM AN AGENT
 
@@ -1876,7 +1889,7 @@ def unresolved_threads(threads):
 # with one of these tags can still be marked as needing no response, as an
 # edit that only marks an issue addressed is; see emit().
 WAKES = {"MERGED", "CLOSED", "CONFLICT", "FAIL", "COMMENT", "INLINE",
-         "REVIEW", "THREAD", "MISMATCH", "WAITING", "STOPPED"}
+         "REVIEW", "THREAD", "MISMATCH", "VERDICT", "STOPPED"}
 
 # The verdicts on a pull request that has nothing left to wait for.
 OVER = ("MERGED", "CLOSED", "LANDED")
@@ -2247,11 +2260,11 @@ class Watcher:
         and then come back every time anything at all lands. That is two
         lines, and neither of them is about a change to this pull request.
         So the last state GitHub gave an answer for is kept here instead,
-        and it is that state, rather than the last read, that the summary
-        line and the outstanding items report. GitHub says it has no answer
-        in two fields at once, and both are checked: the documented one is
-        the null mergeable field, and the merge state is the one the rest of
-        this reads.
+        and it is that state, rather than the last read, that the
+        outstanding items report. GitHub says it has no answer in two
+        fields at once, and both are checked: the documented one is the null
+        mergeable field, and the merge state is the one the rest of this
+        reads.
 
         The answer is for one head commit. check_head() sets it to
         "unknown" when the head moves, so a conflict is reported once for
@@ -2277,8 +2290,8 @@ class Watcher:
             self.emit("CONFLICT", "the branch does not merge cleanly at "
                                   f"{self.head[:9]}")
         elif was == "dirty":
-            self.emit("CONFLICT", "conflicts are gone; merge state is "
-                                  f"{state}", wake=False)
+            self.emit("CONFLICT", "conflicts are gone at "
+                                  f"{self.head[:9]}", wake=False)
 
     def check_checks(self, snap, announce):
         if snap.checks is None:
@@ -2579,7 +2592,7 @@ class Watcher:
                           "have finished")
         if self.refused:
             return True, "everything this token can read has finished"
-        return True, "everything registered has finished"
+        return True, "every check, commit status and workflow run has finished"
 
     def base_settled(self):
         """Whether CI on the branch the pull request merged into has ended
@@ -2703,8 +2716,6 @@ class Watcher:
             pieces.append(f"threads {len(self.known['threads'])} "
                           f"({len(unresolved_threads(self.known['threads']))}"
                           " unresolved)")
-        if self.merge_state:
-            pieces.append(self.merge_state)
         return " · ".join(pieces)
 
     def outstanding_lines(self):
@@ -2843,7 +2854,7 @@ class Watcher:
             notes.append(f"--landed watches {pull['base']['ref']} from here, "
                          "until CI there ends on a commit that contains the "
                          "merge")
-        self.emit("WAITING" if settled else "PENDING",
+        self.emit("VERDICT" if settled else "PENDING",
                   f"{verdict} — {reason}" if settled else reason, notes)
         return verdict
 

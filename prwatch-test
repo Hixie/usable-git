@@ -75,6 +75,27 @@ def check(name, snapshot_fields, known, options=None, head="a" * 40):
     return name, watcher, out.getvalue()
 
 
+SETTLED = "every check, commit status and workflow run has finished"
+
+
+def settled_report(**attributes):
+    """The verdict on a settled pull request whose one check passed, and
+    what reporting it printed, with `attributes` set on the watcher first."""
+    watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
+                              Options(verbose=False, follow=True))
+    for facet in prwatch.Snapshot.FACETS:
+        watcher.known[facet] = {}
+    watcher.known.update(pull=pull(), checks=check_run("Test"),
+                         runs=workflow())
+    watcher.head = "a" * 40
+    for name, value in attributes.items():
+        setattr(watcher, name, value)
+    out = io.StringIO()
+    with redirect_stdout(out):
+        verdict = watcher.final_report(SETTLED)
+    return verdict, out.getvalue()
+
+
 def run_check(fn, expected, forbidden=()):
     name, watcher, output = fn()
     problems = [f"missing {want!r}" for want in expected if want not in output]
@@ -269,8 +290,7 @@ def a_conflict_outlives_an_unknown_reading():
          "review_comments": {}, "reviews": review(), "threads": {}},
         {"pull": pull(mergeable="dirty"), "_merge": "dirty"})
     lines = watcher.outstanding_lines()
-    good = any("needs a rebase" in line for line in lines) and \
-        "dirty" in watcher.status_line()
+    good = any("needs a rebase" in line for line in lines)
     print("ok   a branch that does not merge stays outstanding across a "
           "reading GitHub had no answer for" if good
           else f"FAIL conflict outliving unknown: {lines}")
@@ -289,9 +309,9 @@ def a_merged_pull_request_owes_no_rebase():
         {"pull": pull(mergeable="dirty"), "_merge": "dirty"})
     lines = watcher.outstanding_lines()
     good = not any("rebase" in line for line in lines) and \
-        "dirty" not in watcher.status_line() and "CONFLICT" not in output
+        "CONFLICT" not in output
     print("ok   a merged pull request is not still owed a rebase" if good
-          else f"FAIL merged pull request: {lines} {watcher.status_line()}")
+          else f"FAIL merged pull request: {lines}")
     return good
 
 
@@ -302,7 +322,30 @@ def conflicts_going_away_is_announced():
             "a base branch that clears the conflicts is announced",
             {"pull": pull(mergeable="blocked")},
             {"pull": pull(mergeable="dirty"), "_merge": "dirty"}),
-        expected=["CONFLICT", "conflicts are gone", "blocked"])
+        expected=["CONFLICT", "conflicts are gone at aaaaaaaaa"],
+        forbidden=["blocked"])
+
+
+@case
+def a_green_verdict_names_no_merge_rule():
+    """GitHub's merge rules are not this pull request's outstanding items,
+    but a conflict is.
+
+    "blocked" and "unstable" beside a GREEN verdict read as reasons it is
+    not green, and agents have waited a day on them for nothing.
+    """
+    problems = []
+    for state in ("blocked", "unstable", "behind", "clean"):
+        verdict, said = settled_report(merge_state=state)
+        if verdict != "GREEN" or f" VERDICT  GREEN — {SETTLED}" not in said \
+                or f"· {state}" in said:
+            problems.append(f"with a merge state of {state} it printed "
+                            f"{said!r}")
+    verdict, said = settled_report(merge_state="dirty")
+    if verdict != "FEEDBACK" or " VERDICT  FEEDBACK — " not in said or \
+            "needs a rebase" not in said:
+        problems.append(f"with a conflict it printed {said!r}")
+    return report("a green verdict names no merge rule", problems, "")
 
 
 @case
@@ -1088,19 +1131,11 @@ def no_ci_survives_an_unrelated_unread_facet():
 @case
 def the_verdict_says_when_the_board_was_stood_in_for():
     """The WARN that said so is hours above the verdict on a long watch."""
-    _, watcher, _ = check(
-        "a board assembled around a permission",
-        {"pull": pull(), "checks": check_run("Test"), "runs": workflow(),
-         "statuses": {}, "issue_comments": {}, "review_comments": {},
-         "reviews": {}, "threads": {}},
-        {"pull": pull()}, Options(detail=False))
-    watcher.limited["checks"] = "checks: assembled from the workflow jobs"
-    out = io.StringIO()
-    with redirect_stdout(out):
-        watcher.final_report("everything registered has finished")
-    good = "assembled from the workflow jobs" in out.getvalue()
+    _, said = settled_report(
+        limited={"checks": "checks: assembled from the workflow jobs"})
+    good = "assembled from the workflow jobs" in said
     print("ok   the verdict names the board it was drawn from" if good
-          else f"FAIL stand-in not named: {out.getvalue()}")
+          else f"FAIL stand-in not named: {said}")
     return good
 
 
@@ -1783,7 +1818,7 @@ def a_verdict_is_printed_once_for_each_head():
                     ([pushed] * 4, {"once": True}),
                     ([pushed] * 4, {"once": True}))]
     printed = [tags(output) for output, _, _ in runs]
-    wanted = [["WAITING"], [], ["FAIL", "WAITING"], [], ["FAIL", "WAITING"],
+    wanted = [["VERDICT"], [], ["FAIL", "VERDICT"], [], ["FAIL", "VERDICT"],
               []]
     problems = [] if printed == wanted else [f"it printed {printed}"]
     if "RED" not in runs[4][0]:
@@ -1857,7 +1892,7 @@ def a_verdict_says_when_the_checkout_differs():
                              expect="HEAD", verbose=False)[0]
         said = "HEAD is ccccccccc, but this verdict is for the head, " \
             "aaaaaaaaa" in output
-        if said != (local != "a" * 40) or "WAITING" not in output:
+        if said != (local != "a" * 40) or "VERDICT" not in output:
             problems.append(f"with {local[:9]} checked out it printed "
                             f"{output!r}")
     return report("a verdict says when the checkout differs", problems, "")
@@ -1880,7 +1915,7 @@ def what_is_kept_quiet_stays_quiet():
             problems.append(f"a quiet watch gave {quiet[1:]}: {quiet[0]!r}")
         plain = [tags(process(state, [{}] * 3, verbose=False)[0])
                  for _ in range(2)]
-        if plain != [["WAITING"]] * 2:
+        if plain != [["VERDICT"]] * 2:
             problems.append(f"plain watches printed {plain}")
         other = str(Path(directory) / "other.json")
         process(other, [{"head": "b" * 40}], status=True)
@@ -1912,22 +1947,12 @@ def the_verdict_names_what_is_failing_to_read():
     and a part that reads is not."""
     problems = []
     for warned in (set(), {"threads"}):
-        watcher = prwatch.Watcher(prwatch.GitHub("github.com"), "o", "r", 1,
-                                  Options(verbose=False, follow=True))
-        for facet in prwatch.Snapshot.FACETS:
-            watcher.known[facet] = {}
-        watcher.known["pull"] = pull()
-        watcher.known.update(checks=check_run("Test"), runs=workflow())
-        watcher.head = "a" * 40
-        watcher.warned = set(warned)
-        out = io.StringIO()
-        with redirect_stdout(out):
-            watcher.final_report("everything registered has finished")
+        _, said = settled_report(warned=set(warned))
         named = "failing to read: threads — this verdict rests on the last " \
-            "reading that worked" in out.getvalue()
-        if named != bool(warned) or "WAITING  GREEN" not in out.getvalue():
+            "reading that worked" in said
+        if named != bool(warned) or "VERDICT  GREEN" not in said:
             problems.append(f"with {warned or 'nothing'} failing it printed "
-                            f"{out.getvalue()!r}")
+                            f"{said!r}")
     return report("the verdict names what is failing to read", problems, "")
 
 
@@ -2325,13 +2350,13 @@ def once_waits_for_news_and_then_stops():
                         + [{"comments": comment, "lint": "success"}] * 4,
                         once=True, expect="HEAD")
     problems = []
-    if first[1:] != (3, "GREEN") or "WAITING" not in tags(first[0]):
+    if first[1:] != (3, "GREEN") or "VERDICT" not in tags(first[0]):
         problems.append(f"the first run gave {first[1:]}:\n{first[0]}")
     if second[1:] != (6, "GREEN") or tags(second[0])[-1] != "COMMENT" or \
-            {"MATCH", "WAITING"} & set(tags(second[0])):
+            {"MATCH", "VERDICT"} & set(tags(second[0])):
         problems.append(f"the second run gave {second[1:]}:\n{second[0]}")
     if third[1:] != (6, None) or \
-            {"COMMENT", "WAITING"} & set(tags(third[0])):
+            {"COMMENT", "VERDICT"} & set(tags(third[0])):
         problems.append(f"the third run gave {third[1:]}:\n{third[0]}")
     if problems:
         print("FAIL --once waits for news and then stops")
@@ -2426,7 +2451,7 @@ def once_ends_on_a_change_while_the_build_runs():
     if push[1:] != (4, None) or "RETARGET" not in tags(push[0]):
         problems.append(f"the push gave {push[1:]}:\n{push[0]}")
     if failure[1:] != (5, "RED") or \
-            not {"FAIL", "WAITING"} <= set(tags(failure[0])):
+            not {"FAIL", "VERDICT"} <= set(tags(failure[0])):
         problems.append(f"the failure gave {failure[1:]}:\n{failure[0]}")
     if red[1:] != (4, None):
         problems.append(f"the run after it gave {red[1:]}:\n{red[0]}")
@@ -2566,7 +2591,7 @@ def once_does_not_outlive_the_pull_request():
                 for _ in range(3)]
     said = [tags(output) for output, _, _ in runs]
     good = [run[1:] for run in runs] == [(3, "MERGED")] * 3 and \
-        said == [["MERGED", "WAITING"], ["WAITING"], ["WAITING"]]
+        said == [["MERGED", "VERDICT"], ["VERDICT"], ["VERDICT"]]
     print("ok   --once does not outlive the pull request" if good
           else f"FAIL --once after a merge gave {[r[1:] for r in runs]} and "
                f"said {said}")
@@ -2766,7 +2791,7 @@ def landed_watches_main_until_a_run_finishes_behind_the_merge():
             not in rerun[0]:
         problems.append(f"running it again gave {rerun[1:]}:\n{rerun[0]}")
     quiet = [tags(output) for output, _, _ in outcomes["quiet"]]
-    if quiet != [["MERGED"], [], ["FAIL", "WAITING"], [], []]:
+    if quiet != [["MERGED"], [], ["FAIL", "VERDICT"], [], []]:
         problems.append(f"without --verbose it printed {quiet}")
     passed = outcomes["passed"]
     if passed[2][1:] != (3, "LANDED") or "FAIL" in tags(passed[2][0]) or \
@@ -2794,7 +2819,7 @@ def a_workflow_whose_every_run_was_cancelled_is_waited_for():
             state, [{"state": "closed", "merged": True,
                      "base_runs": runs}] * 40, landed=True)
     good = verdict is None and polls == 40 and \
-        "WAITING" not in tags(output) and "nothing has changed for 30m — " \
+        "VERDICT" not in tags(output) and "nothing has changed for 30m — " \
         "every run so far of Tests on main was cancelled; " in output
     print("ok   a workflow whose every run was cancelled is waited for"
           if good else f"FAIL a workflow whose every run was cancelled "
@@ -2986,7 +3011,7 @@ def a_new_head_gets_a_verdict_of_its_own():
         state = str(Path(directory) / "state.json")
         output, polls, _ = process(state, [{}] * 4 + [{"head": "b" * 40}] * 4,
                                    follow=True)
-    good = tags(output).count("WAITING") == 2 and polls == 8
+    good = tags(output).count("VERDICT") == 2 and polls == 8
     print("ok   a new head gets a verdict of its own" if good
           else f"FAIL a new head and its verdict:\n{output}")
     return good
@@ -3009,7 +3034,7 @@ def once_waits_after_a_follow_that_saw_news():
         once = process(state, [{"comments": comment}] * 6, once=True)
     problems = []
     if tags(follow[0])[-1] != "COMMENT" or \
-            tags(follow[0]).count("WAITING") != 1:
+            tags(follow[0]).count("VERDICT") != 1:
         problems.append(f"the --follow watch gave:\n{follow[0]}")
     if once[1:] != (6, None):
         problems.append(f"the --once run gave {once[1:]}:\n{once[0]}")
@@ -4313,7 +4338,7 @@ def a_relayed_watch_reads_only_what_webhooks_cannot_say():
     if polls != [0]:
         problems.append(f"it read at {polls}")
     if said.count("COMMENT") != 1 or "MERGED" not in said or \
-            said.count("WAITING") != 2:
+            said.count("VERDICT") != 2:
         problems.append(f"it said {said}")
     return report("a relayed watch reads only what webhooks cannot say",
                   problems, output)
@@ -4330,7 +4355,7 @@ def a_verdict_waits_for_quiet_steps_not_webhooks():
     said = tags(output)
     comments = [i for i, tag in enumerate(said) if tag == "COMMENT"]
     problems = []
-    if len(comments) != 3 or said.index("WAITING") < comments[-1]:
+    if len(comments) != 3 or said.index("VERDICT") < comments[-1]:
         problems.append(f"it said {said}")
     if polls != [0]:
         problems.append(f"it read {polls}")
@@ -4373,10 +4398,10 @@ def a_relayed_verdict_waits_for_the_reads_webhooks_ask_for():
                                    **options)
         said = tags(output)
         if early is None:
-            wrong = "WAITING" in said
+            wrong = "VERDICT" in said
         else:
-            wrong = "COMMENT" not in said or "WAITING" not in said or \
-                (said.index("WAITING") < said.index("COMMENT")) != early
+            wrong = "COMMENT" not in said or "VERDICT" not in said or \
+                (said.index("VERDICT") < said.index("COMMENT")) != early
         if wrong:
             problems.append(f"{name} said {said}")
         if polls[:len(reads)] != reads:
@@ -4423,9 +4448,9 @@ def a_relayed_watch_waits_out_a_throttle():
             problems.append(f"{name}, the wait was not reported once, as "
                             "five minutes")
         if "COMMENT" not in said or "CONFLICT" not in said or \
-                "WAITING" in said[said.index("COMMENT"):
+                "VERDICT" in said[said.index("COMMENT"):
                                   said.index("CONFLICT")] or \
-                "WAITING" not in said[said.index("CONFLICT"):]:
+                "VERDICT" not in said[said.index("CONFLICT"):]:
             problems.append(f"{name}, it said {said}")
     return report("a relayed watch waits out a throttle", problems, "")
 
@@ -4490,8 +4515,8 @@ def a_relayed_watch_reads_main_when_its_runs_move():
                  (3000, {"base_runs"})]:
         problems.append(f"it read {polls}")
     said = [tag for tag in tags(output) if tag not in ("PROGRESS", "STALL")]
-    if said[3:] != ["MERGED", "RUN", "CANCEL", "RUN", "RUN", "WAITING"] or \
-            "WAITING  LANDED" not in output:
+    if said[3:] != ["MERGED", "RUN", "CANCEL", "RUN", "RUN", "VERDICT"] or \
+            "VERDICT  LANDED" not in output:
         problems.append(f"it said {said}")
     return report("a relayed --landed watch reads main when its runs move",
                   problems, output)
@@ -4510,7 +4535,7 @@ def a_relayed_watch_wakes_for_the_end_of_the_wait_on_main():
         [(1000, ("pull_request", webhook_for(action="closed",
                                              pull_request=merged)))],
         horizon=2100, landed=True)
-    good = "WAITING  NO-CI — no workflow ran for a push to main" in output \
+    good = "VERDICT  NO-CI — no workflow ran for a push to main" in output \
         and polls == [0, (1000, {"base_runs"})]
     print("ok   a relayed watch wakes for the end of the wait on main"
           if good else f"FAIL a relayed wait on main read {polls}:\n{output}")
