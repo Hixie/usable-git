@@ -249,7 +249,9 @@ git config --global rerere.enabled true
   never reached. Add `--landed` where a merge is not done until the branch
   it merged into is green behind it: the watch carries on past MERGED,
   through runs that later pushes cancelled, to a verdict of LANDED, or RED
-  with the workflow, job and commit that failed.
+  with the workflow, job and commit that failed. When the branch was
+  already failing before the merge, the RED verdict says so, and a later
+  run that passes makes it LANDED.
 
   Add `--github-webhook-relay HOST:PORT` where a relay passes on GitHub's
   webhooks over the network, and the watch takes each change from the

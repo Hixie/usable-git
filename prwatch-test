@@ -2609,6 +2609,11 @@ def the_run_that_decides_follows_the_cancelled_ones():
     decided by the run on the third commit, and "Cache" by the run on the
     merge itself. Runs started after the one that decides are left out,
     and so is a workflow that did not run for the merge.
+
+    When "Tests" was failing before the merge as well, the first later run
+    of it that passed, on the fifth commit, decides instead, and the runs
+    after that one are left out too, as is a run that was skipped, which
+    tested nothing.
     """
     runs = {}
     for rid, commit, name, workflow, conclusion in (
@@ -2622,18 +2627,33 @@ def the_run_that_decides_follows_the_cancelled_ones():
             ("31", "c", "Rapids", 2, "success"),
             ("32", "c", "Docs", 4, "success"),
             ("40", "d", "Tests", 1, "failure"),
-            ("50", "e", "Tests", 1, "success")):
+            ("45", "d", "Tests", 1, "skipped"),
+            ("50", "e", "Tests", 1, "success"),
+            ("60", "f", "Tests", 1, "success")):
         runs.update(base_run(rid, commit * 40, name, workflow,
                              conclusion=conclusion))
-    kept = prwatch.landing_runs(runs)
-    deciding = {run["name"]: run["commit"][0] for run in
-                prwatch.deciding_runs(kept).values()}
+
+    def decided(already=frozenset()):
+        kept = prwatch.landing_runs(runs, already)
+        return sorted(kept, key=int), {
+            run["name"]: run["commit"][0]
+            for run in prwatch.deciding_runs(kept).values()}
+
     problems = []
-    if sorted(kept, key=int) != ["10", "11", "12", "20", "21", "30", "31",
-                                 "40"]:
-        problems.append(f"it kept {sorted(kept, key=int)}")
-    if deciding != {"Cache": "m", "Rapids": "c", "Tests": "d"}:
-        problems.append(f"the runs that decide are on {deciding}")
+    kept = ["10", "11", "12", "20", "21", "30", "31", "40"]
+    if decided() != (kept, {"Cache": "m", "Rapids": "c", "Tests": "d"}):
+        problems.append(f"it kept and was decided by {decided()}")
+    if decided({1}) != (kept + ["50"],
+                        {"Cache": "m", "Rapids": "c", "Tests": "e"}):
+        problems.append(f"with Tests failing before the merge, it kept and "
+                        f"was decided by {decided({1})}")
+    # A read held back by doubt() can hold a run started again with the run
+    # after it, and the run started first still decides.
+    held = {**base_run("2", "b" * 40, conclusion="failure"),
+            **base_run("1", status="in_progress", conclusion=None)}
+    if prwatch.deciding_runs(held)[1]["commit"] != MERGE:
+        problems.append(f"a run started again gave way to "
+                        f"{prwatch.deciding_runs(held)[1]}")
     if prwatch.landing_runs({}) != {}:
         problems.append("no runs gave some")
     return report("the run that decides follows the cancelled ones",
@@ -2649,10 +2669,18 @@ def the_runs_on_main_are_those_that_contain_the_merge():
     has finished or not. Once every run that decides has finished, the list
     is cut off after the last of them to start, and a list cut off that way
     that finds one of them cancelled since is listed again without the end.
+
+    For a run that decides and failed, GitHub is asked how the run of its
+    workflow before it ended, once that run has ended, passing over one
+    that was skipped as well as one that was cancelled. When that run failed
+    too, the runs of the workflow that passed since are asked for on each
+    read, and the first decides. A run held that the list leaves out is
+    kept, so that a list from after the runs for the merge does not give
+    other workflows a say.
     """
 
-    def run(rid, sha, conclusion, status="completed"):
-        return {"id": rid, "name": "Tests", "workflow_id": 1,
+    def run(rid, sha, conclusion, status="completed", workflow=1):
+        return {"id": rid, "name": "Tests", "workflow_id": workflow,
                 "head_sha": sha * 40, "status": status,
                 "conclusion": conclusion, "html_url": "u",
                 "run_attempt": 1, "event": "push",
@@ -2678,6 +2706,15 @@ def the_runs_on_main_are_those_that_contain_the_merge():
 
         def get(self, path):
             self.asked.append(path)
+            if "/actions/workflows/" in path:
+                bound = path.partition("&created=")[2].partition("&")[0]
+                later = bound.startswith("%3E%3D")
+                bound = bound[len("%3E%3D"):]
+                return {"workflow_runs": [
+                    given for given in self.runs
+                    if (given["created_at"] >= bound and
+                        given["conclusion"] == "success" if later
+                        else given["created_at"] <= bound)]}
             sha = path.split("...")[1][0]
             return {"status": {"a": "behind", "m": "identical"}.get(sha,
                                                                     "ahead")}
@@ -2723,6 +2760,56 @@ def the_runs_on_main_are_those_that_contain_the_merge():
             sorted(after, key=int) != ["2", "3", "4", "5"]:
         problems.append(f"a read after the run that decided was cancelled "
                         f"asked {asked_after} and kept {sorted(after)}")
+    if first["4"].get("before") != "ok" or \
+            any("/actions/workflows/" in path for path in asked_again):
+        problems.append(f"the run before the one that failed gave "
+                        f"{first['4'].get('before')}, and was asked about "
+                        f"again in {asked_again}")
+
+    red = [run(7, "a", "success"), run(4, "c", "failure")] + \
+        history[2:4] + [run(1, "a", "failure")]
+    fixed = [run(6, "e", "success"), run(5, "d", "success")] + red
+    going_before = red[1:4] + [run(1, "a", None, "in_progress")]
+    unsure, asked_unsure = read(going_before)
+    waiting, asked_waiting = read(red, unsure)
+    still, asked_still = read(red, waiting)
+    landed, asked_landed = read(fixed, still)
+    later, asked_later = read(fixed, landed)
+    elsewhere, _ = read([run(6, "e", "success", workflow=2)], still)
+    query = "repos/o/r/actions/workflows/1/runs?branch=release%2F1&event=push"
+    before = query + "&created=%3C%3D2026-10-23T00:04:00Z&per_page=100"
+    passed = query + "&status=success&created=%3E%3D2026-10-23T00:04:00Z" \
+        "&per_page=100"
+    if unsure["4"].get("before") != "pending" or \
+            waiting["4"].get("before") != "bad" or \
+            asked_unsure.count(before) != 1 or \
+            asked_waiting.count(before) != 1 or before in asked_still:
+        problems.append(f"the run before gave {unsure['4'].get('before')} "
+                        f"while it went and {waiting['4'].get('before')} "
+                        f"after, and was asked about in {asked_unsure}, "
+                        f"{asked_waiting} and {asked_still}")
+    if sorted(still, key=int) != ["2", "3", "4"] or \
+            asked_still[0] != cut or passed not in asked_still:
+        problems.append(f"a read waiting for a pass kept {sorted(still)} "
+                        f"and asked {asked_still}")
+    deciding = prwatch.deciding_runs(landed)[1]["commit"][0]
+    if sorted(landed, key=int) != ["2", "3", "4", "5"] or deciding != "d" or \
+            asked_landed[0] != cut or \
+            "repos/o/r/actions/runs/4/jobs" in asked_landed:
+        problems.append(f"a later pass kept {sorted(landed)}, decided by "
+                        f"{deciding}, and asked {asked_landed}")
+    if later != landed or asked_later[0] != listing + \
+            "2026-10-23T00:09:29Z..2026-10-23T00:05:00Z":
+        problems.append(f"a read after the pass kept {sorted(later)} and "
+                        f"asked {asked_later}")
+    skipped, _ = read(red[1:4] + [run(1, "a", "skipped"),
+                                  run(0, "a", "failure")])
+    if skipped["4"].get("before") != "bad":
+        problems.append(f"a run before that was skipped gave "
+                        f"{skipped['4'].get('before')}")
+    if sorted(elsewhere, key=int) != ["2", "3", "4"]:
+        problems.append(f"a list without the runs for the merge kept "
+                        f"{sorted(elsewhere)}")
     return report("the runs on main are those that contain the merge",
                   problems, "")
 
@@ -2801,6 +2888,124 @@ def landed_watches_main_until_a_run_finishes_behind_the_merge():
     return report("--landed watches main until a run finishes behind the "
                   "merge", problems, "".join(
                       output for output, _, _ in outcomes["failed"]))
+
+
+@case
+def a_merge_onto_a_failing_branch_lands_when_a_later_push_passes():
+    """A merge onto a main that was already failing is RED, saying so, and
+    LANDED once a run on a later commit, which contains the merge, passes.
+
+    The run on the merge commit fails, and so did the run before it. A
+    later run that fails is not news, and nor is one that is going: each
+    --once run after RED prints nothing until a later run passes, and
+    then LANDED. When main was passing before the merge, the merge made
+    it fail, and a later run that passes, which may be on a commit that
+    reverts the merge, leaves the verdict RED. The runs are read as
+    GitHub gives them, every one of them each time.
+    """
+
+    def run(rid, sha, conclusion="failure", status="completed"):
+        return {"id": rid, "name": "Tests", "workflow_id": 1,
+                "head_sha": sha * 40, "status": status,
+                "conclusion": conclusion, "html_url": f"u{rid}",
+                "run_attempt": 1, "event": "push",
+                "created_at": f"1970-01-01T00:{16 + rid:02d}:00Z"}
+
+    class Main(Merged):
+        """Merged, where a run that failed failed in its job "unit", and
+        the run on main before the merge ended as `before`."""
+
+        def __init__(self, runs, before):
+            super().__init__(runs)
+            self.before = before
+
+        def get(self, path, params=None):
+            if "/actions/workflows/" not in path:
+                return super().get(path, params)
+            if "status=success" in path:
+                return {"workflow_runs": [given for given in self.runs
+                                          if given["conclusion"] == "success"]}
+            return {"workflow_runs": [run(0, "p", self.before)]}
+
+        def paged(self, path, key=None, per_page=100):
+            if not path.endswith("/jobs"):
+                return super().paged(path, key, per_page)
+            rid = int(path.split("/")[-2])
+            return [{"name": "unit", "conclusion": "failure",
+                     "html_url": f"j{rid}"} for given in self.runs
+                    if given["id"] == rid and given["conclusion"] == "failure"]
+
+    def watch(state, runs, before):
+        clock, real, out = Clock(), prwatch.time, io.StringIO()
+        prwatch.time = clock
+        verdict = None
+        try:
+            with redirect_stdout(out):
+                verdict = prwatch.Watcher(Main(runs, before), "o", "r", 1,
+                                          Options(fresh=False, state=state,
+                                                  once=True, landed=True,
+                                                  verbose=False,
+                                                  for_seconds=3600)).run()
+        except prwatch.TimeUp:
+            pass
+        finally:
+            prwatch.time = real
+        return out.getvalue(), verdict
+
+    red = [run(1, "m")]
+    fixed = [run(3, "c", "success"), run(2, "b")] + red
+    outcomes = {}
+    with tempfile.TemporaryDirectory() as directory:
+        for before in ("failure", "success"):
+            state = str(Path(directory) / f"{before}.json")
+            outcomes[before] = [watch(state, given, before) for given in (
+                red, [run(2, "b", None, "in_progress")] + red, fixed[1:],
+                fixed, fixed)]
+    problems = []
+    for before, verdicts in (
+            ("failure", ["RED", None, None, "LANDED", "LANDED"]),
+            ("success", ["RED", None, None, None, None])):
+        runs = outcomes[before]
+        said = [tags(output) for output, _ in runs]
+        given = [verdict for _, verdict in runs]
+        if said != [["VERDICT"] if verdict else [] for verdict in verdicts] \
+                or given != verdicts:
+            problems.append(f"with main ending in {before} before the merge "
+                            f"it said {said}, with the verdicts {given}")
+    note = "Tests was failing on main before the merge as well; a later " \
+        "run that passes makes this LANDED"
+    if note not in outcomes["failure"][0][0] or \
+            note in outcomes["success"][0][0]:
+        problems.append("the RED verdicts gave:\n" + outcomes["failure"][0][0]
+                        + outcomes["success"][0][0])
+    if "failing" in outcomes["failure"][3][0] or \
+            "failed" in outcomes["failure"][3][0]:
+        problems.append(f"LANDED named a failure:\n"
+                        f"{outcomes['failure'][3][0]}")
+    return report("a merge onto a failing branch lands when a later push "
+                  "passes", problems, "".join(
+                      output for runs in outcomes.values()
+                      for output, _ in runs))
+
+
+@case
+def a_failure_waits_for_the_run_before_it():
+    """A run that decides and failed settles the watch only once the run
+    before it has ended, since only that says whether a later run may
+    decide instead."""
+    problems = []
+    for before, settles in (("pending", False), ("bad", True), ("ok", True)):
+        watcher = quiet_watcher(Options(landed=True))
+        watcher.known["pull"] = pull(state="closed", merged=True)
+        watcher.known["base_runs"] = base_run("1", conclusion="failure")
+        watcher.known["base_runs"]["1"]["before"] = before
+        settled, reason = watcher.is_settled()
+        if settled != settles or (not settled and reason !=
+                                  "Tests failed on main, and the run before "
+                                  "it is still going"):
+            problems.append(f"with the run before {before}, it gave "
+                            f"{settled}: {reason}")
+    return report("a failure waits for the run before it", problems, "")
 
 
 @case
@@ -4058,19 +4263,29 @@ def a_run_on_main_is_read_for_while_it_may_count():
 
     That is a run held, whose webhook is kept for the read to be held to,
     a run of a workflow whose every run so far was cancelled, a run on the
-    commit whose workflows count, and any run before one is held, as well
-    as a job that failed in a run held. A later run of a workflow that is
-    decided is not read for, and nor is a run of a workflow that did not
-    run for that commit, a run on another branch, a run no push started,
-    a job that passed, or anything without --landed, before the merge, or
-    once the verdict is LANDED.
+    commit whose workflows count, a run that passed of a workflow whose run
+    that decides failed on a branch that was failing before the merge as
+    well, a run of a workflow whose run that decides failed while the run
+    before it was going, and any run before one is held, as well as a job
+    that failed in a run held. A later run of a workflow that is decided is
+    not read for, and nor is a later run that failed of a workflow waiting
+    for one that passes, a later run that passed of a workflow the merge
+    made fail, a run of a workflow that did not run for that commit, a run
+    on another branch, a run no push started, a job that passed, or
+    anything without --landed, before the merge, or once the verdict is
+    LANDED.
     """
-    def watcher(landed=True, merged=True, verdict=None, decided=True):
+    def watcher(landed=True, merged=True, verdict=None, decided=True,
+                before=None):
         watching = quiet_watcher(Options(landed=landed))
         if merged:
             watching.known["pull"] = pull(state="closed", merged=True)
         watching.known["base_runs"] = base_run("1", conclusion="cancelled")
-        if decided:
+        if before:
+            watching.known["base_runs"].update(base_run(
+                "2", "b" * 40, conclusion="failure"))
+            watching.known["base_runs"]["2"]["before"] = before
+        elif decided:
             watching.known["base_runs"].update(base_run(
                 "2", "b" * 40, status="in_progress", conclusion=None))
         watching.verdict = verdict
@@ -4100,6 +4315,18 @@ def a_run_on_main_is_read_for_while_it_may_count():
             workflow_run=gh_base_run(5, later, workflow=2)), {"base_runs"}),
         ("a later run of a decided workflow", watcher(), webhook_for(
             workflow_run=gh_base_run(5, later, "queued", None)), set()),
+        ("a later run that passed of a workflow failing before the merge",
+         watcher(before="bad"), webhook_for(
+             workflow_run=gh_base_run(5, later)), {"base_runs"}),
+        ("a later run that failed of a workflow failing before the merge",
+         watcher(before="bad"), webhook_for(workflow_run=gh_base_run(
+             5, later, conclusion="failure")), set()),
+        ("a later run that passed of a workflow the merge made fail",
+         watcher(before="ok"), webhook_for(
+             workflow_run=gh_base_run(5, later)), set()),
+        ("the run before a failure on main ending",
+         watcher(before="pending"), webhook_for(workflow_run=gh_base_run(
+             0, "p" * 40, conclusion="failure")), {"base_runs"}),
         ("a run of a workflow that did not run for the merge", watcher(),
          webhook_for(workflow_run=gh_base_run(5, later, "queued", None,
                                               workflow=2)), set()),

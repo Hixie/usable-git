@@ -372,16 +372,32 @@ AFTER THE MERGE
   attempt failing. When no workflow has run on a commit that contains the
   merge --no-ci-grace after the merge, the verdict is NO-CI.
 
+  A merge onto a branch that is already failing fails whatever it holds,
+  and the branch is then fixed by a later push rather than by running the
+  failed run again. So when the run that decides a workflow failed, the
+  watch asks how the run of that workflow before it ended, and waits for
+  that run to end if it has not. When it failed too, the RED verdict says
+  so, and the first later run of the workflow that passes decides
+  instead, which makes the verdict LANDED. When the branch was passing
+  before the merge, a later run that passes changes nothing: it may be on
+  a commit that reverts the merge. Which jobs failed is not compared,
+  since a branch that is failing often fails a different few of its
+  tests on each run. So a merge that breaks a branch that was failing
+  already, and is then reverted, ends in LANDED.
+
   Once the merge is seen, the checks, runs and statuses of the pull
   request's head commit decide nothing, and are not read again. Once the
   verdict is LANDED, the branch is not read again either: nothing that
   happens on it afterwards is about the merge. Once every run that
   decides has finished, runs are listed only up to the last of them to
-  start. GitHub lists at most 1,000 runs at a time when they are chosen
-  by branch, so the runs for the merge would otherwise drop out of the
-  list as the branch gets busier. Whether a commit contains the merge is
-  asked of GitHub once per commit, and the answer is kept in the state
-  file.
+  start, and the runs that passed of a workflow waiting for one are
+  listed apart. GitHub lists at most 1,000 runs at a time when they are
+  chosen by branch, so the runs for the merge would otherwise drop out of
+  the list as the branch gets busier, and a run the watch holds that
+  drops out is kept as it was. Whether a commit contains the merge is
+  asked of GitHub once per commit, and how the run before a failed one
+  ended is asked once that run has ended, and both answers are kept in
+  the state file.
 
 WHOSE TOKEN IT READS WITH
 
@@ -443,8 +459,10 @@ LISTENING FOR WEBHOOKS
     - with --landed, a workflow run on the branch the pull request merged
       into, since only a read says whether its commit contains the merge,
       when it may count: a run the watch holds, a run of a workflow whose
-      every run so far was cancelled, a run on the commit whose workflows
-      are the ones that count, or any run before the watch holds one;
+      every run so far was cancelled, a run that passed of a workflow
+      waiting for one after the branch was failing before the merge, a
+      run on the commit whose workflows are the ones that count, or any
+      run before the watch holds one;
     - with --landed, a job that failed in a run the watch holds, since
       only a read gives the jobs of a run.
   No read is made until a throttle has been waited out, and a read a
@@ -1533,22 +1551,49 @@ def read_base_runs(gh, base, pull, contains, held=None):
     an open-ended list on a busy branch would in time leave out the runs
     for the merge. A list cut short that way that finds a run that decided
     has since been cancelled, which a run started again can be, is listed
-    again without the end.
+    again without the end. A run held that a list leaves out is kept as it
+    was held, so that a list without an end still has the runs for the
+    merge once they are too old to be in it.
 
     Whether a commit contains the merge is asked of GitHub, and the answer
-    is kept in `contains`, by commit, for every later read. The jobs that
-    failed are read for each run that decides and has not passed.
+    is kept in `contains`, by commit, for every later read. For a run that
+    decides and failed, GitHub is asked how the run of its workflow before
+    it ended, and the answer is kept with the run as "before" once that run
+    has ended. When that run failed too, the runs of the workflow that
+    passed since are listed as well, on their own; see landing_runs(). The
+    jobs that failed are read for each run that decides and has not
+    passed.
     """
     merge = pull["merge_commit_sha"]
     since = datetime.fromtimestamp(merged_at(pull) - 600, timezone.utc)
     since = since.strftime("%Y-%m-%dT%H:%M:%SZ")
     branch = urllib.parse.quote(pull["base"]["ref"], safe="")
+    held = held or {}
+
+    def workflow_runs(run, query):
+        return gh.get(f"{base}/actions/workflows/{run['workflow']}/runs"
+                      f"?branch={branch}&event=push&{query}"
+                      "&per_page=100")["workflow_runs"]
+
+    def before(rid, run):
+        """How the last run of `run`'s workflow before it that a push
+        started, and that was neither cancelled nor skipped, ended: a
+        verdict(), or "none" when the hundred runs listed up to it hold no
+        such run."""
+        said = held.get(rid, {}).get("before")
+        if said not in (None, "pending"):
+            return said
+        return next((verdict(other["conclusion"]) for other in
+                     workflow_runs(run, f"created=%3C%3D{run['created']}")
+                     if other["id"] < int(rid) and
+                     verdict(other["conclusion"]) not in ("cancelled",
+                                                          "skipped")),
+                    "none")
 
     def listed(until):
-        window = f"{since}..{until}" if until else f"%3E%3D{since}"
-        runs = {}
-        for run in gh.paged(f"{base}/actions/runs?branch={branch}&event=push"
-                            f"&created={window}", key="workflow_runs"):
+        runs = {rid: dict(run) for rid, run in held.items()}
+
+        def take(run):
             sha = run["head_sha"]
             if sha not in contains:
                 compared = gh.get(f"{base}/compare/{merge}...{sha}"
@@ -1556,7 +1601,23 @@ def read_base_runs(gh, base, pull, contains, held=None):
                 contains[sha] = compared["status"] in ("ahead", "identical")
             if contains[sha]:
                 runs[str(run["id"])] = base_run_item(run)
-        return landing_runs(runs)
+
+        window = f"{since}..{until}" if until else f"%3E%3D{since}"
+        for run in gh.paged(f"{base}/actions/runs?branch={branch}&event=push"
+                            f"&created={window}", key="workflow_runs"):
+            take(run)
+        first = landing_runs(runs)
+        for rid, run in first.items():
+            # The runs not cancelled are the ones that decide.
+            if verdict(run["conclusion"]) == "bad":
+                run["before"] = before(rid, run)
+        already = inherited(first)
+        for run in deciding_runs(first).values():
+            if run["workflow"] in already:
+                for later in workflow_runs(run, "status=success&created="
+                                           f"%3E%3D{run['created']}"):
+                    take(later)
+        return landing_runs(runs, already)
 
     until = None
     if held and not undecided(held) and all(
@@ -1566,9 +1627,10 @@ def read_base_runs(gh, base, pull, contains, held=None):
     kept = listed(until)
     if until and undecided(kept):
         kept = listed(None)
+    deciding = deciding_runs(kept)
     for rid, run in kept.items():
-        # The runs not cancelled are the ones that decide.
-        if verdict(run["conclusion"]) in ("bad", "pending"):
+        if deciding.get(run["workflow"]) is run and \
+                verdict(run["conclusion"]) in ("bad", "pending"):
             run["failed"] = [
                 {"name": job["name"], "conclusion": job["conclusion"],
                  "url": job.get("html_url")}
@@ -1578,16 +1640,20 @@ def read_base_runs(gh, base, pull, contains, held=None):
     return kept
 
 
-def landing_runs(runs):
+def landing_runs(runs, already=frozenset()):
     """The runs, of `runs`, that say how CI ended for a merged change.
 
     `runs` are the runs that pushes to a branch started on commits that
     contain a merge. The workflows that count are the ones that ran for the
     first of those commits. For each, the runs are taken in the order they
-    started, up to and including the first that was not cancelled, which
-    is the run that decides the workflow. A workflow that lets one run wait
-    at a time cancels the waiting run whenever another push arrives, so the
-    run that decides can be on a commit several pushes after the merge.
+    started, up to and including the first that was not cancelled. A
+    workflow that lets one run wait at a time cancels the waiting run
+    whenever another push arrives, so that run can be on a commit several
+    pushes after the merge.
+
+    For a workflow in `already`, that run failed on a branch that was
+    failing before the merge as well, and the first later run that passed
+    is taken too. See deciding_runs().
     """
     order = sorted(runs, key=int)
     if not order:
@@ -1595,21 +1661,50 @@ def landing_runs(runs):
     first = runs[order[0]]["commit"]
     workflows = {runs[rid]["workflow"] for rid in order
                  if runs[rid]["commit"] == first}
+    already = set(already)
     kept = {}
     for rid in order:
         run = runs[rid]
+        outcome = verdict(run["conclusion"])
         if run["workflow"] in workflows:
             kept[rid] = run
-            if verdict(run["conclusion"]) != "cancelled":
+            if outcome != "cancelled":
                 workflows.discard(run["workflow"])
+        elif run["workflow"] in already and outcome == "ok":
+            kept[rid] = run
+            already.discard(run["workflow"])
     return kept
 
 
 def deciding_runs(runs):
     """Workflow -> the run that decides it, of the runs landing_runs() kept,
-    for each workflow that has one."""
-    return {run["workflow"]: run for run in (runs or {}).values()
-            if verdict(run["conclusion"]) != "cancelled"}
+    for each workflow that has one: the first of them to start that was not
+    cancelled, or a later one that passed.
+
+    landing_runs() keeps a later run that passed only after a run that
+    failed on a branch that was failing before the merge as well. A merge
+    onto a branch that is failing fails whatever it holds, and is fixed by
+    a later push rather than by running the failed run again, so then the
+    later run decides instead. A run that passed after one that the merge
+    made fail shows nothing about the merge, since it may be on a commit
+    that reverts it.
+    """
+    deciding = {}
+    for _, run in sorted((runs or {}).items(), key=lambda item: int(item[0])):
+        outcome = verdict(run["conclusion"])
+        if outcome != "cancelled" and (run["workflow"] not in deciding or
+                                       outcome == "ok"):
+            deciding[run["workflow"]] = run
+    return deciding
+
+
+def inherited(runs):
+    """The workflows, of the runs landing_runs() kept, whose run that
+    decides failed on a branch that was failing before the merge as well,
+    which a later run that passes would decide instead."""
+    return {workflow for workflow, run in deciding_runs(runs).items()
+            if verdict(run["conclusion"]) == "bad" and
+            run.get("before") == "bad"}
 
 
 def undecided(runs):
@@ -2624,10 +2719,16 @@ class Watcher:
                        verdict(run["conclusion"]) == "pending")
         cancelled = sorted({run["name"] for run in runs.values()
                             if run["workflow"] in undecided(runs)})
+        # Whether the run before a failure failed too says whether a later
+        # run may decide instead, and the verdict says which.
+        unsure = sorted(run["name"] for run in deciding.values()
+                        if run.get("before") == "pending")
         waiting = ([f"{', '.join(going)} still going on {branch}"]
                    if going else []) + \
             ([f"every run so far of {', '.join(cancelled)} on {branch} was "
-              "cancelled"] if cancelled else [])
+              "cancelled"] if cancelled else []) + \
+            ([f"{', '.join(unsure)} failed on {branch}, and the run before "
+              "it is still going"] if unsure else [])
         if waiting:
             return False, "; ".join(waiting)
         return True, (f"the runs that decide each workflow on {branch}, on "
@@ -2701,7 +2802,10 @@ class Watcher:
             if runs is None:
                 pieces.append(f"{branch} runs ?")
             else:
-                counts = tally_checks(runs)
+                # A run that failed counts only while it decides; a later
+                # run that passed may decide instead.
+                counts = {**tally_checks(runs),
+                          "bad": len(failing_base_runs(runs))}
                 trailer = ", ".join(
                     f"{counts[key]} {word}" for key, word in (
                         ("pending", "going"), ("bad", "failed"),
@@ -2736,6 +2840,10 @@ class Watcher:
             lines += [f"failing job: {run['name']} / {job['name']} "
                       f"({job['conclusion']})  {job['url']}"
                       for job in run.get("failed", [])]
+            if run.get("before") == "bad":
+                lines.append(f"{run['name']} was failing on "
+                             f"{self.merge()[1]} before the merge as well; "
+                             "a later run that passes makes this LANDED")
         for name in failing_runs(self.known.get("runs")):
             lines.append(f"failing run: {name}")
         for name in failing_names(self.known.get("checks")):
@@ -3479,10 +3587,14 @@ class Watcher:
         only a read gives the jobs of a run that failed, so a run that may
         count is read for rather than put in place. Before any run is held,
         that is any run. After, it is a run held, a run of a workflow whose
-        every held run was cancelled, and a run on the commit the first run
-        held is on, whose workflows are the ones that count. What the
-        webhook says of a run held is kept, for doubt() to hold the read to,
-        unless it is what the watch holds already.
+        every held run was cancelled, a run that passed of a workflow whose
+        run that decides failed on a branch that was failing before the
+        merge as well, any run of a workflow whose run that decides failed
+        while the run before it was still going, since that run ending is
+        news, and a run on the commit the first run held is on, whose
+        workflows are the ones that count. What the webhook says of a
+        run held is kept, for doubt() to hold the read to, unless it is what
+        the watch holds already.
         """
         held = self.known.get("base_runs")
         key = str(run["id"])
@@ -3497,8 +3609,13 @@ class Watcher:
             self.announced["base_runs", key] = said
             return {"base_runs"}
         first = held[min(held, key=int)]["commit"]
-        if run.get("head_sha") == first or \
-                run.get("workflow_id") in undecided(held):
+        workflow = run.get("workflow_id")
+        deciding = deciding_runs(held).get(workflow) or {}
+        unsure = verdict(deciding.get("conclusion")) == "bad" and \
+            deciding.get("before") == "pending"
+        if run.get("head_sha") == first or workflow in undecided(held) or \
+                unsure or (workflow in inherited(held) and
+                           verdict(run.get("conclusion")) == "ok"):
             return {"base_runs"}
         return set()
 
