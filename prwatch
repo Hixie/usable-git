@@ -210,16 +210,16 @@ READING THE NUMBERS
   reported, and --verbose prints a RETARGET line instead.
 
   Whether the branch merges is reported only when GitHub has worked it out.
-  GitHub does that in the background and throws the answer away whenever the
-  head branch or the base branch moves, and a read taken before the next
-  answer is ready says "unknown" rather than giving a state. On a repository
-  where something lands every few minutes, most reads say that. Such a read
-  leaves the state alone rather than replacing it: counted as a state of its
-  own, "unknown" makes a conflict disappear and then come back every time
-  anything at all lands, and neither of those lines is about a change to
-  this pull request. The rebase named among the outstanding items comes from
-  the last state GitHub gave an answer for on the head commit rather than
-  the last read.
+  GitHub does that in the background, and works it out again whenever the
+  head branch or the base branch moves. Until the next answer is ready, a
+  read says "unknown" rather than giving a state, or, after the base branch
+  moves, goes on giving the answer from before the move, for several minutes
+  or longer. A read that says "unknown" leaves the state alone rather than
+  replacing it: counted as a state of its own, "unknown" makes a conflict
+  disappear and then come back every time anything at all lands, and
+  neither of those lines is about a change to this pull request. The
+  rebase named among the outstanding items comes from the last state GitHub
+  gave an answer for on the head commit rather than the last read.
 
   A conflict is the only merge state reported. GitHub's others describe the
   repository's rules for merging rather than this branch: "blocked" says
@@ -424,8 +424,12 @@ LISTENING FOR WEBHOOKS
   Some changes come with no webhook that describes them, and those are
   read, no more often than every --interval:
     - a push to either branch, after which GitHub works out again whether
-      the pull request merges, and sends nothing when it has, so the pull
-      request is read until it says;
+      the pull request merges, and sends nothing when it has. After a push
+      to the base branch, a read can give the answer from before the push
+      until then, so the pull request is read straight after such a push,
+      and then each time the time since the push has doubled, and the same
+      from when the watch starts listening, since a push may have come
+      while it was not; a verdict waits only for the first of these reads;
     - a new head commit, whose checks may have been reported before the
       webhook that announced the push, and which moves the lines of inline
       comments and review threads;
@@ -451,8 +455,9 @@ LISTENING FOR WEBHOOKS
   something only a read can describe, so a verdict never comes before that
   read has been made. Nothing announces a commit in the working tree, so
   when --expect names a revision, the working tree is looked at every
-  --interval. Otherwise nothing is read at all while the relay is
-  connected, and --interval-growth and --interval-max have nothing to do.
+  --interval. Otherwise nothing is read while the relay is connected but
+  what the list above names, and --interval-growth and --interval-max have
+  nothing to do.
 
   The relay passes on every webhook while a watch is connected, and keeps
   nothing for one that is not, so the watch connects before its first
@@ -1941,6 +1946,9 @@ class Watcher:
         self.throttle_told = 0.0        # the throttle a WARN line named
         self.last_digest = None
         self.merge_state = None
+        self.owed_since = None          # the push GitHub may owe an answer for
+        self.owed_due = 0.0             # the next read for it; see owe_merge()
+        self.pull_read = 0.0            # the last read of the pull request
         self.contains = {}              # commit -> whether it has the merge
         self.state_path = options.state and Path(options.state)
 
@@ -2250,11 +2258,11 @@ class Watcher:
         """Report whether the branch merges, ignoring the reads with no answer.
 
         GitHub works out whether a pull request still merges in the
-        background, and throws the answer away whenever the head branch or
-        the base branch moves. A read taken before the next answer is ready
-        gives a merge state of "unknown" and a mergeable field of null. On a
-        repository where something lands every few minutes, most reads of an
-        open pull request are that read.
+        background, and works it out again whenever the head branch or the
+        base branch moves. A read taken before the next answer is ready
+        gives a merge state of "unknown" and a mergeable field of null, or,
+        after the base branch moves, the answer from before it moved; see
+        owe_merge().
 
         Counting "unknown" as a state of its own makes a conflict disappear
         and then come back every time anything at all lands. That is two
@@ -2984,7 +2992,10 @@ class Watcher:
         had_state = any(value is not None for value in self.known.values())
 
         self.resolve_expectation()
+        if self.relay is not None:
+            self.owe_merge()
         snap = self.first_poll()
+        self.read_for_merge()
         self.announce_target(snap.pull)
         self.absorb(snap, announce=had_state)
         self.baseline_report()
@@ -3124,6 +3135,7 @@ class Watcher:
             self.connecting = None
             if attempt.lost is None:
                 self.relay = attempt
+                self.owe_merge()
                 self.emit("WARN", f"the webhook relay at {attempt.address} "
                                   "can be reached again; listening from "
                                   "here on")
@@ -3132,7 +3144,9 @@ class Watcher:
         if self.connecting is None and address is not None:
             self.connecting = Relay(address)
 
-    def read(self, facets):
+    def read(self, facets, paced=True):
+        """Read `facets`. A read that is not `paced` holds up no read after
+        it; see listen()."""
         self.wanted -= set(facets)
         snap = self.poll(facets)
         if self.relay is not None:
@@ -3142,8 +3156,13 @@ class Watcher:
                 self.wanted |= set(facets) - (snap.read - snap.errors.keys())
             self.doubt(snap)
         self.absorb(snap)
+        if "pull" in facets:
+            self.read_for_merge()
         self.save_state()
-        self.last_read = time.time()
+        # A read that leaves what it read to be read again keeps the pace, so
+        # that the next read of it comes --interval after it.
+        if paced or self.needs_reading() & set(facets):
+            self.last_read = time.time()
 
     def doubt(self, snap):
         """Believe a read that goes back on a webhook only once it is read
@@ -3203,8 +3222,13 @@ class Watcher:
         rather than in reads. With --expect naming a revision, the working
         tree is looked at every --interval, since nothing announces a commit
         made there.
+
+        The pull request is also read for the answer GitHub owes for a push,
+        as often as owe_merge() says. Such a read goes with any other read
+        due at the time, and otherwise is made on its own, and holds up no
+        read after it unless it leaves the pull request to be read again.
         """
-        interval = max(5.0, self.options.interval)
+        interval = self.least_interval()
         step = min(10.0, interval)
         now = time.time()
         ticking = settled and self.settled_polls < self.options.stability
@@ -3213,6 +3237,8 @@ class Watcher:
         if self.needs_reading():
             self.report_throttle()
             times.append(due)
+        if self.merge_due() is not None:
+            times.append(max(self.merge_due(), self.throttle_lifts()))
         if ticking:
             times.append(self.last_tick + step)
         if self.expect_revision:
@@ -3243,8 +3269,13 @@ class Watcher:
             self.last_look = now
             self.check_expectation(True, self.known["pull"])
         facets = self.needs_reading()
+        merge_due = self.merge_due()
+        owed = merge_due is not None and now >= merge_due
         if facets and now >= due:
+            facets |= {"pull"} if owed else set()
             self.read(tuple(f for f in Snapshot.FACETS if f in facets))
+        elif owed and now >= self.throttle_lifts():
+            self.read(("pull",), paced=False)
         return ticking and now >= self.last_tick + step
 
     def needs_reading(self):
@@ -3253,7 +3284,8 @@ class Watcher:
         Those are the facets a webhook said had changed without saying how,
         the facets never read or whose last read failed, and the pull request
         while GitHub has not said whether its branch merges, since GitHub
-        sends nothing when it has worked that out.
+        sends nothing when it has worked that out. The answer GitHub owes for
+        a push is read for apart from these; see owe_merge().
         """
         facets = self.wanted | {
             facet for facet in Snapshot.FACETS if facet not in self.refused
@@ -3265,6 +3297,51 @@ class Watcher:
         if pull.get("state") == "open" and not merge_answered(pull):
             facets.add("pull")
         return facets
+
+    def least_interval(self):
+        """--interval, but never under five seconds."""
+        return max(5.0, self.options.interval)
+
+    def read_for_merge(self):
+        """Count a read of the pull request as one for any answer GitHub
+        owes, and work out when the next one is due; see owe_merge()."""
+        self.pull_read = time.time()
+        if self.owed_since is not None:
+            self.owed_due = 2 * self.pull_read - self.owed_since
+
+    def merge_due(self):
+        """When the pull request is next to be read for an answer GitHub
+        owes for a push, or None when it owes none; see owe_merge()."""
+        pull = self.known.get("pull") or {}
+        if self.owed_since is None or pull.get("state") != "open":
+            return None
+        return max(self.owed_due, self.pull_read + self.least_interval())
+
+    def owe_merge(self):
+        """Have the pull request read for GitHub's next answer to whether
+        its branch merges, after a push to the base branch.
+
+        After such a push, a read of the pull request goes on giving the
+        answer GitHub worked out before the push, with nothing in it to tell
+        the two apart. GitHub replaces it with an answer for the push several
+        minutes later, and sends no webhook when it does. An answer that
+        differs from the one before does not show that GitHub has caught up
+        either: it can be the answer for an earlier push, and the answer for
+        a push can be the same as the one before it.
+
+        So the pull request is read straight after the push, and then each
+        time the time since the push has doubled, but never sooner than
+        --interval after the read of it before. That is a handful of reads
+        in the first hour and one more for each doubling after that, so an
+        answer however late is read by the time the time since the push has
+        doubled again, or --interval after it came if that is later. A
+        further push starts the reads over, so while pushes land every few
+        minutes, the pull request is read about every --interval. The relay
+        keeps nothing for a watch that is not listening, so starting to
+        listen, when the watch starts and when the relay can be reached
+        again after it was lost, starts them over too.
+        """
+        self.owed_since = self.owed_due = time.time()
 
     def hear(self, event, payload):
         """Bring the picture up to date with what a webhook says.
@@ -3296,6 +3373,8 @@ class Watcher:
 
         if event == "push":
             pushed = (field("repository", "id"), payload.get("ref"))
+            if pushed == branch(base):
+                self.owe_merge()
             return {"pull"} if pushed in (branch(base), branch(head)) else set()
         if field("repository", "id") != branch(base)[0]:
             return set()

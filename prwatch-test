@@ -4176,7 +4176,7 @@ class FakeRelay:
 
 
 def relayed(readings, webhooks, horizon=20000, local=None, reconnect=None,
-            **options):
+            merge=False, **options):
     """One --follow watch through a relay, run until `horizon` seconds in.
 
     `readings` gives the keyword arguments for reading() for a poll made a
@@ -4186,6 +4186,12 @@ def relayed(readings, webhooks, horizon=20000, local=None, reconnect=None,
     checked out in the working tree at a given time, and `reconnect` the
     relay a connection made at a given time reaches. Returns what the watch
     printed, the time and facets of each read, and how it ended.
+
+    A watch reads the pull request for whether it merges from when it
+    starts listening, as the case "a push reads the pull request until
+    GitHub answers again" shows. Unless `merge` is true, the reads given
+    leave the pull request out of each read of only some facets, and leave
+    out those that read nothing else, for a case about something else.
     """
     clock = Clock(now=0.0)
     real = (prwatch.time, prwatch.Relay)
@@ -4242,6 +4248,10 @@ def relayed(readings, webhooks, horizon=20000, local=None, reconnect=None,
                     ended = f"time up after {clock.now:.0f}s"
     finally:
         prwatch.time, prwatch.Relay = real
+    if not merge:
+        polls = [(at[0], at[1] - {"pull"}) if isinstance(at, tuple) else at
+                 for at in polls
+                 if not isinstance(at, tuple) or at[1] != {"pull"}]
     return out.getvalue(), polls, ended
 
 
@@ -4332,10 +4342,13 @@ def a_relayed_watch_reads_only_what_webhooks_cannot_say():
         (2500, ("pull_request", webhook_for(
             action="closed", pull_request=pull(state="closed",
                                                merged=True)))),
-    ], horizon=3000)
+    ], horizon=3000, merge=True)
     said = tags(output)
     problems = []
-    if polls != [0]:
+    # Besides the reads for whether the branch merges, which start when the
+    # watch starts listening.
+    if polls != [0] + [(at, {"pull"}) for at in (60, 120, 240, 480, 960,
+                                                 1920)]:
         problems.append(f"it read at {polls}")
     if said.count("COMMENT") != 1 or "MERGED" not in said or \
             said.count("VERDICT") != 2:
@@ -4351,13 +4364,13 @@ def a_verdict_waits_for_quiet_steps_not_webhooks():
         (at, ("issue_comment", webhook_for(
             issue={"number": 1}, action="created",
             comment=gh_comment(cid=at, updated=f"2026-09-20T10:00:{at:02}Z"))))
-        for at in (2, 4, 15)], horizon=1000)
+        for at in (2, 4, 15)], horizon=1000, merge=True)
     said = tags(output)
     comments = [i for i, tag in enumerate(said) if tag == "COMMENT"]
     problems = []
     if len(comments) != 3 or said.index("VERDICT") < comments[-1]:
         problems.append(f"it said {said}")
-    if polls != [0]:
+    if polls != [0] + [(at, {"pull"}) for at in (60, 120, 240, 480, 960)]:
         problems.append(f"it read {polls}")
     return report("a verdict waits for quiet steps, not for webhooks",
                   problems, output)
@@ -4430,16 +4443,20 @@ def a_relayed_watch_waits_out_a_throttle():
     rerun = (100, ("check_run", webhook_for(check_run=gh_check(
         cid=9, status="queued", conclusion=None))))
     # A watch that has lost its relay polls on, so only its first reads
-    # are known; a listening watch stops reading once it has its answers.
+    # are known; a listening watch reads the pull request for a while
+    # after the push, with growing waits, and reads the rest once.
     for name, webhooks, reads, polling in [
-            ("listening", [push, comment], [0, (100, {"pull"}),
-                                            (405, {"pull"})], False),
+            ("listening", [push, comment],
+             [0, (60, {"pull"}), (100, {"pull"}), (405, {"pull"}),
+              (710, {"pull"})], False),
             ("with a check to read too", [push, rerun, comment],
-             [0, (100, {"pull", "checks"}), (405, {"pull", "checks"}),
-              (465, {"checks"})], False),
+             [0, (60, {"pull"}), (100, {"pull", "checks"}),
+              (405, {"pull", "checks"}), (465, {"checks"}), (710, {"pull"})],
+             False),
             ("with the relay lost", [push, comment, (200, None)],
-             [0, (100, {"pull"}), 405], True)]:
-        output, polls, _ = relayed(readings, webhooks, horizon=1000)
+             [0, (60, {"pull"}), (100, {"pull"}), 405], True)]:
+        output, polls, _ = relayed(readings, webhooks, horizon=1000,
+                                   merge=True)
         said = tags(output)
         if (polls[:len(reads)] if polling else polls) != reads:
             problems.append(f"{name}, it read {polls}")
@@ -4464,9 +4481,11 @@ def a_read_from_before_a_merge_does_not_reopen_it():
         lambda now: {"state": "closed", "merged": True} if now >= 1060 else {},
         [(1000, ("pull_request", webhook_for(action="closed",
                                              pull_request=merged))),
-         (1000, ("push", webhook_for(ref="refs/heads/main")))], horizon=1500)
+         (1000, ("push", webhook_for(ref="refs/heads/main")))], horizon=1500,
+        merge=True)
     problems = []
-    if polls != [0, (1000, {"pull"}), (1060, {"pull"})]:
+    if polls != [0] + [(at, {"pull"}) for at in
+                       (60, 120, 240, 480, 960, 1000, 1060)]:
         problems.append(f"it read {polls}")
     if "now open" in output or tags(output).count("MERGED") != 1:
         problems.append(f"it said {tags(output)}")
@@ -4543,22 +4562,131 @@ def a_relayed_watch_wakes_for_the_end_of_the_wait_on_main():
 
 
 @case
-def a_push_reads_the_pull_request_until_github_says():
-    """GitHub says nothing when it has worked out whether a branch merges."""
-    def readings(now):
-        if now < 1000:
-            return {}
-        return {"mergeable": "unknown" if now < 1100 else "dirty"}
+def a_push_reads_the_pull_request_until_github_answers_again():
+    """After a push to the base branch, GitHub goes on giving the answer it
+    worked out before the push, and replaces it minutes later without a
+    webhook. So the pull request is read straight after the push, and then
+    each time the time since the push has doubled, whatever the answers
+    say. A second push starts that over, so the answer for the first does
+    not end the reads for the second. The relay keeps nothing for a watch
+    that is not listening, so the same reads start when the watch starts.
+    A push to the pull request's own branch gives it a new head, and GitHub
+    says "unknown" until it has an answer for that, so that push starts
+    nothing over."""
+    def late(now):
+        return {"mergeable": "dirty" if now >= 1500 else "clean"}
 
-    output, polls, _ = relayed(readings, [
-        (1000, ("push", webhook_for(ref="refs/heads/main")))], horizon=2000)
+    def unknown(now):
+        return {} if now < 1000 else \
+            {"mergeable": "unknown" if now < 1100 else "dirty"}
+
+    def overtaken(now):
+        return {"mergeable": "clean" if now < 1100 else
+                "unstable" if now < 1400 else "dirty"}
+
+    def at(*times):
+        # Each time the time since the watch started has doubled, then
+        # `times`.
+        return [0] + [(time, {"pull"})
+                      for time in (60, 120, 240, 480, 960) + times]
+
+    push = (1000, ("push", webhook_for(ref="refs/heads/main")))
+    once = at(1000, 1060, 1120, 1240, 1480, 1960, 2920, 4840, 8680, 16360)
     problems = []
-    if polls != [0, (1000, {"pull"}), (1060, {"pull"}), (1120, {"pull"})]:
+    for name, readings, webhooks, reads, conflict in [
+            ("after a push", late, [push], once, True),
+            ("after a push GitHub says it is working out", unknown, [push],
+             once, True),
+            ("after two pushes", overtaken, [push, (1050, push[1])],
+             at(1000, 1060, 1120, 1190, 1330, 1610, 2170, 3290, 5530, 10010,
+                18970), True),
+            ("after a push GitHub gives no new answer for",
+             lambda now: {}, [push], once, False),
+            ("after a push to the pull request's own branch", late,
+             [(1000, ("push", webhook_for(ref="refs/heads/feature")))],
+             at(1000, 2000, 4000, 8000, 16000), True),
+            ("with no push heard", late, [],
+             at(1920, 3840, 7680, 15360), True)]:
+        output, polls, _ = relayed(readings, webhooks, horizon=20000,
+                                   merge=True)
+        if polls != reads:
+            problems.append(f"{name}, it read {polls}")
+        if ("CONFLICT" in tags(output)) != conflict:
+            problems.append(f"{name}, it said {tags(output)}")
+    return report("a push reads the pull request until GitHub answers again",
+                  problems, "")
+
+
+@case
+def a_read_for_a_merge_answer_keeps_its_own_pace():
+    """A read for the answer GitHub owes for a push holds up no other read,
+    and one that leaves the pull request to be read again is not made again
+    sooner than --interval later."""
+    push = (1000, ("push", webhook_for(ref="refs/heads/main")))
+
+    def rerun(at, cid):
+        return (at, ("check_run", webhook_for(check_run=gh_check(
+            cid=cid, status="queued", conclusion=None))))
+
+    problems = []
+    _, unknown, _ = relayed(
+        lambda now: {"mergeable": "clean" if now < 1050 else
+                     "unknown" if now < 1300 else "dirty"},
+        [push], horizon=1400, merge=True)
+    if unknown[6:] != [(at, {"pull"}) for at in (1000, 1060, 1120, 1180,
+                                                 1240, 1300)]:
+        problems.append(f"with GitHub working it out, it read {unknown}")
+    _, checks, _ = relayed(lambda now: {}, [push, rerun(1200, 9),
+                                            rerun(1230, 10)],
+                           horizon=1500, merge=True)
+    if checks[6:] != [(1000, {"pull"}), (1060, {"pull"}), (1120, {"pull"}),
+                      (1200, {"checks"}), (1240, {"pull"}),
+                      (1260, {"checks"}), (1480, {"pull"})]:
+        problems.append(f"with checks to read too, it read {checks}")
+    return report("a read for a merge answer keeps its own pace", problems,
+                  "")
+
+
+@case
+def a_polled_watch_reports_a_conflict_github_finds_late():
+    """Without a relay, every poll reads the pull request, so a conflict
+    GitHub finds polls after the base branch moved ends a --once watch that
+    has given its verdict, and a run of polls finding none does not."""
+    with tempfile.TemporaryDirectory() as directory:
+        state = str(Path(directory) / "state.json")
+        process(state, [{}] * 3, once=True)
+        quiet = process(state, [{}] * 8, once=True)
+        late = process(state, [{}] * 8 + [{"mergeable": "dirty"}] + [{}],
+                       once=True)
+    problems = []
+    if quiet[1:] != (8, None) or "CONFLICT" in tags(quiet[0]):
+        problems.append(f"the quiet run gave {quiet[1:]}:\n{quiet[0]}")
+    if late[1:] != (9, "FEEDBACK") or "CONFLICT" not in tags(late[0]):
+        problems.append(f"the late run gave {late[1:]}:\n{late[0]}")
+    return report("a polled watch reports a conflict GitHub finds late",
+                  problems, "")
+
+
+@case
+def a_lost_relay_may_have_lost_a_push():
+    """A push sent while the relay was lost is read for as if it had been
+    heard, after the relay can be reached again."""
+    def reconnect(clock):
+        return FakeRelay(clock, [], 20000)
+
+    output, polls, _ = relayed(
+        lambda now: {"mergeable": "dirty" if now >= 1500 else "clean"},
+        [(1000, None)], horizon=20000, reconnect=reconnect,
+        github_webhook_relay="r:1", merge=True)
+    problems = []
+    # The relay is taken up at the poll at 1240, and the reads double from
+    # there.
+    if polls[6:12] != [1000, 1240] + [(at, {"pull"}) for at in
+                                      (1300, 1360, 1480, 1720)] or \
+            "can be reached again" not in output or \
+            "CONFLICT" not in tags(output):
         problems.append(f"it read {polls}")
-    if "CONFLICT" not in tags(output):
-        problems.append("the conflict was never announced")
-    return report("a push reads the pull request until GitHub says",
-                  problems, output)
+    return report("a lost relay may have lost a push", problems, output)
 
 
 @case
