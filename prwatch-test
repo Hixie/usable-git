@@ -5039,6 +5039,10 @@ def a_relay_is_connected_to_and_kept_alive():
     heard = hear(relay)
     keepalive = relay.connection.getsockopt(socket.SOL_SOCKET,
                                             socket.SO_KEEPALIVE)
+    # macOS numbers the idle time 0x10, whether or not Python names it.
+    idle = getattr(socket, "TCP_KEEPIDLE", 0x10)
+    timing = [relay.connection.getsockopt(socket.IPPROTO_TCP, option)
+              for option in (idle, socket.TCP_KEEPINTVL, socket.TCP_KEEPCNT)]
     nobody = prwatch.Relay(f"127.0.0.1:{port}")
     nobody.ready.wait()
     problems = []
@@ -5046,6 +5050,8 @@ def a_relay_is_connected_to_and_kept_alive():
         problems.append(f"it heard {heard!r}")
     if not keepalive:
         problems.append("the connection is not kept alive")
+    if timing != [60, 10, 6]:
+        problems.append(f"the probes are timed {timing}, not [60, 10, 6]")
     if "cannot be connected to" not in (nobody.lost or ""):
         problems.append(f"a relay nobody listens for: {nobody.lost}")
     try:

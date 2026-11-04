@@ -1008,6 +1008,18 @@ class RelayLost(Exception):
 # few kilobytes.
 LONGEST_WEBHOOK = 26 * 1024 * 1024
 
+# The TCP keepalive settings for the connection to the relay, by option
+# number: seconds of quiet before the first probe, seconds between probes,
+# and how many unanswered probes end the connection. Linux names the first
+# TCP_KEEPIDLE. macOS names it TCP_KEEPALIVE, number 0x10, which Python
+# defines only from 3.10 on; macOS's default for it is two hours.
+KEEPALIVE = {
+    getattr(socket, "TCP_KEEPIDLE",
+            getattr(socket, "TCP_KEEPALIVE", 0x10)): 60,
+    socket.TCP_KEEPINTVL: 10,
+    socket.TCP_KEEPCNT: 6,
+}
+
 
 def webhook(packet):
     """The event a webhook is about, and its payload, from GitHub's request.
@@ -1086,14 +1098,10 @@ class Relay:
         # The relay sends nothing while nothing happens, so a far end that
         # vanished without closing the connection is found by the kernel's
         # probes: the first after a minute of quiet, and the connection is
-        # given up after another minute of probes going unanswered. Linux
-        # and macOS name the first of these settings differently.
+        # given up after another minute of probes going unanswered.
         connection.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
-        for name, value in (("TCP_KEEPIDLE", 60), ("TCP_KEEPALIVE", 60),
-                            ("TCP_KEEPINTVL", 10), ("TCP_KEEPCNT", 6)):
-            if hasattr(socket, name):
-                connection.setsockopt(socket.IPPROTO_TCP,
-                                      getattr(socket, name), value)
+        for option, value in KEEPALIVE.items():
+            connection.setsockopt(socket.IPPROTO_TCP, option, value)
         return connection
 
     def close(self):
